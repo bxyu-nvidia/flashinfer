@@ -1366,6 +1366,106 @@ def _run_two_kernel_state_dtype_case(
             )
 
 
+@pytest.mark.parametrize("algorithm", ["monolith", "two-kernel"])
+@pytest.mark.parametrize("philox_rounds", [0, 5])
+@pytest.mark.parametrize("num_tokens", [1, 6])
+@pytest.mark.parametrize("max_window", [8, 16], ids=["checkpoint", "live"])
+@pytest.mark.parametrize("d_split", [1, 2])
+def test_fp16_checkpoint_readout_avoids_double_rounding(
+    algorithm, philox_rounds, num_tokens, max_window, d_split
+):
+    """Read out the FP32 replay directly in BF16 while storing an FP16 cache.
+
+    1 + 17/4096 rounds to 1.0078125 in BF16, but to 1.0 through FP16.
+    The second request has no replay history and must read its native cache.
+    """
+    if philox_rounds and not is_cvt_rs_supported():
+        pytest.skip("fp16 Philox SR requires HW cvt.rs (sm_100a+)")
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch, cache_size, nheads, dim, dstate = 2, 3, 8, 64, 128
+    state = torch.full(
+        (cache_size, nheads, dim, dstate), -3.0, dtype=torch.float16, device=device
+    )
+    state[0].fill_(2)
+    state[1].fill_(1)
+    initial_state = state.clone()
+    ring_start = torch.zeros(cache_size, dtype=torch.int32, device=device)
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size,
+        nheads,
+        1,
+        dim,
+        dstate,
+        max_window,
+        num_tokens,
+        dtype,
+        device,
+        ring_start=ring_start,
+    )
+    x_cache.zero_()
+    B_cache.zero_()
+    dt_cache.zero_()
+    x_cache[1, :, 0, :] = 1
+    B_cache[1, :, 0, :] = 1
+    dt_cache[1, :, 0] = 17 / 4096
+    prev = torch.tensor([0, 8, 0], dtype=torch.int32, device=device)
+    indices = torch.tensor([1, 0], dtype=torch.int32, device=device)
+
+    x = torch.zeros(batch, num_tokens, nheads, dim, dtype=dtype, device=device)
+    dt = torch.zeros(
+        batch, num_tokens, nheads, 1, dtype=dtype, device=device
+    ).expand_as(x)
+    A = torch.zeros(nheads, device=device).as_strided((nheads, dim, dstate), (1, 0, 0))
+    B = torch.zeros(batch, num_tokens, 1, dstate, dtype=dtype, device=device)
+    C = torch.zeros_like(B)
+    C[..., 0] = 1
+    out = torch.empty_like(x)
+    scratch = (
+        _two_kernel_scratch(batch, nheads, num_tokens, max_window, dtype, device)
+        if algorithm == "two-kernel"
+        else {"algorithm": "monolith"}
+    )
+    checkpointing_ssu(
+        state,
+        x_cache,
+        B_cache,
+        dt_cache,
+        ring_start,
+        prev,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        out,
+        state_batch_indices=indices,
+        rand_seed=torch.tensor([12345], dtype=torch.int64, device=device)
+        if philox_rounds
+        else None,
+        philox_rounds=philox_rounds,
+        d_split=d_split,
+        **scratch,
+    )
+
+    expected = torch.full_like(out, 2)
+    expected[0].fill_(1 + 17 / 4096)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    if max_window == 8:
+        lower, upper = 1 + 4 / 1024, 1 + 5 / 1024
+        if philox_rounds:
+            assert ((state[1] == lower) | (state[1] == upper)).all()
+        else:
+            torch.testing.assert_close(
+                state[1], torch.full_like(state[1], lower), atol=0, rtol=0
+            )
+        torch.testing.assert_close(state[0], initial_state[0], atol=0, rtol=0)
+        torch.testing.assert_close(state[2], initial_state[2], atol=0, rtol=0)
+    else:
+        torch.testing.assert_close(state, initial_state, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("philox_rounds", [0, 5])
 def test_two_kernel_f16_state(philox_rounds):
     """f16 STATE + bf16 activations on the two-kernel path vs the monolithic

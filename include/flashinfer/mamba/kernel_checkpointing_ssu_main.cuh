@@ -26,7 +26,8 @@ namespace flashinfer::mamba::checkpointing {
 
 template <typename input_t, typename state_t, int NPREDICTED_, int MAX_WINDOW_, int D_PER_CTA,
           int DSTATE, int STATE_PIPE = 1, bool VARLEN = false>
-struct CheckpointingSsuMainStorage {
+struct CheckpointingSsuMainStorage
+    : CheckpointReadoutStorage<state_t, STATE_PIPE * D_PER_CTA * DSTATE> {
   static constexpr int NPREDICTED = NPREDICTED_;
   static constexpr int MAX_WINDOW = MAX_WINDOW_;
   static constexpr int D_SMEM_COLS = next_multiple_of<SmemSwizzle<input_t>::ATOM_COLS>(D_PER_CTA);
@@ -275,24 +276,26 @@ __device__ __forceinline__ float warp_scan_old_cumAdt(SmemT const& smem, float A
   return A_val * scan;
 }
 
-template <typename input_t, typename state_t, int D_PER_CTA, int DSTATE, typename SmemT,
-          typename TiledMma, typename ThrMma, typename... FragY>
+template <typename input_t, typename state_t, int D_PER_CTA, int DSTATE, bool CHECKPOINT = false,
+          typename SmemT, typename TiledMma, typename ThrMma, typename... FragY>
 __device__ __forceinline__ void add_init_out_main(SmemT const& smem, TiledMma const& tiled_mma,
                                                   ThrMma const& thr_mma, int tid, int state_buf,
                                                   FragY&... frag_y) {
   using namespace cute;
+  auto const* state_ptr = output_state_ptr<state_t, CHECKPOINT>(smem);
+  using readout_t = std::remove_cv_t<std::remove_pointer_t<decltype(state_ptr)>>;
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   constexpr int K_TILE = cute::tile_size<2>(TiledMma{});
   constexpr int NUM_K_TILES = DSTATE / K_TILE;
   constexpr int M_TILE = cute::tile_size<0>(TiledMma{});  // 16·NUM_WARPS = D_PER_CTA
-  static_assert(sizeof(state_t) != 1, "8-bit state goes through the dedicated 8-bit kernel");
+  static_assert(sizeof(readout_t) != 1, "8-bit state goes through the dedicated 8-bit kernel");
 
-  using AView = std::conditional_t<sizeof(state_t) == 2, MMA_prop::operand_t, state_t>;
+  using AView = std::conditional_t<sizeof(readout_t) == 2, MMA_prop::operand_t, readout_t>;
   // A = state [D_PER_CTA, DSTATE] (dstate contiguous = K-major → x4 non-transpose LDSM),
   // slot-indexed.
   auto const layout_state = make_swizzled_layout_rc<AView, D_PER_CTA, DSTATE>();
   Tensor smem_state = make_tensor(
-      make_smem_ptr(reinterpret_cast<AView const*>(smem.state + state_buf * SmemT::STATE_ELEMS)),
+      make_smem_ptr(reinterpret_cast<AView const*>(state_ptr + state_buf * SmemT::STATE_ELEMS)),
       layout_state);
   Tensor smem_state_ktiled =
       local_tile(smem_state, make_tile(Int<M_TILE>{}, Int<K_TILE>{}), make_coord(_0{}, _));
@@ -302,7 +305,7 @@ __device__ __forceinline__ void add_init_out_main(SmemT const& smem, TiledMma co
   Tensor smem_C = make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(
                                   smem.C + state_buf * SmemT::C_ELEMS)),
                               layout_C);
-  pipelined_kloop_gemm<3, NUM_K_TILES, state_t, input_t, MMA_prop::operand_t>(
+  pipelined_kloop_gemm<3, NUM_K_TILES, readout_t, input_t, MMA_prop::operand_t>(
       tiled_mma, thr_mma, tid, smem_state_ktiled, smem_C, frag_y...);
 }
 
@@ -402,8 +405,8 @@ __device__ __forceinline__ void output_head_2k(SmemT& smem, CheckpointingSsuPara
       Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
       Tensor frag_y_1 = thr_mma.partition_fragment_C(id_tile);
       if (m_active)  // only the D_PER_CTA/16 M-warps run the output MMA
-        add_init_out_main<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid,
-                                                               tile_buf, frag_y_0, frag_y_1);
+        add_init_out_main<input_t, state_t, D_PER_CTA, DSTATE, true>(smem, tiled_mma, thr_mma, tid,
+                                                                     tile_buf, frag_y_0, frag_y_1);
       if constexpr (!kSkipSmemToGmemState)  // store_state is cooperative over ALL warps
         store_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, params, warp, lane, d_tile,
                                                                 head, cache_slot, tile_buf);
@@ -414,8 +417,8 @@ __device__ __forceinline__ void output_head_2k(SmemT& smem, CheckpointingSsuPara
     } else {
       Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
       if (m_active)  // only the D_PER_CTA/16 M-warps run the output MMA
-        add_init_out_main<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid,
-                                                               tile_buf, frag_y_0);
+        add_init_out_main<input_t, state_t, D_PER_CTA, DSTATE, true>(smem, tiled_mma, thr_mma, tid,
+                                                                     tile_buf, frag_y_0);
       if constexpr (!kSkipSmemToGmemState)  // store_state is cooperative over ALL warps
         store_state<state_t, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(smem, params, warp, lane, d_tile,
                                                                 head, cache_slot, tile_buf);
@@ -676,9 +679,14 @@ __device__ __forceinline__ void replay_state_mma_main(
         int const col = get<1>(id_part(i)) + n_base;
         int const off = layout_state_swz(row, col);
 
-        // Smem write is always RN (matmul-3 reads it); only the gmem store is SR'd.
+        // Native state for RN cache storage; SR writes directly from registers.
         pair_t const q = pack_float2<state_t>(make_float2(frag_h(i), frag_h(i + 1)));
         *reinterpret_cast<pair_t*>(&state_base[off]) = q;
+        if constexpr (std::is_same_v<state_t, __half>) {
+          auto* readout = smem.checkpoint_state + tile_buf * SmemT::STATE_ELEMS;
+          *reinterpret_cast<Pair<MMA_prop::operand_t>*>(&readout[off]) =
+              pack_float2<MMA_prop::operand_t>(make_float2(frag_h(i), frag_h(i + 1)));
+        }
 
         if constexpr (kPhiloxF16) {
           static_assert(sizeof(state_t) == 2, "STG.64 cooperative path requires 2-byte state_t");

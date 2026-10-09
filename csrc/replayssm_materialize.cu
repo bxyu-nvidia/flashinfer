@@ -86,7 +86,7 @@ __global__ void materialize_replay_kernel(MaterializeParams p) {
                 "8-bit ReplaySSM materialization requires DIM=64 and DSTATE=128");
   using SmemT = std::conditional_t<
       sizeof(T) == 1, CheckpointingSsuStorage8bit<input_t, T, NPREDICTED, MAX_WINDOW, DIM, DSTATE>,
-      CheckpointingSsuStorage<input_t, T, NPREDICTED, MAX_WINDOW, DIM, DSTATE>>;
+      CheckpointingSsuStorage<input_t, T, NPREDICTED, MAX_WINDOW, DIM, DSTATE, false>>;
   extern __shared__ __align__(128) char smem_buf[];
   auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
   int const lane = threadIdx.x, warp = threadIdx.y, tid = warp * warpSize + lane;
@@ -446,10 +446,11 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
   ffi::CUDADeviceGuard device_guard(state_ptrs.device().device_id);
   const cudaStream_t stream = get_stream(state_ptrs.device());
   int64_t const work_items = int64_t(p.batch) * p.layers * p.heads;
-  constexpr size_t smem =
-      sizeof(std::conditional_t < sizeof(state_t) == 1,
-             CheckpointingSsuStorage8bit<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE>,
-             CheckpointingSsuStorage < input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE >>);
+  constexpr size_t smem = sizeof(
+      std::conditional_t<
+          sizeof(state_t) == 1,
+          CheckpointingSsuStorage8bit<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE>,
+          CheckpointingSsuStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE, false>>);
   FLASHINFER_CUDA_CHECK(cudaFuncSetAttribute(materialize_replay_kernel<state_t>,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
   constexpr int kThreadsPerCta = warpSize * kNumWarps;

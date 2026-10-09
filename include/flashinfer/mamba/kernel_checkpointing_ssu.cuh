@@ -59,8 +59,8 @@ namespace flashinfer::mamba::checkpointing {
 // =============================================================================
 // smem holds the state in its native dtype (`state_t`).  cp.async pulls the
 // native dtype straight into smem (with the matching `SmemSwizzle<state_t>`),
-// and the conversion to `MMA_prop::operand_t` happens on the register read inside
-// add_init_out / replay_state_mma.
+// and native state is used for replay and cache writes. FP16 checkpoints also
+// stage a direct BF16 conversion of the FP32 replay for the output matmul.
 // `D_PER_CTA` is the per-CTA D dimension after D-split.
 // For D_SPLIT = 1 (default), D_PER_CTA == DIM (per-head DIM).  At D_SPLIT > 1
 // the storage is sliced: each CTA owns a contiguous D_PER_CTA-row slice of
@@ -74,8 +74,9 @@ namespace flashinfer::mamba::checkpointing {
 // D_PER_CTA cols; the padded tail is unused but keeps the swizzle layout
 // well-formed.  Cost: 1 KB per [NPREDICTED_PAD_MMA_M, 64] buffer at D_PER_CTA=32.
 template <typename input_t, typename state_t, int NPREDICTED_, int MAX_WINDOW_, int D_PER_CTA,
-          int DSTATE>
-struct CheckpointingSsuStorage {
+          int DSTATE, bool ENABLE_CHECKPOINT_READOUT = true>
+struct CheckpointingSsuStorage
+    : CheckpointReadoutStorage<state_t, D_PER_CTA * DSTATE, ENABLE_CHECKPOINT_READOUT> {
   // Re-export the two T/W axis sizes so helpers that only see SmemT can
   // recover them.
   static constexpr int NPREDICTED = NPREDICTED_;
@@ -275,7 +276,7 @@ __device__ __forceinline__ void exchange_ntile_state_store_global(
 // i32 element offset inside the chunk.  Use this instead of separately
 // holding params.state-ptr and state_gmem_off.
 template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, int PHILOX_ROUNDS,
-          int NUM_WARPS, typename SmemT>
+          int NUM_WARPS, bool WRITE_READOUT = false, typename SmemT>
 __device__ __forceinline__ void replay_state_mma(SmemT& smem, CheckpointingSsuParams const& params,
                                                  int warp, int lane, int prev_k, int d_tile,
                                                  int64_t state_ptr_offset, state_t* state_w_base,
@@ -470,9 +471,15 @@ __device__ __forceinline__ void replay_state_mma(SmemT& smem, CheckpointingSsuPa
         int const col = get<1>(id_part(i)) + n_base;
         int const off = layout_state_swz(row, col);
 
-        // Smem write — always nearest-even (output's matmul 3 reads this).
+        // Native state for RN cache storage; SR writes directly from registers.
         pair_t const q = pack_float2<state_t>(make_float2(frag_h(i), frag_h(i + 1)));
         *reinterpret_cast<pair_t*>(&state_base[off]) = q;
+        if constexpr (WRITE_READOUT && std::is_same_v<state_t, __half>) {
+          // FP16 and BF16 share the swizzle; round directly from the FP32 replay.
+          auto* readout = smem.checkpoint_state + tile_buf * D_PER_CTA * DSTATE;
+          *reinterpret_cast<Pair<MMA_prop::operand_t>*>(&readout[off]) =
+              pack_float2<MMA_prop::operand_t>(make_float2(frag_h(i), frag_h(i + 1)));
+        }
 
         if constexpr (kPhiloxF16) {
           static_assert(sizeof(state_t) == 2, "STG.64 cooperative path requires 2-byte state_t");
@@ -677,8 +684,8 @@ __device__ __forceinline__ void compute_and_store_output(
   if constexpr (NUM_N_TILES == 2) {
     Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
     Tensor frag_y_1 = thr_mma.partition_fragment_C(id_tile);
-    add_init_out<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid, tile_buf,
-                                                      frag_y_0, frag_y_1);
+    add_init_out<input_t, state_t, D_PER_CTA, DSTATE, true>(smem, tiled_mma, thr_mma, tid, tile_buf,
+                                                            frag_y_0, frag_y_1);
     // State writeback hoisted here — after matmul 3 has finished consuming
     // smem.state, before matmul 4 which reads only smem.x / smem.CB_scaled
     // / smem.z.  STGs fire-and-forget alongside the epilogue (matmul 4 +
@@ -695,8 +702,8 @@ __device__ __forceinline__ void compute_and_store_output(
     epilogue(frag_y_1, 1);
   } else {  // NUM_N_TILES == 1 (D_SPLIT = 2 path)
     Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
-    add_init_out<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid, tile_buf,
-                                                      frag_y_0);
+    add_init_out<input_t, state_t, D_PER_CTA, DSTATE, true>(smem, tiled_mma, thr_mma, tid, tile_buf,
+                                                            frag_y_0);
     // No sync needed before store_state: the post-replay __syncthreads()
     // in the kernel already established cross-warp visibility of replay's
     // writes to smem.state, and nothing after that point writes to it
@@ -1049,16 +1056,16 @@ __device__ __forceinline__ void compute_and_store_output_swapped(
     Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
     Tensor frag_y_1 = thr_mma.partition_fragment_C(id_tile);
     if (m_active) {  // only the D_PER_CTA/16 M-warps run the output MMA
-      add_init_out_swapped<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid,
-                                                                tile_buf, frag_y_0, frag_y_1);
+      add_init_out_swapped<input_t, state_t, D_PER_CTA, DSTATE, true>(smem, tiled_mma, thr_mma, tid,
+                                                                      tile_buf, frag_y_0, frag_y_1);
       epilogue(frag_y_0, 0);
       epilogue(frag_y_1, 1);
     }
   } else {
     Tensor frag_y_0 = thr_mma.partition_fragment_C(id_tile);
     if (m_active) {
-      add_init_out_swapped<input_t, state_t, D_PER_CTA, DSTATE>(smem, tiled_mma, thr_mma, tid,
-                                                                tile_buf, frag_y_0);
+      add_init_out_swapped<input_t, state_t, D_PER_CTA, DSTATE, true>(smem, tiled_mma, thr_mma, tid,
+                                                                      tile_buf, frag_y_0);
       epilogue(frag_y_0, 0);
     }
   }
@@ -1243,7 +1250,7 @@ __device__ __forceinline__ void ssu_checkpoint(SmemT& smem, CheckpointingSsuPara
   state_t* const state_w_base = reinterpret_cast<state_t*>(params.state) +
                                 cache_slot * params.state_stride_seq +
                                 (int64_t)head * DIM * DSTATE + (int64_t)d_tile * D_PER_CTA * DSTATE;
-  replay_state_mma<input_t, state_t, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS, NUM_WARPS>(
+  replay_state_mma<input_t, state_t, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS, NUM_WARPS, true>(
       smem, params, warp, lane, prev_k, d_tile, state_ptr_offset, state_w_base, rand_seed,
       /*must_checkpoint=*/true);
 
