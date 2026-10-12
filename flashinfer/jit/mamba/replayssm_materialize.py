@@ -22,6 +22,7 @@ from ...compilation_context import CompilationContext
 from .. import env as jit_env
 from ..core import JitSpec, gen_jit_spec
 from ..utils import write_if_different
+from .replayssm_precision import precision_flags, precision_suffix
 
 _DTYPE = {
     torch.float16: "half",
@@ -61,6 +62,7 @@ def gen_replayssm_materialize_module(
         f"_a_{_NAME[matrixA_dtype]}_d_{dim}_ds_{dstate}_hpg_{heads_per_group}"
         f"_mw_{max_window}_pr_{philox_rounds}"
     )
+    uri += precision_suffix()
     directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     os.makedirs(directory, exist_ok=True)
     with open(
@@ -85,4 +87,9 @@ def gen_replayssm_materialize_module(
     flags = CompilationContext().get_nvcc_flags_list(
         supported_major_versions=[8, 9, 10, 11, 12]
     )
-    return gen_jit_spec(uri, sources, extra_cuda_cflags=flags)
+    return gen_jit_spec(
+        uri,
+        sources,
+        extra_cuda_cflags=flags
+        + precision_flags(state_dtype, input_dtype, dim, dstate),
+    )

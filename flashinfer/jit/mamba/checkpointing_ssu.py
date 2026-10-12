@@ -24,6 +24,7 @@ from ...compilation_context import CompilationContext
 from .. import env as jit_env
 from ..core import JitSpec, gen_jit_spec
 from ..utils import write_if_different
+from .replayssm_precision import precision_flags, precision_suffix
 
 
 # Arch gating: all kernel variants need cp.async + mma.sync.m16n8k16 →
@@ -103,7 +104,7 @@ def get_checkpointing_ssu_uri(
         uri += f"_pr_{philox_rounds}"
     if enable_pdl:
         uri += "_pdl"
-    return uri
+    return uri + precision_suffix()
 
 
 def gen_checkpointing_ssu_module(
@@ -189,5 +190,7 @@ def gen_checkpointing_ssu_module(
     return gen_jit_spec(
         uri,
         source_paths,
-        extra_cuda_cflags=_arch_flags() + (extra_cuda_cflags or []),
+        extra_cuda_cflags=_arch_flags()
+        + precision_flags(state_dtype, input_dtype, dim, dstate)
+        + (extra_cuda_cflags or []),
     )

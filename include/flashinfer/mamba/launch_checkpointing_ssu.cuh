@@ -23,6 +23,9 @@
 #include "kernel_checkpointing_ssu_8bit.cuh"
 #include "kernel_checkpointing_ssu_main.cuh"
 #include "kernel_checkpointing_ssu_precompute.cuh"
+#ifdef FLASHINFER_REPLAYSSM_PRECISION_MASK
+#include "kernel_replayssm_precision.cuh"
+#endif
 
 namespace flashinfer::mamba::checkpointing {
 
@@ -405,6 +408,21 @@ template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t
           typename stateIndex_t, typename state_scale_t>
 void launchCheckpointingSsu(CheckpointingSsuParams& params, int precompute_heads_per_cta,
                             int main_pipeline_stages, int main_ctas_per_sm, cudaStream_t stream) {
+#ifdef FLASHINFER_REPLAYSSM_PRECISION_MASK
+  auto kernel = checkpointing_precision_kernel<
+      input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t, DIM, DSTATE, NPREDICTED,
+      MAX_WINDOW, FLASHINFER_REPLAYSSM_PRECISION_MASK, PHILOX_ROUNDS, ENABLE_PDL>;
+  cudaLaunchAttribute attr{};
+  attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr.val.programmaticStreamSerializationAllowed = ENABLE_PDL ? 1 : 0;
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(DIM / 4, params.batch, params.nheads);
+  config.blockDim = dim3(32, 4);
+  config.stream = stream;
+  config.attrs = &attr;
+  config.numAttrs = 1;
+  FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, params));
+#else
   bool const is_varlen = (params.cu_seqlens != nullptr);
   auto launch = [&]<int D_SPLIT, bool VARLEN>() {
     launchCheckpointingSsuImpl<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
@@ -430,6 +448,7 @@ void launchCheckpointingSsu(CheckpointingSsuParams& params, int precompute_heads
                        ".  Allowed values: {1, 2}.  d_split=4 needs "
                        "warp-count restructure.");
   }
+#endif
 }
 
 }  // namespace flashinfer::mamba::checkpointing

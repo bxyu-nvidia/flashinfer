@@ -780,6 +780,16 @@ def checkpointing_ssu(
 ) -> torch.Tensor:
     """Checkpointing SSU with MTP replay using matmul-based parallel token processing.
 
+    For accuracy experiments, set ``FLASHINFER_REPLAYSSM_PRECISION`` before
+    process startup to ``bf16`` (SIMT control), ``readout``, ``reconstruction``,
+    ``readout-reconstruction``, ``cb``, ``readout-cb``, ``reconstruction-cb``,
+    or ``all``. These use a slower FP32 SIMT implementation with selected BF16
+    intermediate conversions removed, regardless of ``algorithm``. Cache dtype,
+    checkpoint scheduling, and RN/SR storage remain in effect. Prefix-state
+    materialization uses the same setting. Each mode has a separate JIT URI.
+    The default ``native`` retains the original MMA kernels. Restart the process
+    to change modes; changing the environment after first use is unsupported.
+
     Parameters
     ----------
     state : torch.Tensor
