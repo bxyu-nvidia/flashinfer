@@ -57,6 +57,150 @@ _CONFIGS = [
 ]
 
 
+@pytest.fixture
+def precision_cuda_mode(monkeypatch):
+    import importlib
+    from flashinfer.jit.mamba import replayssm_precision
+
+    checkpoint_api = importlib.import_module("flashinfer.mamba.checkpointing_ssu")
+    materialize_api = importlib.import_module("flashinfer.mamba.replayssm_materialize")
+
+    def select(mask):
+        monkeypatch.setattr(
+            replayssm_precision, "replayssm_precision_mask", lambda: mask
+        )
+        checkpoint_api._get_module.cache_clear()
+        materialize_api._module.cache_clear()
+
+    yield select
+    checkpoint_api._get_module.cache_clear()
+    materialize_api._module.cache_clear()
+
+
+@pytest.mark.parametrize("mask", range(8))
+@pytest.mark.parametrize("state_dtype,rounds", [(torch.float32, 0), (torch.float16, 5)])
+def test_precision_cuda_intermediate_controls(
+    precision_cuda_mode, mask, state_dtype, rounds
+):
+    """Each CUDA precision bit must change its targeted cancellation example."""
+    precision_cuda_mode(mask)
+    heads, groups, dim, ds, tokens, window = 4, 2, 64, 128, 2, 8
+    ring = window + tokens
+    eps = 1 / 1024
+    for scenario in ("readout", "reconstruction", "cb"):
+        for algorithm in ("monolith", "two-kernel"):
+            state = torch.zeros(2, heads, dim, ds, device="cuda", dtype=state_dtype)
+            xc, bc, dc, starts = _make_ring_caches(
+                2,
+                heads,
+                groups,
+                dim,
+                ds,
+                window,
+                tokens,
+                torch.bfloat16,
+                "cuda",
+                ring_start=torch.tensor(
+                    [ring - 2, 0], device="cuda", dtype=torch.int32
+                ),
+            )
+            xc.zero_()
+            bc.zero_()
+            dc.zero_()
+            x = torch.zeros(1, tokens, heads, dim, device="cuda", dtype=torch.bfloat16)
+            dt = torch.zeros(1, tokens, heads, 1, device="cuda").expand_as(x)
+            b = torch.zeros(1, tokens, groups, ds, device="cuda", dtype=torch.bfloat16)
+            c = torch.zeros_like(b)
+            c[..., 0] = 1
+            a = torch.zeros(heads, device="cuda").as_strided(
+                (heads, dim, ds), (1, 0, 0)
+            )
+            counts = torch.zeros(2, device="cuda", dtype=torch.int32)
+            d = None
+            if scenario == "readout":
+                state[0, :, :, 0], state[0, :, :, 1] = 1 + eps, 1
+                c[..., 1] = -1
+                expected = eps if mask & 1 else 0
+            elif scenario == "reconstruction":
+                state[0, :, :, 1] = 1
+                counts[0] = window
+                xc[0, :, ring - 2] = 1
+                bc[0, :, ring - 2, 0] = 1
+                dc[0, :, ring - 2] = 1 + eps
+                c[..., 1] = -1
+                expected = eps if mask & 3 == 3 else 0
+            else:
+                x[:, 0] = 1
+                dt = torch.full(
+                    (1, tokens, heads, 1), 1 + eps, device="cuda"
+                ).expand_as(x)
+                b[..., 0] = 1
+                d = -torch.ones(heads, 1, device="cuda", dtype=torch.bfloat16).expand(
+                    heads, dim
+                )
+                expected = eps if mask & 4 else 0
+            out = torch.empty_like(x)
+            scratch = allocate_checkpointing_ssu_scratch(
+                1, heads, tokens, window, x.dtype, x.device
+            )
+            checkpointing_ssu(
+                state,
+                xc,
+                bc,
+                dc,
+                starts,
+                counts,
+                x,
+                dt,
+                a,
+                b,
+                c,
+                out,
+                D=d,
+                state_batch_indices=torch.tensor([0], device="cuda", dtype=torch.int32),
+                philox_rounds=rounds,
+                rand_seed=torch.tensor([17], device="cuda", dtype=torch.int64)
+                if rounds
+                else None,
+                algorithm=algorithm,
+                cb_scaled=scratch[0],
+                cumAdt_vec=scratch[1],
+                cb_old=scratch[2],
+            )
+            torch.testing.assert_close(
+                out[0, 0], torch.full_like(out[0, 0], expected), rtol=0, atol=0
+            )
+            if scenario == "reconstruction":
+                torch.testing.assert_close(
+                    state[0, :, :, 0],
+                    torch.full_like(state[0, :, :, 0], 1 + eps if mask & 2 else 1),
+                    rtol=0,
+                    atol=0,
+                )
+            # New inputs wrap into the ring, and the inactive slot is untouched.
+            positions = (
+                starts[0] + counts[0] + torch.arange(tokens, device="cuda")
+            ) % ring
+            torch.testing.assert_close(
+                xc[0, :, positions], x[0].transpose(0, 1), rtol=0, atol=0
+            )
+            assert torch.count_nonzero(state[1]) == 0
+
+
+def test_precision_cuda_varlen(precision_cuda_mode):
+    """Preserve mixed-length and empty-request behavior with the new launch."""
+    precision_cuda_mode(7)
+    _run_varlen_and_compare(
+        seq_lens=[0, 1, 6],
+        prev_ks=[0, 8, 3],
+        npredicted=6,
+        max_window=8,
+        state_dtype=torch.float16,
+        use_z=True,
+        two_kernel=True,
+    )
+
+
 def _make_ring_caches(
     cache_size,
     nheads,
@@ -1364,6 +1508,106 @@ def _run_two_kernel_state_dtype_case(
                 atol=5e-1,
                 msg=f"{name} mismatch at k={k_label} ({state_dtype} state, philox={philox_rounds})",
             )
+
+
+@pytest.mark.parametrize("algorithm", ["monolith", "two-kernel"])
+@pytest.mark.parametrize("philox_rounds", [0, 5])
+@pytest.mark.parametrize("num_tokens", [1, 6])
+@pytest.mark.parametrize("max_window", [8, 16], ids=["checkpoint", "live"])
+@pytest.mark.parametrize("d_split", [1, 2])
+def test_fp16_checkpoint_readout_avoids_double_rounding(
+    algorithm, philox_rounds, num_tokens, max_window, d_split
+):
+    """Read out the FP32 replay directly in BF16 while storing an FP16 cache.
+
+    1 + 17/4096 rounds to 1.0078125 in BF16, but to 1.0 through FP16.
+    The second request has no replay history and must read its native cache.
+    """
+    if philox_rounds and not is_cvt_rs_supported():
+        pytest.skip("fp16 Philox SR requires HW cvt.rs (sm_100a+)")
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch, cache_size, nheads, dim, dstate = 2, 3, 8, 64, 128
+    state = torch.full(
+        (cache_size, nheads, dim, dstate), -3.0, dtype=torch.float16, device=device
+    )
+    state[0].fill_(2)
+    state[1].fill_(1)
+    initial_state = state.clone()
+    ring_start = torch.zeros(cache_size, dtype=torch.int32, device=device)
+    x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
+        cache_size,
+        nheads,
+        1,
+        dim,
+        dstate,
+        max_window,
+        num_tokens,
+        dtype,
+        device,
+        ring_start=ring_start,
+    )
+    x_cache.zero_()
+    B_cache.zero_()
+    dt_cache.zero_()
+    x_cache[1, :, 0, :] = 1
+    B_cache[1, :, 0, :] = 1
+    dt_cache[1, :, 0] = 17 / 4096
+    prev = torch.tensor([0, 8, 0], dtype=torch.int32, device=device)
+    indices = torch.tensor([1, 0], dtype=torch.int32, device=device)
+
+    x = torch.zeros(batch, num_tokens, nheads, dim, dtype=dtype, device=device)
+    dt = torch.zeros(
+        batch, num_tokens, nheads, 1, dtype=dtype, device=device
+    ).expand_as(x)
+    A = torch.zeros(nheads, device=device).as_strided((nheads, dim, dstate), (1, 0, 0))
+    B = torch.zeros(batch, num_tokens, 1, dstate, dtype=dtype, device=device)
+    C = torch.zeros_like(B)
+    C[..., 0] = 1
+    out = torch.empty_like(x)
+    scratch = (
+        _two_kernel_scratch(batch, nheads, num_tokens, max_window, dtype, device)
+        if algorithm == "two-kernel"
+        else {"algorithm": "monolith"}
+    )
+    checkpointing_ssu(
+        state,
+        x_cache,
+        B_cache,
+        dt_cache,
+        ring_start,
+        prev,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        out,
+        state_batch_indices=indices,
+        rand_seed=torch.tensor([12345], dtype=torch.int64, device=device)
+        if philox_rounds
+        else None,
+        philox_rounds=philox_rounds,
+        d_split=d_split,
+        **scratch,
+    )
+
+    expected = torch.full_like(out, 2)
+    expected[0].fill_(1 + 17 / 4096)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    if max_window == 8:
+        lower, upper = 1 + 4 / 1024, 1 + 5 / 1024
+        if philox_rounds:
+            assert ((state[1] == lower) | (state[1] == upper)).all()
+        else:
+            torch.testing.assert_close(
+                state[1], torch.full_like(state[1], lower), atol=0, rtol=0
+            )
+        torch.testing.assert_close(state[0], initial_state[0], atol=0, rtol=0)
+        torch.testing.assert_close(state[2], initial_state[2], atol=0, rtol=0)
+    else:
+        torch.testing.assert_close(state, initial_state, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("philox_rounds", [0, 5])

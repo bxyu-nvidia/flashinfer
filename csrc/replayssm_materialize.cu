@@ -20,6 +20,9 @@
 #include <flashinfer/mamba/checkpointing_ssu.cuh>
 #include <flashinfer/mamba/kernel_checkpointing_ssu.cuh>
 #include <flashinfer/mamba/kernel_checkpointing_ssu_8bit.cuh>
+#ifdef FLASHINFER_REPLAYSSM_PRECISION_MASK
+#include <flashinfer/mamba/kernel_replayssm_precision.cuh>
+#endif
 // clang-format on
 
 #include <cuda_runtime.h>
@@ -58,6 +61,60 @@ struct MaterializeParams {
   int32_t batch, layers, heads, ring_buffer_len, pad_slot_id;
 };
 
+#ifdef FLASHINFER_REPLAYSSM_PRECISION_MASK
+template <typename T>
+__global__ void materialize_precision_kernel(MaterializeParams p) {
+  int64_t const work_items = int64_t(p.batch) * p.layers * p.heads;
+  for (int64_t work = blockIdx.x; work < work_items; work += gridDim.x) {
+    int const head = work % p.heads;
+    int const layer = (work / p.heads) % p.layers;
+    int const request = p.active_request_indices[work / (int64_t(p.heads) * p.layers)];
+    if (request < 0) continue;
+    assert(request < p.batch);
+    int64_t const table = int64_t(layer) * p.batch + request;
+    int const src = p.src_slots[table], dst = p.dst_slots[table];
+    if (src == p.pad_slot_id || dst == p.pad_slot_id) continue;
+    int const count = p.replay_prefix_len[request], start = p.ring_start[request];
+    assert(count >= 0 && count <= MAX_WINDOW && start >= 0 && start < p.ring_buffer_len);
+    CheckpointingSsuParams view{};
+    view.state = reinterpret_cast<void*>(p.state_ptrs[layer]);
+    view.state_stride_seq = p.state_slot_strides[layer];
+    view.x_cache = reinterpret_cast<void*>(p.x_ptrs[layer]);
+    view.x_cache_stride_seq = p.x_slot_strides[layer];
+    view.x_cache_stride_head = int64_t(p.ring_buffer_len) * DIM;
+    view.x_cache_stride_pos = DIM;
+    view.B_cache = reinterpret_cast<void*>(p.b_ptrs[layer]);
+    view.B_cache_stride_seq = p.b_slot_strides[layer];
+    view.B_cache_stride_group = int64_t(p.ring_buffer_len) * DSTATE;
+    view.B_cache_stride_pos = DSTATE;
+    view.dt_cache = reinterpret_cast<void*>(p.dt_ptrs[layer]);
+    view.dt_cache_stride_seq = p.dt_slot_strides[layer];
+    view.dt_cache_stride_head = p.ring_buffer_len;
+    view.ring_buffer_len = p.ring_buffer_len;
+    float dt[MAX_WINDOW], cum[MAX_WINDOW];
+    float const a = toFloat(reinterpret_cast<matrixA_t const*>(p.a_ptrs[layer])[head]);
+    precision_history_decay(view, src, head, start, count, a, dt, cum);
+    auto* state = static_cast<T*>(view.state);
+    int64_t const seed = PHILOX_ROUNDS > 0 ? conversion::layer_philox_seed(*p.rand_seed, layer) : 0;
+    for (int row = threadIdx.y; row < DIM; row += blockDim.y) {
+      int64_t const offset =
+          int64_t(dst) * view.state_stride_seq + (int64_t(head) * DIM + row) * DSTATE;
+      if (count == 0) {
+        int64_t const source =
+            int64_t(src) * view.state_stride_seq + (int64_t(head) * DIM + row) * DSTATE;
+        for (int n = threadIdx.x; n < DSTATE; n += 32) state[offset + n] = state[source + n];
+      } else {
+        float2 values[DSTATE / 64];
+        precision_replay_row<T, input_t, DIM, DSTATE, MAX_WINDOW,
+                             FLASHINFER_REPLAYSSM_PRECISION_MASK>(
+            view, src, head, head / HEADS_PER_GROUP, row, start, count, dt, cum, values);
+        precision_store_row<T, DSTATE, PHILOX_ROUNDS>(state, offset, values, seed);
+      }
+    }
+  }
+}
+#endif
+
 __device__ __forceinline__ void advance_persistent_coordinates(
     int64_t& work, int& virtual_request, int& layer, int& head, int work_stride,
     int virtual_request_delta, int layer_delta, int head_delta, int layers, int heads) {
@@ -86,7 +143,7 @@ __global__ void materialize_replay_kernel(MaterializeParams p) {
                 "8-bit ReplaySSM materialization requires DIM=64 and DSTATE=128");
   using SmemT = std::conditional_t<
       sizeof(T) == 1, CheckpointingSsuStorage8bit<input_t, T, NPREDICTED, MAX_WINDOW, DIM, DSTATE>,
-      CheckpointingSsuStorage<input_t, T, NPREDICTED, MAX_WINDOW, DIM, DSTATE>>;
+      CheckpointingSsuStorage<input_t, T, NPREDICTED, MAX_WINDOW, DIM, DSTATE, false>>;
   extern __shared__ __align__(128) char smem_buf[];
   auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
   int const lane = threadIdx.x, warp = threadIdx.y, tid = warp * warpSize + lane;
@@ -446,10 +503,17 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
   ffi::CUDADeviceGuard device_guard(state_ptrs.device().device_id);
   const cudaStream_t stream = get_stream(state_ptrs.device());
   int64_t const work_items = int64_t(p.batch) * p.layers * p.heads;
-  constexpr size_t smem =
-      sizeof(std::conditional_t < sizeof(state_t) == 1,
-             CheckpointingSsuStorage8bit<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE>,
-             CheckpointingSsuStorage < input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE >>);
+#ifdef FLASHINFER_REPLAYSSM_PRECISION_MASK
+  if (work_items == 0) return;
+  int const blocks = int(work_items < 65535 ? work_items : 65535);
+  materialize_precision_kernel<state_t><<<blocks, dim3(32, 4), 0, stream>>>(p);
+  FLASHINFER_CUDA_CHECK(cudaGetLastError());
+#else
+  constexpr size_t smem = sizeof(
+      std::conditional_t<
+          sizeof(state_t) == 1,
+          CheckpointingSsuStorage8bit<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE>,
+          CheckpointingSsuStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE, false>>);
   FLASHINFER_CUDA_CHECK(cudaFuncSetAttribute(materialize_replay_kernel<state_t>,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
   constexpr int kThreadsPerCta = warpSize * kNumWarps;
@@ -463,5 +527,6 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
   dim3 grid(work_items < persistent_ctas ? int(work_items) : int(persistent_ctas));
   materialize_replay_kernel<state_t><<<grid, dim3(warpSize, kNumWarps), smem, stream>>>(p);
   FLASHINFER_CUDA_CHECK(cudaGetLastError());
+#endif
 }
 }  // namespace flashinfer::mamba

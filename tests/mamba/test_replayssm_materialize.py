@@ -9,6 +9,15 @@ from flashinfer.jit.mamba.replayssm_materialize import (
     gen_replayssm_materialize_module,
 )
 from flashinfer.utils import is_cvt_rs_supported
+from .test_checkpointing_ssu import precision_cuda_mode  # noqa: F401
+
+
+@pytest.mark.parametrize("mask", [0, 3, 7])
+@pytest.mark.parametrize("rounds", [0, 5])
+def test_precision_materialize_matches_checkpoint(precision_cuda_mode, mask, rounds):  # noqa: F811
+    """Prefix transfer uses the same reconstruction precision as decode."""
+    precision_cuda_mode(mask)
+    test_replayssm_materialize_matches_checkpointing_ssu_replay(torch.float16, rounds)
 
 
 def _ptr_table(tensors: list[torch.Tensor]) -> torch.Tensor:

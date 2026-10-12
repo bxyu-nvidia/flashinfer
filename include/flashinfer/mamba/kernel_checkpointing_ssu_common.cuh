@@ -174,6 +174,25 @@ struct MMA_prop {
   static constexpr int K_SMALL = cute::size<2>(typename cute::MMA_Traits<AtomK8>::Shape_MNK{});
 };
 
+// FP16 cache rounding must not precede the BF16 output-matmul conversion.
+// Other state dtypes and materialization-only kernels need no extra storage.
+template <typename state_t, int ELEMS, bool ENABLE = true>
+struct CheckpointReadoutStorage {};
+
+template <int ELEMS>
+struct CheckpointReadoutStorage<__half, ELEMS, true> {
+  alignas(16) MMA_prop::operand_t checkpoint_state[ELEMS];
+};
+
+template <typename state_t, bool CHECKPOINT, typename SmemT>
+__device__ __forceinline__ auto const* output_state_ptr(SmemT const& smem) {
+  if constexpr (CHECKPOINT && std::is_same_v<state_t, __half>) {
+    return smem.checkpoint_state;
+  } else {
+    return smem.state;
+  }
+}
+
 // =============================================================================
 // Swizzled smem layout for mma.sync operands (row-major).
 // =============================================================================
@@ -1713,25 +1732,27 @@ __device__ __forceinline__ void pipelined_kloop_gemm(TiledMma const& tiled_mma,
 // reinterpret-cast to MMA_prop::operand_t so the 16-bit LDSM atom matches the view
 // (actual element type recovered inside `convert_frag`); ≥4-byte smem keeps
 // the native dtype and uses scalar UniversalCopy + register conversion.
-template <typename input_t, typename state_t, int D_PER_CTA, int DSTATE, typename SmemT,
-          typename TiledMma, typename ThrMma, typename... FragY>
+template <typename input_t, typename state_t, int D_PER_CTA, int DSTATE, bool CHECKPOINT = false,
+          typename SmemT, typename TiledMma, typename ThrMma, typename... FragY>
 __device__ __forceinline__ void add_init_out(SmemT const& smem, TiledMma const& tiled_mma,
                                              ThrMma const& thr_mma, int tid, int state_buf,
                                              FragY&... frag_y) {
   using namespace cute;
+  auto const* state_ptr = output_state_ptr<state_t, CHECKPOINT>(smem);
+  using readout_t = std::remove_cv_t<std::remove_pointer_t<decltype(state_ptr)>>;
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   constexpr int K_TILE = cute::tile_size<2>(TiledMma{});
   constexpr int NUM_K_TILES = DSTATE / K_TILE;
   // Smem source dtype for matmul-3 (generic kernel only; 8-bit state goes
   // through the dedicated `checkpointing_ssu_kernel_8bit` path):
-  //   - sizeof(state_t) == 2 (fp16/bf16): LDSM the native 16-bit, view as bf16.
-  //   - sizeof(state_t) == 4 (fp32): scalar UniversalCopy + on-the-fly convert.
-  static_assert(sizeof(state_t) != 1,
+  //   - sizeof(readout_t) == 2 (fp16/bf16): LDSM the native 16-bit, view as bf16.
+  //   - sizeof(readout_t) == 4 (fp32): scalar UniversalCopy + on-the-fly convert.
+  static_assert(sizeof(readout_t) != 1,
                 "add_init_out is the 2/4-byte path; 1-byte state goes through "
                 "compute_output_8bit");
-  constexpr bool is_2byte_smem = (sizeof(state_t) == 2);
-  using state_view_t = std::conditional_t<is_2byte_smem, MMA_prop::operand_t, state_t>;
-  using BTypeIn = state_t;
+  constexpr bool is_2byte_smem = (sizeof(readout_t) == 2);
+  using state_view_t = std::conditional_t<is_2byte_smem, MMA_prop::operand_t, readout_t>;
+  using BTypeIn = readout_t;
 
   auto layout_C_swz =
       make_aliased_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, DSTATE, SmemT::NPREDICTED>();
@@ -1742,9 +1763,9 @@ __device__ __forceinline__ void add_init_out(SmemT const& smem, TiledMma const& 
 
   // Swizzle layout matches the dtype of the buffer being viewed.
   auto const layout_state_swz = make_swizzled_layout_rc<BTypeIn, D_PER_CTA, DSTATE>();
-  // state_buf selects the double-buffered slot; offset in state_t units before the view cast.
-  state_view_t const* smem_state_ptr = reinterpret_cast<state_view_t const*>(
-      reinterpret_cast<state_t const*>(smem.state) + state_buf * D_PER_CTA * DSTATE);
+  // state_buf selects the double-buffered slot; offset in readout_t units before the view cast.
+  state_view_t const* smem_state_ptr =
+      reinterpret_cast<state_view_t const*>(state_ptr + state_buf * D_PER_CTA * DSTATE);
   Tensor smem_state = make_tensor(make_smem_ptr(smem_state_ptr), layout_state_swz);
 
   pipelined_kloop_gemm<3, NUM_K_TILES, input_t, BTypeIn, MMA_prop::operand_t>(
@@ -1760,22 +1781,23 @@ __device__ __forceinline__ void add_init_out(SmemT const& smem, TiledMma const& 
 // NumStages = 2 (not the main's 3): the monolith's register context is fatter
 // (replay + CB compute inline, no maxnreg cap), and the f32 wide-A staging at
 // depth 3 (3×8 f32 + 3×4 u32 per thread) tips it over — depth 2 halves that.
-template <typename input_t, typename state_t, int D_PER_CTA, int DSTATE, typename SmemT,
-          typename TiledMma, typename ThrMma, typename... FragY>
+template <typename input_t, typename state_t, int D_PER_CTA, int DSTATE, bool CHECKPOINT = false,
+          typename SmemT, typename TiledMma, typename ThrMma, typename... FragY>
 __device__ __forceinline__ void add_init_out_swapped(SmemT const& smem, TiledMma const& tiled_mma,
                                                      ThrMma const& thr_mma, int tid, int state_buf,
                                                      FragY&... frag_y) {
   using namespace cute;
+  auto const* state_ptr = output_state_ptr<state_t, CHECKPOINT>(smem);
+  using readout_t = std::remove_cv_t<std::remove_pointer_t<decltype(state_ptr)>>;
   constexpr int NPREDICTED_PAD_MMA_M = SmemT::NPREDICTED_PAD_MMA_M;
   constexpr int K_TILE = cute::tile_size<2>(TiledMma{});
   constexpr int NUM_K_TILES = DSTATE / K_TILE;
   constexpr int M_TILE = cute::tile_size<0>(TiledMma{});
-  static_assert(sizeof(state_t) != 1, "8-bit state goes through the dedicated 8-bit kernel");
-  using AView = std::conditional_t<sizeof(state_t) == 2, MMA_prop::operand_t, state_t>;
+  static_assert(sizeof(readout_t) != 1, "8-bit state goes through the dedicated 8-bit kernel");
+  using AView = std::conditional_t<sizeof(readout_t) == 2, MMA_prop::operand_t, readout_t>;
   auto const layout_state = make_swizzled_layout_rc<AView, D_PER_CTA, DSTATE>();
   Tensor smem_state = make_tensor(
-      make_smem_ptr(reinterpret_cast<AView const*>(reinterpret_cast<state_t const*>(smem.state) +
-                                                   state_buf * D_PER_CTA * DSTATE)),
+      make_smem_ptr(reinterpret_cast<AView const*>(state_ptr + state_buf * D_PER_CTA * DSTATE)),
       layout_state);
   Tensor smem_state_ktiled =
       local_tile(smem_state, make_tile(Int<M_TILE>{}, Int<K_TILE>{}), make_coord(_0{}, _));
@@ -1783,7 +1805,7 @@ __device__ __forceinline__ void add_init_out_swapped(SmemT const& smem, TiledMma
       make_aliased_swizzled_layout_rc<input_t, NPREDICTED_PAD_MMA_M, DSTATE, SmemT::NPREDICTED>();
   Tensor smem_C =
       make_tensor(make_smem_ptr(reinterpret_cast<MMA_prop::operand_t const*>(smem.C)), layout_C);
-  pipelined_kloop_gemm<2, NUM_K_TILES, state_t, input_t, MMA_prop::operand_t>(
+  pipelined_kloop_gemm<2, NUM_K_TILES, readout_t, input_t, MMA_prop::operand_t>(
       tiled_mma, thr_mma, tid, smem_state_ktiled, smem_C, frag_y...);
 }
 
