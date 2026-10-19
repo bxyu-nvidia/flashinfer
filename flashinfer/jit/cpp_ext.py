@@ -313,12 +313,12 @@ def generate_ninja_build_for_op(
             ]
         )
 
-    # Add nvcc linking rule for device code
+    # nvcc defaults to static cudart even when ldflags contains -lcudart.
     if needs_device_linking:
         lines.extend(
             [
                 "rule nvcc_link",
-                "  command = $nvcc -shared $cuda_arch_flags $in $ldflags -o $out",
+                "  command = $nvcc -shared --cudart=shared $cuda_arch_flags $in $ldflags -o $out",
                 "",
             ]
         )
