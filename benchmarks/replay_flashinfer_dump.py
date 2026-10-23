@@ -137,10 +137,6 @@ def main() -> None:
             if measured:
                 torch.cuda.profiler.stop()
         if measured:
-            print(
-                f"iteration={iteration - args.warmup} "
-                f"gpu_ms={start.elapsed_time(end):.3f}"
-            )
             expected = torch.load(
                 args.dump / "outputs.pt", map_location="cpu", weights_only=False
             )
@@ -159,14 +155,12 @@ def main() -> None:
                     "API returns None; inspect arguments_after.pt "
                     "or use --compare-buffers."
                 )
-            else:
-                print("Saved outputs match within the requested tolerances.")
 
             metrics["Time taken (ms)"].append(start.elapsed_time(end))
 
         del result, positional, keyword
 
-    print(f"Time taken avg (ms): {sum(metrics['Time taken (ms)']) / len(metrics['Time taken (ms)'])}")
+    print(f"Time taken avg (ms): {sum(metrics['Time taken (ms)']) / len(metrics['Time taken (ms)'])} {metrics['Time taken (ms)']}")
 
 
 if __name__ == "__main__":
