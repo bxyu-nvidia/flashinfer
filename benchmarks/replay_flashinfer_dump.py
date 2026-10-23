@@ -13,6 +13,7 @@ import argparse
 import importlib
 import json
 import os
+from collections import defaultdict
 from pathlib import Path
 
 import torch
@@ -104,6 +105,8 @@ def main() -> None:
         function = getattr(function, part)
 
     print(f"{module_str}.{function_str}: forward_tokens={metadata['forward_tokens']}")
+
+    metrics = defaultdict(list)
     for iteration in range(args.warmup + args.iterations):
         positional, keyword = load_snapshot(args.dump / "inputs.pt", device)
         if args.weight_layout:
@@ -158,7 +161,12 @@ def main() -> None:
                 )
             else:
                 print("Saved outputs match within the requested tolerances.")
+
+            metrics["Time taken (ms)"].append(start.elapsed_time(end))
+
         del result, positional, keyword
+
+    print(f"Time taken avg (ms): {sum(metrics['Time taken (ms)']) / len(metrics['Time taken (ms)'])}")
 
 
 if __name__ == "__main__":
