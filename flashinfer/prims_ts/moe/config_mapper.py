@@ -24,6 +24,7 @@ from enum import IntEnum
 from functools import lru_cache
 from importlib import resources
 import math
+import os
 from typing import Sequence
 
 from flashinfer.tllm_enums import ActivationType, WeightLayout
@@ -1203,20 +1204,43 @@ def _ensure_config_task_manager_buildable(
     top_k: int | None = None,
     num_experts: int | None = None,
 ) -> None:
+    validation_top_k = max(1, int(top_k or 1))
+    validation_num_experts = max(validation_top_k, int(num_experts or 2))
+    _validate_task_schedule_cached(
+        tuple(sorted(spec.kwargs.items())),
+        num_experts=validation_num_experts,
+        num_tokens=max(1, int(num_tokens or 128)),
+        top_k=validation_top_k,
+        debug_checks=os.environ.get("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "0").lower(),
+    )
+
+
+@lru_cache(maxsize=1024)
+def _validate_task_schedule_cached(
+    config_items: tuple[tuple[str, int], ...],
+    *,
+    num_experts: int,
+    num_tokens: int,
+    top_k: int,
+    debug_checks: str,
+) -> None:
+    """Remember successful CPU schedule validation without retaining managers."""
     from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
         build_batched_gemm_task_manager,
     )
 
-    validation_top_k = max(1, int(top_k or 1))
-    validation_num_experts = max(validation_top_k, int(num_experts or 2))
+    # The builder reads this environment setting itself; include it in the key
+    # so enabling debug checks cannot reuse a less thoroughly validated result.
+    del debug_checks
     manager = build_batched_gemm_task_manager(
-        num_experts=validation_num_experts,
-        num_tokens=max(1, int(num_tokens or 128)),
-        top_k=validation_top_k,
+        num_experts=num_experts,
+        num_tokens=num_tokens,
+        top_k=top_k,
         verbose=False,
-        **spec.kwargs,
+        **dict(config_items),
     )
     _task_manager_smem_bytes(manager)
+    # lru_cache stores only this successful None return, never exceptions.
 
 
 def _ensure_pair_buildable(
