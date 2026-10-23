@@ -161,8 +161,8 @@ def main() -> None:
 
         del result, positional, keyword
 
-    to_print = ", ".join([f"{t:.3f}" for t in metrics['Time taken (ms)']])
-    print(f"Time taken avg (ms): {sum(metrics['Time taken (ms)']) / len(metrics['Time taken (ms)']):.3f} {to_print}")
+    to_print = [f"{t:.3f}" for t in metrics['Time taken (ms)']]
+    print(f"Time taken avg (ms): {sum(metrics['Time taken (ms)']) / len(metrics['Time taken (ms)']):.3f}\n{to_print}")
 
 
 if __name__ == "__main__":
