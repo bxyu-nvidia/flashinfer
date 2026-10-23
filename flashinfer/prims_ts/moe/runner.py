@@ -747,6 +747,9 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         fc2_fn = get_compiled_gemm(fc2_hash, "fc2", fc2_io, stream)
         fc2_fn(*self._launch_args(fc2_io, stream))
 
+        # TODO @bxyu-nvidia: Remove
+        print(fc1_io["cfg"], fc2_io["cfg"])
+
         if kwargs["do_finalize"]:
             self.moe_op.trtllm_moe_run_finalize(
                 gemm2_output,
