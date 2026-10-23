@@ -275,9 +275,9 @@ def is_prims_ts_bf16_supported(
     )
     if any(
         _enum_eq(routing_method_type, routing)
-        for routing in (RoutingMethodType.Sigmoid, RoutingMethodType.DeepSeekV3)
+        for routing in (RoutingMethodType.Sigmoid,)
     ):
-        return False, "Sigmoid and DeepSeekV3 routing are not supported"
+        return False, "Sigmoid routing are not supported"
     if not _is_supported_weight_layout(
         kwargs.get("weight_layout", runner.weight_layout)
     ):
