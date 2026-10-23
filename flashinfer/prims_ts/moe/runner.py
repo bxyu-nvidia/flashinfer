@@ -613,154 +613,172 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         hidden_states = moe_inputs.hidden_states
         output = moe_inputs.output
         num_tokens = hidden_states.shape[0]
-        pair = map_trtllm_bf16_moe_tactic(
-            requested_tactic,
-            activation_type=int(self.activation_type),
-            num_tokens=num_tokens,
-            top_k=self.top_k,
-            num_local_experts=self.num_local_experts,
-            weight_layout=int(kwargs.get("weight_layout", self.weight_layout)),
-            fc1_has_bias=kwargs.get("gemm1_bias") is not None,
-            fc2_has_bias=kwargs.get("gemm2_bias") is not None,
-            enable_pdl=bool(kwargs.get("enable_pdl", False)),
-            **_gemm1_oa_flags_from_kwargs(kwargs),
-        )
-        resolved_tactic = _concrete_tactic(pair)
-        ok, reason = is_prims_ts_bf16_supported(
-            self,
-            moe_inputs,
-            resolved_tactic,
-            **kwargs,
-        )
-        if not ok:
-            raise RuntimeError(
-                f"Config not supported by Prims-TS BF16 kernel ({reason})"
+        with torch.cuda.nvtx.range("prims_ts/config_mapping"):
+            pair = map_trtllm_bf16_moe_tactic(
+                requested_tactic,
+                activation_type=int(self.activation_type),
+                num_tokens=num_tokens,
+                top_k=self.top_k,
+                num_local_experts=self.num_local_experts,
+                weight_layout=int(kwargs.get("weight_layout", self.weight_layout)),
+                fc1_has_bias=kwargs.get("gemm1_bias") is not None,
+                fc2_has_bias=kwargs.get("gemm2_bias") is not None,
+                enable_pdl=bool(kwargs.get("enable_pdl", False)),
+                **_gemm1_oa_flags_from_kwargs(kwargs),
             )
+            resolved_tactic = _concrete_tactic(pair)
+
+        with torch.cuda.nvtx.range("prims_ts/support_check"):
+            ok, reason = is_prims_ts_bf16_supported(
+                self,
+                moe_inputs,
+                resolved_tactic,
+                **kwargs,
+            )
+            if not ok:
+                raise RuntimeError(
+                    f"Config not supported by Prims-TS BF16 kernel ({reason})"
+                )
 
         import cuda.bindings.driver as cuda_drv
 
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
 
-        routing_out = self.moe_op.trtllm_moe_run_routing(
-            moe_inputs.routing_logits,
-            kwargs["routing_bias"],
-            moe_inputs.topk_ids,
-            moe_inputs.expert_weights,
-            hidden_states,
-            kwargs["gemm1_weights"],
-            kwargs["gemm2_weights"],
-            kwargs["num_experts"],
-            self.top_k,
-            kwargs["n_group"],
-            kwargs["topk_group"],
-            self.intermediate_size,
-            kwargs["local_expert_offset"],
-            self.num_local_experts,
-            kwargs["routed_scaling_factor"],
-            kwargs["routing_method_type"],
-            kwargs["use_shuffled_weight"],
-            kwargs["weight_layout"],
-            kwargs["enable_pdl"],
-            resolved_tactic,
-            int(self.activation_type),
-            kwargs.get("norm_topk_prob", True),
-            kwargs.get("routing_replay_out"),
-        )
-
-        (
-            expert_weights,
-            expanded_idx_to_permuted_idx,
-            permuted_idx_to_token_idx,
-            tile_idx,
-            mn_limit,
-            num_non_exiting_ctas,
-            total_num_padded_tokens,
-            gemm1_output,
-            gemm2_output,
-        ) = _torch_views_of_ffi_tensors(routing_out)
-        expert_weights = _select_expert_weights(moe_inputs, expert_weights)
-        routed_token_capacity = _routed_token_capacity(
-            self,
-            moe_inputs,
-            resolved_tactic,
-            total_num_padded_tokens,
-            kwargs,
-        )
-
-        fc1_cfg = pair.fc1.cfg.build()
-        fc2_cfg = pair.fc2.cfg.build()
-
-        fc1_io = build_bf16_launch_io(
-            fc="fc1",
-            cfg=fc1_cfg,
-            hidden_states=hidden_states,
-            gemm1_weights=kwargs["gemm1_weights"],
-            gemm2_weights=kwargs["gemm2_weights"],
-            gemm1_bias=kwargs.get("gemm1_bias"),
-            gemm2_bias=kwargs.get("gemm2_bias"),
-            **_gemm1_oa_io_kwargs(kwargs),
-            gemm1_output=gemm1_output,
-            gemm2_output=gemm2_output,
-            tile_idx=tile_idx,
-            mn_limit=mn_limit,
-            route_map=permuted_idx_to_token_idx,
-            num_non_exiting_ctas=num_non_exiting_ctas,
-            total_num_padded_tokens=total_num_padded_tokens,
-            routed_token_capacity=routed_token_capacity,
-            activation_type=int(self.activation_type),
-            num_experts=self.num_local_experts,
-            num_tokens=num_tokens,
-            top_k=self.top_k,
-            intermediate_size=self.intermediate_size,
-            hidden_size=self.hidden_size,
-        )
-        fc1_hash = stable_config_hash(fc1_io["cfg"])
-        fc1_fn = get_compiled_gemm(fc1_hash, "fc1", fc1_io, stream)
-        fc1_fn(*self._launch_args(fc1_io, stream))
-
-        fc2_io = build_bf16_launch_io(
-            fc="fc2",
-            cfg=fc2_cfg,
-            hidden_states=hidden_states,
-            gemm1_weights=kwargs["gemm1_weights"],
-            gemm2_weights=kwargs["gemm2_weights"],
-            gemm1_bias=kwargs.get("gemm1_bias"),
-            gemm2_bias=kwargs.get("gemm2_bias"),
-            **_gemm1_oa_io_kwargs(kwargs),
-            gemm1_output=gemm1_output,
-            gemm2_output=gemm2_output,
-            tile_idx=tile_idx,
-            mn_limit=mn_limit,
-            route_map=permuted_idx_to_token_idx,
-            num_non_exiting_ctas=num_non_exiting_ctas,
-            total_num_padded_tokens=total_num_padded_tokens,
-            routed_token_capacity=routed_token_capacity,
-            activation_type=int(self.activation_type),
-            num_experts=self.num_local_experts,
-            num_tokens=num_tokens,
-            top_k=self.top_k,
-            intermediate_size=self.intermediate_size,
-            hidden_size=self.hidden_size,
-        )
-        fc2_hash = stable_config_hash(fc2_io["cfg"])
-        fc2_fn = get_compiled_gemm(fc2_hash, "fc2", fc2_io, stream)
-        fc2_fn(*self._launch_args(fc2_io, stream))
-
-        if kwargs["do_finalize"]:
-            self.moe_op.trtllm_moe_run_finalize(
-                gemm2_output,
-                output,
-                expert_weights,
-                expanded_idx_to_permuted_idx,
-                total_num_padded_tokens,
-                num_tokens,
+        with torch.cuda.nvtx.range("prims_ts/routing"):
+            routing_out = self.moe_op.trtllm_moe_run_routing(
+                moe_inputs.routing_logits,
+                kwargs["routing_bias"],
+                moe_inputs.topk_ids,
+                moe_inputs.expert_weights,
+                hidden_states,
+                kwargs["gemm1_weights"],
+                kwargs["gemm2_weights"],
                 kwargs["num_experts"],
                 self.top_k,
-                self.hidden_size,
+                kwargs["n_group"],
+                kwargs["topk_group"],
+                self.intermediate_size,
+                kwargs["local_expert_offset"],
+                self.num_local_experts,
+                kwargs["routed_scaling_factor"],
+                kwargs["routing_method_type"],
+                kwargs["use_shuffled_weight"],
+                kwargs["weight_layout"],
                 kwargs["enable_pdl"],
-                False,
+                resolved_tactic,
+                int(self.activation_type),
+                kwargs.get("norm_topk_prob", True),
+                kwargs.get("routing_replay_out"),
             )
+
+        with torch.cuda.nvtx.range("prims_ts/routing_outputs"):
+            (
+                expert_weights,
+                expanded_idx_to_permuted_idx,
+                permuted_idx_to_token_idx,
+                tile_idx,
+                mn_limit,
+                num_non_exiting_ctas,
+                total_num_padded_tokens,
+                gemm1_output,
+                gemm2_output,
+            ) = _torch_views_of_ffi_tensors(routing_out)
+            expert_weights = _select_expert_weights(moe_inputs, expert_weights)
+            routed_token_capacity = _routed_token_capacity(
+                self,
+                moe_inputs,
+                resolved_tactic,
+                total_num_padded_tokens,
+                kwargs,
+            )
+
+        with torch.cuda.nvtx.range("prims_ts/config_build"):
+            fc1_cfg = pair.fc1.cfg.build()
+            fc2_cfg = pair.fc2.cfg.build()
+
+        with torch.cuda.nvtx.range("prims_ts/fc1_prepare"):
+            fc1_io = build_bf16_launch_io(
+                fc="fc1",
+                cfg=fc1_cfg,
+                hidden_states=hidden_states,
+                gemm1_weights=kwargs["gemm1_weights"],
+                gemm2_weights=kwargs["gemm2_weights"],
+                gemm1_bias=kwargs.get("gemm1_bias"),
+                gemm2_bias=kwargs.get("gemm2_bias"),
+                **_gemm1_oa_io_kwargs(kwargs),
+                gemm1_output=gemm1_output,
+                gemm2_output=gemm2_output,
+                tile_idx=tile_idx,
+                mn_limit=mn_limit,
+                route_map=permuted_idx_to_token_idx,
+                num_non_exiting_ctas=num_non_exiting_ctas,
+                total_num_padded_tokens=total_num_padded_tokens,
+                routed_token_capacity=routed_token_capacity,
+                activation_type=int(self.activation_type),
+                num_experts=self.num_local_experts,
+                num_tokens=num_tokens,
+                top_k=self.top_k,
+                intermediate_size=self.intermediate_size,
+                hidden_size=self.hidden_size,
+            )
+
+        with torch.cuda.nvtx.range("prims_ts/fc1_compile_lookup"):
+            fc1_hash = stable_config_hash(fc1_io["cfg"])
+            fc1_fn = get_compiled_gemm(fc1_hash, "fc1", fc1_io, stream)
+
+        with torch.cuda.nvtx.range("prims_ts/fc1_launch"):
+            fc1_fn(*self._launch_args(fc1_io, stream))
+
+        with torch.cuda.nvtx.range("prims_ts/fc2_prepare"):
+            fc2_io = build_bf16_launch_io(
+                fc="fc2",
+                cfg=fc2_cfg,
+                hidden_states=hidden_states,
+                gemm1_weights=kwargs["gemm1_weights"],
+                gemm2_weights=kwargs["gemm2_weights"],
+                gemm1_bias=kwargs.get("gemm1_bias"),
+                gemm2_bias=kwargs.get("gemm2_bias"),
+                **_gemm1_oa_io_kwargs(kwargs),
+                gemm1_output=gemm1_output,
+                gemm2_output=gemm2_output,
+                tile_idx=tile_idx,
+                mn_limit=mn_limit,
+                route_map=permuted_idx_to_token_idx,
+                num_non_exiting_ctas=num_non_exiting_ctas,
+                total_num_padded_tokens=total_num_padded_tokens,
+                routed_token_capacity=routed_token_capacity,
+                activation_type=int(self.activation_type),
+                num_experts=self.num_local_experts,
+                num_tokens=num_tokens,
+                top_k=self.top_k,
+                intermediate_size=self.intermediate_size,
+                hidden_size=self.hidden_size,
+            )
+
+        with torch.cuda.nvtx.range("prims_ts/fc2_compile_lookup"):
+            fc2_hash = stable_config_hash(fc2_io["cfg"])
+            fc2_fn = get_compiled_gemm(fc2_hash, "fc2", fc2_io, stream)
+
+        with torch.cuda.nvtx.range("prims_ts/fc2_launch"):
+            fc2_fn(*self._launch_args(fc2_io, stream))
+
+        if kwargs["do_finalize"]:
+            with torch.cuda.nvtx.range("prims_ts/finalize"):
+                self.moe_op.trtllm_moe_run_finalize(
+                    gemm2_output,
+                    output,
+                    expert_weights,
+                    expanded_idx_to_permuted_idx,
+                    total_num_padded_tokens,
+                    num_tokens,
+                    kwargs["num_experts"],
+                    self.top_k,
+                    self.hidden_size,
+                    kwargs["enable_pdl"],
+                    False,
+                )
+
             return []
         return [gemm2_output, expert_weights, expanded_idx_to_permuted_idx]
 
