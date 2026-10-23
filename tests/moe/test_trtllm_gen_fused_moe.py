@@ -3767,3 +3767,118 @@ def test_moe_lora_delta(
     assert (real_reference - zero_reference).abs().max().item() > 0.05
     # Kernel matches the dequant reference (delta injected on both sides).
     check_accuracy(real_reference, real_actual, **moe_impl.get_tolerances())
+
+
+@pytest.mark.parametrize(
+    "num_tokens,offset,chunked",
+    [(128, 0, False), (4096, 0, False), (8193, 384, False), (8193, 384, True)],
+)
+@pytest.mark.parametrize("precomputed", [False, True])
+@pytest.mark.parametrize("provided_output", [False, True])
+def test_nemotron_prefill_bf16_bitexact(
+    num_tokens, offset, chunked, precomputed, provided_output, monkeypatch
+):
+    """Preserve results and caller-owned output buffers in eager and graphs."""
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("Requires SM100")
+    from flashinfer.fused_moe import nemotron_prefill
+
+    nemotron_prefill._hits.clear()
+    torch.manual_seed(19)
+    kwargs = dict(
+        routing_logits=torch.randn(
+            num_tokens, 512, device="cuda", dtype=torch.bfloat16
+        ),
+        routing_bias=torch.randn(512, device="cuda", dtype=torch.bfloat16) * 0.01,
+        hidden_states=torch.randn(num_tokens, 1024, device="cuda", dtype=torch.bfloat16)
+        * 0.1,
+        gemm1_weights=torch.randn(
+            128, 16, 2688, 64, device="cuda", dtype=torch.bfloat16
+        )
+        * 0.02,
+        gemm2_weights=torch.randn(
+            128, 42, 1024, 64, device="cuda", dtype=torch.bfloat16
+        )
+        * 0.02,
+        num_experts=512,
+        top_k=22,
+        n_group=1,
+        topk_group=1,
+        intermediate_size=2688,
+        local_expert_offset=offset,
+        local_num_experts=128,
+        routing_method_type=2,
+        activation_type=6,
+        routed_scaling_factor=1.0,
+    )
+    call = trtllm_bf16_moe
+    if precomputed:
+        from flashinfer.fused_moe import trtllm_bf16_routed_moe
+
+        scores = kwargs.pop("routing_logits").float().sigmoid()
+        bias = kwargs.pop("routing_bias").float()
+        ids = (scores + bias).topk(22, dim=-1).indices.to(torch.int32)
+        weights = scores.gather(1, ids.long())
+        weights = (weights / weights.sum(-1, keepdim=True)).to(torch.bfloat16)
+        kwargs.update(
+            topk_ids=(ids, weights),
+            n_group=None,
+            topk_group=None,
+            routing_method_type=1,
+            routed_scaling_factor=None,
+        )
+        call = trtllm_bf16_routed_moe
+    if provided_output:
+        kwargs["output"] = torch.empty_like(kwargs["hidden_states"])
+    if chunked and not precomputed:
+        kwargs["routing_replay_out"] = torch.empty(
+            num_tokens, 22, device="cuda", dtype=torch.int16
+        )
+    monkeypatch.setenv("FLASHINFER_NEMOTRON_PREFILL", "0")
+    expected = call(**kwargs)
+    if provided_output:
+        assert expected.data_ptr() == kwargs["output"].data_ptr()
+    expected = expected.clone()
+    expected_replay = (
+        kwargs["routing_replay_out"].clone() if chunked and not precomputed else None
+    )
+    routed_sizes = []
+    if chunked:
+        from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
+
+        monkeypatch.setattr(nemotron_prefill, "_MAX_CHUNK_TOKENS", 8192)
+        native = get_trtllm_moe_sm100_module()
+        original_routing = native.trtllm_moe_run_routing
+
+        def bounded_routing(*args):
+            routed_sizes.append(args[4].shape[0])
+            return original_routing(*args)
+
+        monkeypatch.setattr(native, "trtllm_moe_run_routing", bounded_routing)
+    monkeypatch.setenv("FLASHINFER_NEMOTRON_PREFILL", "1")
+    actual = call(**kwargs)
+    if chunked:
+        assert sum(routed_sizes) == num_tokens
+        assert max(routed_sizes) <= 8192
+    if expected_replay is not None:
+        torch.testing.assert_close(
+            kwargs["routing_replay_out"], expected_replay, rtol=0, atol=0
+        )
+    if provided_output:
+        assert actual.data_ptr() == kwargs["output"].data_ptr()
+    assert ((torch.cuda.current_device(), num_tokens) in nemotron_prefill._hits) == (
+        num_tokens >= 4096
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = call(**kwargs)
+    graph.replay()
+    torch.cuda.synchronize()
+    if provided_output:
+        assert captured.data_ptr() == kwargs["output"].data_ptr()
+    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+    if expected_replay is not None:
+        torch.testing.assert_close(
+            kwargs["routing_replay_out"], expected_replay, rtol=0, atol=0
+        )

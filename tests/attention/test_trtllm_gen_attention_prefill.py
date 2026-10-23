@@ -1555,3 +1555,77 @@ def test_trtllm_gen_prefill_glm5(
     )
 
     torch.testing.assert_close(output_trtllm, output_naive, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("q_lens", [(1, 9), (129, 265), (1024, 1060)])
+@pytest.mark.parametrize("tensor_scales", [False, True])
+def test_grouped_long_context_prefill(q_lens, tensor_scales, monkeypatch):
+    """Grouped append queries preserve ragged causal boundaries and scaling."""
+    _skip_if_not_blackwell()
+    torch.manual_seed(20261018)
+    device = "cuda"
+    heads, kv_heads, dim, page_size = 32, 2, 128, 128
+    kv_lens = [16384, 16417]
+    pages = [(n + page_size - 1) // page_size for n in kv_lens]
+    q = torch.randn(sum(q_lens), heads, dim, device=device).to(torch.float8_e4m3fn)
+    kv = torch.randn(sum(pages), 2, kv_heads, page_size, dim, device=device).to(
+        torch.float8_e4m3fn
+    )
+    table = torch.zeros(2, max(pages), dtype=torch.int32, device=device)
+    table[0, : pages[0]] = torch.arange(pages[0], device=device)
+    table[1, : pages[1]] = torch.arange(pages[0], sum(pages), device=device)
+    seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+    cu_q = torch.tensor([0, q_lens[0], sum(q_lens)], dtype=torch.int32, device=device)
+    cu_kv = torch.tensor(
+        [0, kv_lens[0], sum(kv_lens)], dtype=torch.int32, device=device
+    )
+    workspace = torch.zeros(128 * 1024**2, dtype=torch.uint8, device=device)
+    scale1, scale2 = 0.7 / dim**0.5, 1.3
+    if tensor_scales:
+        scale1 = torch.tensor(scale1, device=device)
+        scale2 = torch.tensor(scale2, device=device)
+    kwargs = dict(
+        query=q,
+        kv_cache=kv,
+        workspace_buffer=workspace,
+        block_tables=table,
+        seq_lens=seq_lens,
+        max_q_len=max(q_lens),
+        max_kv_len=max(kv_lens),
+        bmm1_scale=scale1,
+        bmm2_scale=scale2,
+        batch_size=2,
+        cum_seq_lens_q=cu_q,
+        cum_seq_lens_kv=cu_kv,
+        out_dtype=torch.bfloat16,
+    )
+    monkeypatch.setenv("FLASHINFER_TRTLLM_GROUPED_PREFILL", "0")
+    baseline = flashinfer.prefill.trtllm_batch_context_with_kv_cache(**kwargs)
+    monkeypatch.setenv("FLASHINFER_TRTLLM_GROUPED_PREFILL", "1")
+    actual = flashinfer.prefill.trtllm_batch_context_with_kv_cache(**kwargs)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual.float(), baseline.float(), rtol=0.04, atol=0.003)
+    # An independent FP32 reference on both sides of each causal boundary
+    # catches a shared masking error in the baseline/candidate comparison.
+    offset = 0
+    for batch, (qlen, kvlen) in enumerate(zip(q_lens, kv_lens, strict=True)):
+        ids = sorted({0, qlen // 2, qlen - 1})
+        positions = torch.tensor(ids, device=device)
+        q_sample = q[offset + positions].float().transpose(0, 1)
+        cache = kv[table[batch, : pages[batch]].long()].float()
+        k = cache[:, 0].permute(1, 0, 2, 3).reshape(kv_heads, -1, dim)[:, :kvlen]
+        v = cache[:, 1].permute(1, 0, 2, 3).reshape(kv_heads, -1, dim)[:, :kvlen]
+        k = k.repeat_interleave(heads // kv_heads, dim=0)
+        v = v.repeat_interleave(heads // kv_heads, dim=0)
+        logits = (q_sample @ k.transpose(1, 2)) * scale1
+        visible = torch.arange(kvlen, device=device)[None, :] <= (
+            kvlen - qlen + positions[:, None]
+        )
+        logits.masked_fill_(~visible[None], float("-inf"))
+        ref = (logits.softmax(-1) @ v).transpose(0, 1) * scale2
+        selected = actual[offset + positions].float()
+        relative_rms = (
+            selected - ref
+        ).square().mean().sqrt() / ref.square().mean().sqrt()
+        assert relative_rms < 0.04
+        offset += qlen

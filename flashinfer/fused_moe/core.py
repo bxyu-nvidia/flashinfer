@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import os
 import threading
 import weakref
 from dataclasses import dataclass
@@ -2085,6 +2086,15 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             "norm_topk_prob": norm_topk_prob,
             "routing_replay_out": routing_replay_out,
         }
+        if os.environ.get("FLASHINFER_NEMOTRON_PREFILL") == "1":
+            from .nemotron_prefill import run_nemotron_prefill
+
+            candidate = run_nemotron_prefill(
+                moe_runner, moe_inputs.to_list(), runner_kwargs
+            )
+            if candidate is not None:
+                return candidate
+
         _, tactic = tuner.choose_one(
             "flashinfer::trtllm_bf16_moe",
             [moe_runner],

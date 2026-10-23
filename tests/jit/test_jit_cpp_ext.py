@@ -58,7 +58,10 @@ def test_generate_ninja_uses_sccache_compatible_nvcc_depfile_flag(
     assert "--dependency-output" not in ninja
 
 
-def test_generate_ninja_propagates_cuda_arch_flags_to_nvcc_link(monkeypatch, tmp_path):
+@pytest.mark.parametrize("needs_device_linking", [False, True])
+def test_generate_ninja_links_shared_cuda_runtime(
+    monkeypatch, tmp_path, needs_device_linking
+):
     monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda")
     monkeypatch.setattr(cpp_ext.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
     monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "8.0")
@@ -73,11 +76,19 @@ def test_generate_ninja_propagates_cuda_arch_flags_to_nvcc_link(monkeypatch, tmp
         ],
         extra_ldflags=None,
         extra_include_dirs=None,
-        needs_device_linking=True,
+        needs_device_linking=needs_device_linking,
     )
 
     assert "cuda_arch_flags = -gencode=arch=compute_103a,code=sm_103a" in ninja
-    assert "command = $nvcc -shared $cuda_arch_flags $in $ldflags -o $out" in ninja
+    if needs_device_linking:
+        assert (
+            "command = $nvcc -shared --cudart=shared $cuda_arch_flags $in $ldflags -o $out"
+            in ninja
+        )
+    else:
+        assert "command = $cxx $in $ldflags -o $out" in ninja
+        assert "--cudart" not in ninja
+    assert "-lcudart" in ninja
     assert "cuda_arch_flags = -DNDEBUG" not in ninja
 
 

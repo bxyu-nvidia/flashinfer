@@ -17,6 +17,7 @@ limitations under the License.
 import functools
 import logging
 import math
+import os
 import threading
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
@@ -6101,6 +6102,63 @@ def trtllm_batch_context_with_kv_cache(
             # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
+
+    # Group heads with short append queries to reuse the long shared KV prefix.
+    # Dispatch at the Python boundary so installed AOT modules work unchanged.
+    if (
+        os.environ.get("FLASHINFER_TRTLLM_GROUPED_PREFILL") == "1"
+        and causal
+        and window_left == -1
+        and query.dtype == k_cache.dtype == v_cache.dtype == torch.float8_e4m3fn
+        and k_cache.ndim == 4
+        and kv_layout in ("HND", "NHD")
+        and query.shape[1] == 16 * k_cache.shape[1 if kv_layout == "HND" else 2]
+        and query.shape[-1] == k_cache.shape[-1] == 128
+        and 0 < max_q_len <= 2048
+        and max_kv_len >= 16384
+        and (
+            out_dtype == torch.bfloat16
+            or (
+                out_dtype is None
+                and isinstance(out, torch.Tensor)
+                and out.dtype == torch.bfloat16
+            )
+        )
+        and o_sf_scale is None
+        and o_sf_vec_size is None
+        and batch_size == seq_lens.numel() == cum_seq_lens_q.numel() - 1
+        and cum_seq_lens_kv.numel() == batch_size + 1
+        and sinks is None
+        and kv_cache_sf is None
+        and not skip_softmax_threshold_scale_factor
+        and not use_fp16_softmax
+        and not uses_spcompress
+        and lse is None
+        and not return_lse
+        and get_compute_capability(query.device) == (10, 0)
+    ):
+        from .decode import trtllm_batch_decode_with_kv_cache
+
+        return trtllm_batch_decode_with_kv_cache(
+            query,
+            kv_cache,
+            workspace_buffer,
+            block_tables,
+            seq_lens,
+            max_kv_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            out=out,
+            out_dtype=out_dtype,
+            kv_layout=kv_layout,
+            enable_pdl=enable_pdl,
+            backend="trtllm-gen",
+            q_len_per_req=None,
+            max_q_len=max_q_len,
+            cum_seq_lens_q=cum_seq_lens_q,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+        )
 
     if k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8:
         if get_compute_capability(query.device) == (10, 7):
