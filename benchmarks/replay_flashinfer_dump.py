@@ -17,6 +17,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
+from tqdm.auto import tqdm
 
 
 def load_snapshot(path: Path, device: torch.device) -> object:
@@ -107,7 +108,7 @@ def main() -> None:
     print(f"{module_str}.{function_str}: forward_tokens={metadata['forward_tokens']}")
 
     metrics = defaultdict(list)
-    for iteration in range(args.warmup + args.iterations):
+    for iteration in tqdm(range(args.warmup + args.iterations), desc="Iteration"):
         positional, keyword = load_snapshot(args.dump / "inputs.pt", device)
         if args.weight_layout:
             from flashinfer.fused_moe import WeightLayout
