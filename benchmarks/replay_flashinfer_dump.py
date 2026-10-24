@@ -10,9 +10,11 @@ are captured for inspection, not supported by this standalone replay.
 """
 
 import argparse
+import cProfile
 import importlib
 import json
 import os
+import pstats
 from collections import defaultdict
 from pathlib import Path
 
@@ -45,7 +47,7 @@ def compare_snapshot(
             compare_snapshot(actual[key], expected[key], rtol=rtol, atol=atol)
     elif isinstance(expected, (list, tuple)):
         assert isinstance(actual, type(expected)) and len(actual) == len(expected)
-        for left, right in zip(actual, expected):
+        for left, right in zip(actual, expected, strict=True):
             compare_snapshot(left, right, rtol=rtol, atol=atol)
     else:
         assert actual == expected, f"Parameter mismatch: {actual!r} != {expected!r}"
@@ -74,6 +76,15 @@ def main() -> None:
         default=None,
         choices=["BlockMajorK", "MajorK"],
     )
+    parser.add_argument(
+        "--cpu-profile",
+        type=Path,
+        help=(
+            "Write a cProfile report for measured API calls only, excluding warmup, "
+            "input loading, explicit synchronization and comparison. Run without "
+            "nsys/ncu; profiling perturbs timings."
+        ),
+    )
     args = parser.parse_args()
 
     if args.warmup < 0 or args.iterations < 1:
@@ -101,11 +112,21 @@ def main() -> None:
     else:
         raise NotImplementedError(f"{args.module=} {args.function=}")
 
-    function = importlib.import_module(module_str)
+    module = importlib.import_module(module_str)
+    function = module
     for part in function_str.split("."):
         function = getattr(function, part)
 
     print(f"{module_str}.{function_str}: forward_tokens={metadata['forward_tokens']}")
+
+    cpu_profile = cProfile.Profile() if args.cpu_profile is not None else None
+    if cpu_profile is not None:
+        print(f"Imported module: {module.__file__}")
+        print(
+            "CPU profiling enabled: reported elapsed times include profiling overhead "
+            "and should not be used for throughput comparisons."
+        )
+        args.cpu_profile.parent.mkdir(parents=True, exist_ok=True)
 
     metrics = defaultdict(list)
     for iteration in tqdm(range(args.warmup + args.iterations), desc="Iteration"):
@@ -132,7 +153,14 @@ def main() -> None:
         try:
             start.record()
             with torch.cuda.nvtx.range("replay/moe"):
-                result = function(*positional, **keyword)
+                if measured and cpu_profile is not None:
+                    cpu_profile.enable()
+                    try:
+                        result = function(*positional, **keyword)
+                    finally:
+                        cpu_profile.disable()
+                else:
+                    result = function(*positional, **keyword)
             end.record()
             end.synchronize()
         finally:
@@ -161,6 +189,16 @@ def main() -> None:
             metrics["Time taken (ms)"].append(start.elapsed_time(end))
 
         del result, positional, keyword
+
+    if cpu_profile is not None:
+        cpu_profile.dump_stats(str(args.cpu_profile))
+        print(f"CPU profile saved to: {args.cpu_profile.resolve()}")
+        # Keep full filenames in the saved report; shorten only console output.
+        stats = pstats.Stats(cpu_profile).strip_dirs()
+        print("CPU profile: top 30 functions by self time")
+        stats.sort_stats("tottime").print_stats(30)
+        print("CPU profile: top 30 functions by cumulative time")
+        stats.sort_stats("cumulative").print_stats(30)
 
     to_print = [f"{t:.3f}" for t in metrics["Time taken (ms)"]]
     print(
