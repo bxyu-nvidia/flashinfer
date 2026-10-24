@@ -25,11 +25,12 @@ from flashinfer.prims_ts.moe import compile_cache, config_mapper
 from flashinfer.tllm_enums import ActivationType, WeightLayout
 
 
+@pytest.mark.parametrize("deferred", [False, True])
 @pytest.mark.parametrize("immutable", [False, True])
 @pytest.mark.parametrize("warm", [False, True])
 @pytest.mark.parametrize("finalize", [False, True])
 def test_fc1_submission_defers_unused_outputs_and_preserves_cold_path(
-    monkeypatch, warm, finalize, immutable
+    monkeypatch, warm, finalize, immutable, deferred
 ):
     import cutlass.cute.runtime
 
@@ -119,6 +120,7 @@ def test_fc1_submission_defers_unused_outputs_and_preserves_cold_path(
         return original_prepare(**kwargs)
 
     def build_io(**kwargs):
+        events.append("build_" + kwargs["fc"])
         io = original_build(**kwargs)
         if kwargs["fc"] == "fc1":
             assert ("cfg" not in io) == (warm and immutable)
@@ -128,9 +130,20 @@ def test_fc1_submission_defers_unused_outputs_and_preserves_cold_path(
     monkeypatch.setattr(module, "prepare_bf16_fc1_inputs", prepare_inputs)
     monkeypatch.setattr(module, "build_bf16_launch_io", build_io)
 
-    def route(*args):
+    def submit_routing(*args):
         events.append("routing")
+
+    def route(*args):
+        submit_routing()
         return routing_array
+
+    def prepare_routing(*args):
+        events.append("routing_prepare")
+        return [routing_array, submit_routing]
+
+    def launch_args(io, stream):
+        events.append("launch_args")
+        return (*io["_launch_args"], stream)
 
     def finish(gemm2, result, weights, indices, *args):
         events.append("finalize")
@@ -150,8 +163,11 @@ def test_fc1_submission_defers_unused_outputs_and_preserves_cold_path(
         moe_op=SimpleNamespace(
             trtllm_moe_run_routing=route, trtllm_moe_run_finalize=finish
         ),
-        _launch_args=lambda io, stream: (*io["_launch_args"], stream),
+        _launch_args=launch_args,
     )
+    if deferred:
+        model.moe_op.trtllm_moe_prepare_routing = prepare_routing
+
     inputs = SimpleNamespace(
         hidden_states=hidden,
         output=output,
@@ -193,15 +209,25 @@ def test_fc1_submission_defers_unused_outputs_and_preserves_cold_path(
         enable_pdl=False,
         do_finalize=finalize,
     )
+    route_event = "routing_prepare" if deferred else "routing"
     assert events[:3] == (
         (
-            ["find", "pre_route_inputs", "routing"]
+            ["find", "pre_route_inputs", route_event]
             if warm
-            else ["find", "runtime_config", "routing"]
+            else ["find", "runtime_config", route_event]
         )
         if immutable
-        else ["runtime_config", "find", "routing"]
+        else ["runtime_config", "find", route_event]
     )
+    assert events.count("routing") == 1
+    if deferred:
+        assert events.index("build_fc1") < events.index("routing")
+        assert events.index("launch_args") < events.index("routing")
+        assert events[events.index("routing") + 1] == "fc1"
+        if not warm:
+            assert events.index("compile_fc1") < events.index("routing")
+    else:
+        assert events.index("routing") < events.index("build_fc1")
     split = events.index("fc1")
     assert [e for e in events[:split] if isinstance(e, tuple)] == [
         ("extract", slice(2, 8))

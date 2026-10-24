@@ -778,8 +778,20 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                         **_gemm1_oa_io_kwargs(kwargs),
                     )
 
-        with torch.cuda.nvtx.range("prims_ts/routing"):
-            routing_out = self.moe_op.trtllm_moe_run_routing(
+        prepare_routing = getattr(self.moe_op, "trtllm_moe_prepare_routing", None)
+        if prepare_routing is None:
+            logger.warning_once(
+                "Prims-TS prepared routing is unavailable in the loaded MoE binary; "
+                "using eager routing. Rebuild the TRTLLM MoE module from current "
+                "FlashInfer sources to enable preparation before routing submission."
+            )
+        route = prepare_routing or self.moe_op.trtllm_moe_run_routing
+        with torch.cuda.nvtx.range(
+            "prims_ts/routing_prepare"
+            if prepare_routing is not None
+            else "prims_ts/routing"
+        ):
+            routing_out = route(
                 moe_inputs.routing_logits,
                 kwargs["routing_bias"],
                 moe_inputs.topk_ids,
@@ -804,6 +816,10 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 kwargs.get("norm_topk_prob", True),
                 kwargs.get("routing_replay_out"),
             )
+
+        submit_routing = None
+        if prepare_routing is not None:
+            routing_out, submit_routing = routing_out[:]
 
         with torch.cuda.nvtx.range("prims_ts/routing_outputs"):
             (
@@ -850,12 +866,19 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 hidden_size=self.hidden_size,
             )
 
+            fc1_launch_args = self._launch_args(fc1_io, stream)
+
         if fc1_fn is None:
             with torch.cuda.nvtx.range("prims_ts/fc1_compile_lookup"):
                 fc1_fn = get_compiled_gemm(fc1_io["config_hash"], "fc1", fc1_io, stream)
 
+        # All FC1 buffers, pointer wrappers and launch arguments are ready.
+        # Submit on the same stream; FC1 consumes routing results in stream order.
+        if submit_routing is not None:
+            with torch.cuda.nvtx.range("prims_ts/routing"):
+                submit_routing(hidden_states)
         with torch.cuda.nvtx.range("prims_ts/fc1_launch"):
-            fc1_fn(*self._launch_args(fc1_io, stream))
+            fc1_fn(*fc1_launch_args)
 
         # These three outputs are only needed by FC2/finalize. Convert them
         # after submitting FC1 so their host overhead can overlap its execution.
