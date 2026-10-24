@@ -124,6 +124,36 @@ def _block_major_k_bytes_cached(config_items: tuple[tuple[str, int], ...]) -> in
 
 
 @dataclass(frozen=True)
+class _ImmutablePrimsTsConfigSpec:
+    """Internal scalar-only spec shared across BF16 calls.
+
+    Assembly receives a separate mutable config; neither tensors nor mutable
+    option dictionaries are retained here.
+    """
+
+    config_items: tuple[tuple[str, int], ...]
+    weight_layout: int
+    weight_dtype_tma_bits: int
+    block_major_k_bytes: int
+
+    def build(self) -> object:
+        return copy(_build_config_cached(self.config_items))
+
+
+@lru_cache(maxsize=1024)
+def _immutable_config_spec_cached(
+    config_items: tuple[tuple[str, int], ...],
+) -> _ImmutablePrimsTsConfigSpec:
+    cfg = _build_config_cached(config_items)
+    return _ImmutablePrimsTsConfigSpec(
+        config_items=config_items,
+        weight_layout=int(cfg.weight_layout),
+        weight_dtype_tma_bits=int(cfg.weight_dtype_tma_bits),
+        block_major_k_bytes=int(cfg.block_major_k_bytes),
+    )
+
+
+@dataclass(frozen=True)
 class PrimsTsMoeGemmConfig:
     """One Prims-TS GEMM config plus the local config row it came from."""
 
@@ -1766,6 +1796,53 @@ def map_trtllm_bf16_moe_tactic(
 ) -> PrimsTsGemmPair:
     """Return Prims-TS FC1/FC2 configs for a Prims-TS BF16 MoE tactic."""
 
+    pair = _resolve_bf16_moe_tactic(
+        tactic,
+        activation_type=activation_type,
+        num_tokens=num_tokens,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        fc1_has_bias=fc1_has_bias,
+        fc2_has_bias=fc2_has_bias,
+        has_gemm1_alpha=has_gemm1_alpha,
+        has_gemm1_beta=has_gemm1_beta,
+        has_gemm1_clamp_limit=has_gemm1_clamp_limit,
+        enable_pdl=enable_pdl,
+        weight_layout=weight_layout,
+    )
+
+    # Keep the public mutable-spec contract without exposing internal state.
+    return PrimsTsGemmPair(
+        pair.tile_n,
+        pair.moe_config_index,
+        PrimsTsMoeGemmConfig(
+            PrimsTsConfigSpec(dict(pair.fc1.cfg.config_items)),
+            pair.fc1.prims_ts_gemm_config_index,
+        ),
+        PrimsTsMoeGemmConfig(
+            PrimsTsConfigSpec(dict(pair.fc2.cfg.config_items)),
+            pair.fc2.prims_ts_gemm_config_index,
+        ),
+    )
+
+
+def _resolve_bf16_moe_tactic(
+    tactic: int | Sequence[int],
+    *,
+    activation_type: int = int(ActivationType.Swiglu),
+    num_tokens: int | None = None,
+    top_k: int | None = None,
+    num_local_experts: int | None = None,
+    fc1_has_bias: bool = False,
+    fc2_has_bias: bool = False,
+    has_gemm1_alpha: bool = False,
+    has_gemm1_beta: bool = False,
+    has_gemm1_clamp_limit: bool = False,
+    enable_pdl: bool = False,
+    weight_layout: int = int(WeightLayout.MajorK),
+) -> PrimsTsGemmPair:
+    """Resolve a shared immutable FC1/FC2 pair for the internal BF16 path."""
+
     tile_n, moe_config_index = _parse_tactic(
         tactic,
         num_tokens=num_tokens,
@@ -1778,7 +1855,7 @@ def map_trtllm_bf16_moe_tactic(
     if moe_config_index < -1:
         raise ValueError(f"Unsupported MoE config index={moe_config_index}")
 
-    pair = _bf16_config_pair_cached(
+    return _bf16_config_pair_cached(
         debug_checks=os.environ.get("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "0").lower(),
         tile_n=tile_n,
         moe_config_index=moe_config_index,
@@ -1800,28 +1877,25 @@ def map_trtllm_bf16_moe_tactic(
         weight_layout=weight_layout,
     )
 
-    # Frozen pair records contain mutable option dictionaries. Give every
-    # caller independent specs so edits cannot poison subsequent cache hits.
-    return PrimsTsGemmPair(
-        pair.tile_n,
-        pair.moe_config_index,
-        PrimsTsMoeGemmConfig(
-            PrimsTsConfigSpec(dict(pair.fc1.cfg.kwargs)),
-            pair.fc1.prims_ts_gemm_config_index,
-        ),
-        PrimsTsMoeGemmConfig(
-            PrimsTsConfigSpec(dict(pair.fc2.cfg.kwargs)),
-            pair.fc2.prims_ts_gemm_config_index,
-        ),
-    )
-
 
 @lru_cache(maxsize=1024)
 def _bf16_config_pair_cached(*, debug_checks: str, **kwargs) -> PrimsTsGemmPair:
     # Schedule validation reads the environment itself. Partition results by
     # debug mode so a cached production check never bypasses debug validation.
     del debug_checks
-    return _required_json_moe_config_pair(**kwargs)
+    pair = _required_json_moe_config_pair(**kwargs)
+    return PrimsTsGemmPair(
+        pair.tile_n,
+        pair.moe_config_index,
+        PrimsTsMoeGemmConfig(
+            _immutable_config_spec_cached(tuple(sorted(pair.fc1.cfg.kwargs.items()))),
+            pair.fc1.prims_ts_gemm_config_index,
+        ),
+        PrimsTsMoeGemmConfig(
+            _immutable_config_spec_cached(tuple(sorted(pair.fc2.cfg.kwargs.items()))),
+            pair.fc2.prims_ts_gemm_config_index,
+        ),
+    )
 
 
 def map_trtllm_nvfp4_moe_tactic(

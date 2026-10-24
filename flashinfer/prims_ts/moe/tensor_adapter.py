@@ -380,6 +380,7 @@ def build_bf16_launch_io(
     import cutlass
 
     from .compile_cache import get_bf16_runtime_config
+    from .config_mapper import _ImmutablePrimsTsConfigSpec
 
     if fc == "fc1":
         out_hidden = _fc1_out_hidden(intermediate_size, activation_type)
@@ -394,11 +395,14 @@ def build_bf16_launch_io(
         activation_compact = gemm1_output
         output_buf = gemm2_output
 
+    # K normalization changes scheduling fields, not weight-storage layout.
+    # Retain the precomputed scalar layout while making a private launch config.
+    weight_storage_cfg = cfg if isinstance(cfg, _ImmutablePrimsTsConfigSpec) else None
     cfg, config_hash = get_bf16_runtime_config(cfg, in_hidden)
     _validate_weight_storage(
         name="gemm1_weights" if fc == "fc1" else "gemm2_weights",
         tensor=weights,
-        cfg=cfg,
+        cfg=weight_storage_cfg if weight_storage_cfg is not None else cfg,
         num_experts=num_experts,
         out_hidden=out_hidden,
         in_hidden=in_hidden,

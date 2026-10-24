@@ -324,9 +324,9 @@ def _prepare_prims_ts_bf16_tactic(
     **kwargs: Any,
 ) -> PrimsTsGemmPair:
     """Resolve and check one tactic after call-wide validation has succeeded."""
-    from .config_mapper import map_trtllm_bf16_moe_tactic
+    from .config_mapper import _resolve_bf16_moe_tactic
 
-    pair = map_trtllm_bf16_moe_tactic(
+    pair = _resolve_bf16_moe_tactic(
         tactic,
         activation_type=int(kwargs.get("activation_type", runner.activation_type)),
         num_tokens=int(moe_inputs.hidden_states.shape[0]),

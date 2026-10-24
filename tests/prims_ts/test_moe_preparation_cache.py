@@ -28,6 +28,7 @@ def clear_caches():
         config_mapper._build_config_cached,
         config_mapper._bf16_config_pair_cached,
         config_mapper._block_major_k_bytes_cached,
+        config_mapper._immutable_config_spec_cached,
         compile_cache._bf16_spec_runtime_config_cached,
         compile_cache._bf16_runtime_config_cached,
     )
@@ -163,7 +164,7 @@ def test_runtime_config_failure_is_not_cached(config_module):
 
 
 @pytest.mark.parametrize("layout", [WeightLayout.MajorK, WeightLayout.BlockMajorK])
-@pytest.mark.parametrize("use_spec", [False, True])
+@pytest.mark.parametrize("use_spec", [False, True, "immutable"])
 @pytest.mark.parametrize("fc", ["fc1", "fc2"])
 @pytest.mark.parametrize("swap_ab", [False, True])
 def test_launch_io_refreshes_tensor_pointers_and_shapes(
@@ -190,6 +191,11 @@ def test_launch_io_refreshes_tensor_pointers_and_shapes(
         if use_spec
         else config_module.make_config(**options)
     )
+
+    if use_spec == "immutable":
+        cfg = config_mapper._immutable_config_spec_cached(
+            tuple(sorted(options.items()))
+        )
 
     weight_shape = (2, 128, 128) if layout == WeightLayout.MajorK else (2, 2, 128, 64)
 
@@ -219,6 +225,15 @@ def test_launch_io_refreshes_tensor_pointers_and_shapes(
     old_inputs, new_inputs = inputs(2), inputs(4)
     old = tensor_adapter.build_bf16_launch_io(**old_inputs)
     assert make_ptr.call_count == 8
+    if use_spec == "immutable":
+
+        def unexpected_layout(_self):
+            pytest.fail("Warm immutable launch must use its precomputed weight layout")
+
+        for name in ("block_major_k_bytes", "weight_dtype_tma_bits"):
+            monkeypatch.setattr(
+                config_module.BatchedGemmConfig, name, property(unexpected_layout)
+            )
     new = tensor_adapter.build_bf16_launch_io(**new_inputs)
     assert make_ptr.call_count == 16
     for name in (
@@ -386,3 +401,78 @@ def test_spec_runtime_failure_is_not_cached():
         with pytest.raises(ValueError, match="requires tile_k=128"):
             compile_cache.get_bf16_runtime_config(spec, 128)
     assert compile_cache._bf16_spec_runtime_config_cached.cache_info().currsize == 0
+
+
+def test_internal_specs_are_immutable_and_public_mutations_are_isolated(map_pair):
+    from dataclasses import FrozenInstanceError
+
+    pair = config_mapper._resolve_bf16_moe_tactic([128, 0])
+    spec = pair.fc1.cfg
+    assert isinstance(spec, config_mapper._ImmutablePrimsTsConfigSpec)
+    assert config_mapper._resolve_bf16_moe_tactic([128, 0]) is pair
+    with pytest.raises(FrozenInstanceError):
+        spec.block_major_k_bytes = 999
+    with pytest.raises(TypeError):
+        spec.config_items[0] = ("tile_n", 256)
+    public = config_mapper.map_trtllm_bf16_moe_tactic([128, 0])
+    public.fc1.cfg.kwargs["tile_n"] = 256
+    public.fc1.cfg.kwargs["tile_k"] = 128
+    assert spec.build().tile_n == 128
+    assert config_mapper._resolve_bf16_moe_tactic([128, 0]) is pair
+    assert map_pair.call_count == 1
+
+
+def test_internal_warm_preparation_does_not_sort_build_or_recompute_layout(
+    map_pair, monkeypatch, config_module
+):
+    pair = config_mapper._resolve_bf16_moe_tactic([128, 0])
+    expected, expected_key = compile_cache.get_bf16_runtime_config(pair.fc1.cfg, 128)
+    expected_fields = asdict(expected)
+    block_bytes = pair.fc1.cfg.block_major_k_bytes
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Warm immutable preparation must reuse keys and layout metadata")
+
+    monkeypatch.setattr(config_mapper, "sorted", unexpected, raising=False)
+    monkeypatch.setattr(compile_cache, "sorted", unexpected, raising=False)
+    monkeypatch.setattr(config_mapper, "_build_config_cached", unexpected)
+    monkeypatch.setattr(compile_cache, "_build_config_cached", unexpected)
+    monkeypatch.setattr(
+        config_module.BatchedGemmConfig, "block_major_k_bytes", property(unexpected)
+    )
+    for _ in range(2):
+        same_pair = config_mapper._resolve_bf16_moe_tactic([128, 0])
+        assert same_pair is pair
+        assert same_pair.fc1.cfg.block_major_k_bytes == block_bytes
+        launch_cfg, key = compile_cache.get_bf16_runtime_config(same_pair.fc1.cfg, 128)
+        assert asdict(launch_cfg) == expected_fields
+        assert key == expected_key
+        launch_cfg.tile_n = 256
+        launch_cfg.num_mma_warps = 99
+
+
+@pytest.mark.parametrize("layout", [WeightLayout.MajorK, WeightLayout.BlockMajorK])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("k", [128, 192])
+def test_immutable_specs_match_runtime_config_hash_and_layout(layout, swap_ab, k):
+    options = dict(
+        dtype_a=3,
+        dtype_b=3,
+        dtype_c=3,
+        mma_k=16,
+        tile_k=64,
+        batch_mode=0 if swap_ab else 1,
+        transpose_mma_output=int(swap_ab),
+        weight_layout=int(layout),
+        use_unroll_loop_2x_for_mma=1,
+    )
+    public = config_mapper.PrimsTsConfigSpec(options)
+    spec = config_mapper._immutable_config_spec_cached(tuple(sorted(options.items())))
+    original, original_key = compile_cache.get_bf16_runtime_config(public.build(), k)
+    actual, key = compile_cache.get_bf16_runtime_config(spec, k)
+    assert asdict(actual) == asdict(original)
+    assert key == original_key
+    assert spec.weight_layout == original.weight_layout
+    assert spec.weight_dtype_tma_bits == original.weight_dtype_tma_bits
+    assert spec.block_major_k_bytes == original.block_major_k_bytes
+    assert actual.use_unroll_loop_2x_for_mma == (1 if k == 128 else 0)

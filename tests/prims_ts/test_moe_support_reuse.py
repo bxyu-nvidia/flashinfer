@@ -106,7 +106,7 @@ def invocation(modules, monkeypatch):
         if tuple(tactic) == (-1, -1)
         else selected_pair
     )
-    monkeypatch.setattr(modules.mapper, "map_trtllm_bf16_moe_tactic", mapping)
+    monkeypatch.setattr(modules.mapper, "_resolve_bf16_moe_tactic", mapping)
     check = Mock(wraps=modules.support._check_prims_ts_bf16_call)
     monkeypatch.setattr(modules.backend, "_check_prims_ts_bf16_call", check)
     monkeypatch.setattr(modules.runner, "_check_prims_ts_bf16_call", check)
