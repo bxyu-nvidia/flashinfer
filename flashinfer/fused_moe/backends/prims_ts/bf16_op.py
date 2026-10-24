@@ -16,12 +16,16 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from copy import copy
+from functools import lru_cache
+from threading import Lock
 from typing import List, Optional, Union
 
 import torch
 
 from flashinfer.api_logging import flashinfer_api
-from flashinfer.autotuner import AutoTuner
+from flashinfer.autotuner import AutoTuner, TuningConfig
 from flashinfer.fused_moe.shared.inputs import (
     MoeRunnerInputs,
     RoutingInputMode,
@@ -44,6 +48,62 @@ from flashinfer.utils import (
     register_custom_op,
     register_fake_op,
 )
+
+
+_BF16_TUNING_CONFIG_CACHE: OrderedDict[tuple, TuningConfig] = OrderedDict()
+_BF16_TUNING_CONFIG_CACHE_LOCK = Lock()
+_BF16_TUNING_CONFIG_CACHE_SIZE = 256
+
+
+@lru_cache(maxsize=64)
+def _empty_routing_placeholder(
+    device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    # Callers pass hidden_states.device, which includes the CUDA device index.
+    # These tensors have no elements and are only read as absent-route markers.
+    return torch.empty(0, dtype=dtype, device=device)
+
+
+def _get_bf16_tuning_config(
+    runner: PrimsTsBf16MoERunner,
+    inputs: MoeRunnerInputs,
+    *,
+    tune_max_num_tokens: int,
+    routing_input_mode: RoutingInputMode,
+) -> TuningConfig:
+    # BF16 setup supplies no scale, LoRA, or per-token-scale tensors. Its tuning
+    # layout depends on input presence, not token count, tensor addresses or
+    # device. Initializers capture expert count/routing mode, never live inputs.
+    key = (
+        runner.num_experts,
+        runner.hidden_size,
+        routing_input_mode,
+        tune_max_num_tokens,
+        tuple(getattr(inputs, name) is not None for name in MoeRunnerInputs._FIELDS),
+    )
+    with _BF16_TUNING_CONFIG_CACHE_LOCK:
+        config = _BF16_TUNING_CONFIG_CACHE.get(key)
+        if config is not None:
+            _BF16_TUNING_CONFIG_CACHE.move_to_end(key)
+    if config is None:
+        config = runner._make_tuning_config(
+            inputs,
+            tune_max_num_tokens=tune_max_num_tokens,
+            routing_input_mode=routing_input_mode,
+            use_cuda_graph=True,
+            use_cold_l2_cache=True,
+        )
+        with _BF16_TUNING_CONFIG_CACHE_LOCK:
+            config = _BF16_TUNING_CONFIG_CACHE.setdefault(key, config)
+            _BF16_TUNING_CONFIG_CACHE.move_to_end(key)
+            if len(_BF16_TUNING_CONFIG_CACHE) > _BF16_TUNING_CONFIG_CACHE_SIZE:
+                _BF16_TUNING_CONFIG_CACHE.popitem(last=False)
+    # Preserve per-call mutable records while reusing buckets and callbacks.
+    result = copy(config)
+    result.dynamic_tensor_specs = tuple(
+        copy(spec) for spec in config.dynamic_tensor_specs
+    )
+    return result
 
 
 def _get_moe_op():
@@ -123,9 +183,9 @@ def prims_ts_bf16_moe_op(
             )
 
         if routing_logits is not None:
-            topk_ids = torch.empty(0, dtype=torch.int32, device=hidden_states.device)
-            expert_weights = torch.empty(
-                0, dtype=routing_logits.dtype, device=hidden_states.device
+            topk_ids = _empty_routing_placeholder(hidden_states.device, torch.int32)
+            expert_weights = _empty_routing_placeholder(
+                hidden_states.device, routing_logits.dtype
             )
         else:
             assert topk_ids is not None
@@ -136,7 +196,7 @@ def prims_ts_bf16_moe_op(
             expert_weights = (
                 expert_weights
                 if expert_weights is not None
-                else torch.empty(0, dtype=torch.bfloat16, device=hidden_states.device)
+                else _empty_routing_placeholder(hidden_states.device, torch.bfloat16)
             )
         routing_input_mode = (
             RoutingInputMode.FromLogits
@@ -170,12 +230,11 @@ def prims_ts_bf16_moe_op(
             gemm1_lora_delta=None,
             per_token_scale=None,
         )
-        tuning_config = moe_runner._make_tuning_config(
+        tuning_config = _get_bf16_tuning_config(
+            moe_runner,
             moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
             routing_input_mode=routing_input_mode,
-            use_cuda_graph=True,
-            use_cold_l2_cache=True,
         )
 
         common_kwargs = dict(
