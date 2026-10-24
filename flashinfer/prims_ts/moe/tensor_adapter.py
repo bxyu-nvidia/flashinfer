@@ -361,7 +361,7 @@ def build_bf16_launch_io(
     gemm1_beta: torch.Tensor | None = None,
     gemm1_clamp_limit: torch.Tensor | None = None,
     gemm1_output: torch.Tensor,
-    gemm2_output: torch.Tensor,
+    gemm2_output: torch.Tensor | None,
     tile_idx: torch.Tensor,
     mn_limit: torch.Tensor,
     route_map: torch.Tensor,
@@ -375,6 +375,7 @@ def build_bf16_launch_io(
     intermediate_size: int,
     hidden_size: int,
     _reuse_fc1_io: dict | None = None,
+    _prepared_runtime_config: tuple | None = None,
 ) -> dict:
     """Build Prims-TS launch IO from TRT-LLM routing/workspace tensors."""
     from cutlass.cute.runtime import make_ptr
@@ -394,12 +395,18 @@ def build_bf16_launch_io(
         in_hidden = intermediate_size
         weights = gemm2_weights
         activation_compact = gemm1_output
+        if gemm2_output is None:
+            raise ValueError("gemm2_output is required for FC2")
         output_buf = gemm2_output
 
     # K normalization changes scheduling fields, not weight-storage layout.
     # Retain the precomputed scalar layout while making a private launch config.
     weight_storage_cfg = cfg if isinstance(cfg, _ImmutablePrimsTsConfigSpec) else None
-    cfg, config_hash = get_bf16_runtime_config(cfg, in_hidden)
+    cfg, config_hash = (
+        get_bf16_runtime_config(cfg, in_hidden)
+        if _prepared_runtime_config is None
+        else _prepared_runtime_config
+    )
     _validate_weight_storage(
         name="gemm1_weights" if fc == "fc1" else "gemm2_weights",
         tensor=weights,

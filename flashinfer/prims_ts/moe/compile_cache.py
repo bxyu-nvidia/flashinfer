@@ -146,6 +146,22 @@ def _compile_target_key(io: dict) -> tuple[int, str]:
     return int(device_index), _get_compile_arch()
 
 
+def _compiled_gemm_key(cfg_hash: str, fc1_or_fc2: str, io: dict) -> tuple:
+    device_index, compile_arch = _compile_target_key(io)
+    return (
+        cfg_hash,
+        fc1_or_fc2,
+        get_compile_options(),
+        device_index,
+        compile_arch,
+    )
+
+
+def find_compiled_gemm(cfg_hash: str, fc1_or_fc2: str, io: dict) -> Any | None:
+    """Look up an existing GEMM without requiring routing buffers or compiling."""
+    return _COMPILED_GEMM_CACHE.get(_compiled_gemm_key(cfg_hash, fc1_or_fc2, io))
+
+
 def get_compiled_gemm(cfg_hash: str, fc1_or_fc2: str, io: dict, stream: Any) -> Any:
     """Compile and cache a TS GEMM for the supplied launch IO.
 
@@ -155,14 +171,7 @@ def get_compiled_gemm(cfg_hash: str, fc1_or_fc2: str, io: dict, stream: Any) -> 
     does not depend on their values and they must not be part of the cache key.
     """
 
-    device_index, compile_arch = _compile_target_key(io)
-    key = (
-        cfg_hash,
-        fc1_or_fc2,
-        get_compile_options(),
-        device_index,
-        compile_arch,
-    )
+    key = _compiled_gemm_key(cfg_hash, fc1_or_fc2, io)
     if key in _COMPILED_GEMM_CACHE:
         return _COMPILED_GEMM_CACHE[key]
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import _compile_for_launch

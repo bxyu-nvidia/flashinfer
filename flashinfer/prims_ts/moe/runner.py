@@ -48,7 +48,12 @@ from flashinfer.tllm_enums import (
 )
 from flashinfer.utils import get_compute_capability, round_up
 
-from .compile_cache import get_compiled_gemm, stable_config_hash
+from .compile_cache import (
+    find_compiled_gemm,
+    get_bf16_runtime_config,
+    get_compiled_gemm,
+    stable_config_hash,
+)
 from .config_mapper import (
     PrimsTsGemmPair,
     map_trtllm_deepseek_fp8_moe_tactic,
@@ -728,6 +733,14 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
 
+        # Resolve the warm FC1 executable before routing. A cache miss still
+        # compiles below, once the actual routing buffers are available.
+        with torch.cuda.nvtx.range("prims_ts/fc1_pre_route"):
+            fc1_runtime_config = get_bf16_runtime_config(pair.fc1.cfg, self.hidden_size)
+            fc1_fn = find_compiled_gemm(
+                fc1_runtime_config[1], "fc1", {"_keepalive": (hidden_states,)}
+            )
+
         with torch.cuda.nvtx.range("prims_ts/routing"):
             routing_out = self.moe_op.trtllm_moe_run_routing(
                 moe_inputs.routing_logits,
@@ -757,17 +770,13 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
         with torch.cuda.nvtx.range("prims_ts/routing_outputs"):
             (
-                expert_weights,
-                expanded_idx_to_permuted_idx,
                 permuted_idx_to_token_idx,
                 tile_idx,
                 mn_limit,
                 num_non_exiting_ctas,
                 total_num_padded_tokens,
                 gemm1_output,
-                gemm2_output,
-            ) = _torch_views_of_ffi_tensors(routing_out)
-            expert_weights = _select_expert_weights(moe_inputs, expert_weights)
+            ) = _torch_views_of_ffi_tensors(routing_out[2:8])
             routed_token_capacity = _routed_token_capacity(
                 self,
                 moe_inputs,
@@ -780,6 +789,7 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             fc1_io = build_bf16_launch_io(
                 fc="fc1",
                 cfg=pair.fc1.cfg,
+                _prepared_runtime_config=fc1_runtime_config,
                 hidden_states=hidden_states,
                 gemm1_weights=kwargs["gemm1_weights"],
                 gemm2_weights=kwargs["gemm2_weights"],
@@ -787,7 +797,7 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 gemm2_bias=kwargs.get("gemm2_bias"),
                 **_gemm1_oa_io_kwargs(kwargs),
                 gemm1_output=gemm1_output,
-                gemm2_output=gemm2_output,
+                gemm2_output=None,
                 tile_idx=tile_idx,
                 mn_limit=mn_limit,
                 route_map=permuted_idx_to_token_idx,
@@ -802,12 +812,20 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 hidden_size=self.hidden_size,
             )
 
-        with torch.cuda.nvtx.range("prims_ts/fc1_compile_lookup"):
-            fc1_hash = fc1_io["config_hash"]
-            fc1_fn = get_compiled_gemm(fc1_hash, "fc1", fc1_io, stream)
+        if fc1_fn is None:
+            with torch.cuda.nvtx.range("prims_ts/fc1_compile_lookup"):
+                fc1_fn = get_compiled_gemm(fc1_io["config_hash"], "fc1", fc1_io, stream)
 
         with torch.cuda.nvtx.range("prims_ts/fc1_launch"):
             fc1_fn(*self._launch_args(fc1_io, stream))
+
+        # These three outputs are only needed by FC2/finalize. Convert them
+        # after submitting FC1 so their host overhead can overlap its execution.
+        with torch.cuda.nvtx.range("prims_ts/routing_outputs_deferred"):
+            expert_weights, expanded_idx_to_permuted_idx, gemm2_output = (
+                _torch_views_of_ffi_tensors(routing_out[:2] + routing_out[8:9])
+            )
+            expert_weights = _select_expert_weights(moe_inputs, expert_weights)
 
         with torch.cuda.nvtx.range("prims_ts/fc2_prepare"):
             fc2_io = build_bf16_launch_io(
