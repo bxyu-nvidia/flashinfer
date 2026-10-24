@@ -74,10 +74,22 @@ def _get_compile_arch() -> str:
     If not set, detect from the current CUDA device.
     """
     arch = os.environ.get("CUTE_DSL_ARCH")
-    if not arch:
+    if arch:
+        # Explicit targets also work without initializing CUDA.
+        return _get_compile_arch_cached(None, arch)
+
+    import torch
+
+    return _get_compile_arch_cached(torch.cuda.current_device(), None)
+
+
+@functools.lru_cache(maxsize=64)
+def _get_compile_arch_cached(device_index: Optional[int], arch: Optional[str]) -> str:
+    """Cache target resolution without freezing the active device or override."""
+    if arch is None:
         import torch
 
-        major, minor = torch.cuda.get_device_capability()
+        major, minor = torch.cuda.get_device_capability(device_index)
         suffix = "a" if major >= 9 else ""
         arch = f"sm_{major}{minor}{suffix}"
     return sanitize_symbol_name(arch.replace("_", ""))
