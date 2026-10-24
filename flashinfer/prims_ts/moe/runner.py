@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+from functools import lru_cache
 from typing import Any, List, Optional
 
 import torch
@@ -399,6 +400,44 @@ def _quantize_nvfp4_fc1_output_for_fc2(
     return activation_output, activation_output_scale, per_token_scale_fc2
 
 
+# Cache only scalar metadata, never input tensors. Avoid reconstructing the
+# MoeRunnerInputs dataclass just to inspect four optional fields.
+_CACHE_KEY_INPUT_INDICES = tuple(
+    MoeRunnerInputs.idx(name)
+    for name in (
+        "per_token_scale",
+        "gemm1_lora_delta",
+        "routing_logits",
+        "expert_weights",
+    )
+)
+
+
+@lru_cache(maxsize=256)
+def _prims_ts_cache_key_extras(
+    dtype_act: int,
+    dtype_weights: int,
+    fp8_quantization_type: int,
+    activation_type: int,
+    use_per_token_scaling: bool,
+    input_presence: tuple[bool, ...],
+    static_extras: tuple,
+) -> tuple:
+    return (
+        ("prims_ts_moe_config_version", 4),
+        ("dtype_act", dtype_act),
+        ("dtype_weights", dtype_weights),
+        ("fp8_quantization_type", fp8_quantization_type),
+        ("activation_type", activation_type),
+        ("use_per_token_scaling", use_per_token_scaling),
+        ("per_token_scale", input_presence[0]),
+        ("gemm1_lora_delta", input_presence[1]),
+        ("routing_logits", input_presence[2]),
+        ("expert_weights", input_presence[3]),
+        *static_extras,
+    )
+
+
 class _PrimsTsMoERunnerMixin:
     _cache_key_static_extras: tuple = ()
 
@@ -440,25 +479,14 @@ class _PrimsTsMoERunnerMixin:
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-        moe_inputs = MoeRunnerInputs.from_list(inputs)
-        return (
-            ("prims_ts_moe_config_version", 4),
-            ("dtype_act", int(self.dtype_act)),
-            ("dtype_weights", int(self.dtype_weights)),
-            ("fp8_quantization_type", int(self.fp8_quantization_type)),
-            ("activation_type", int(self.activation_type)),
-            ("use_per_token_scaling", bool(self.use_per_token_scaling)),
-            ("per_token_scale", moe_inputs.per_token_scale is not None),
-            ("gemm1_lora_delta", moe_inputs.gemm1_lora_delta is not None),
-            (
-                "routing_logits",
-                moe_inputs.routing_logits is not None,
-            ),
-            (
-                "expert_weights",
-                moe_inputs.expert_weights is not None,
-            ),
-            *getattr(self, "_cache_key_static_extras", ()),
+        return _prims_ts_cache_key_extras(
+            int(self.dtype_act),
+            int(self.dtype_weights),
+            int(self.fp8_quantization_type),
+            int(self.activation_type),
+            bool(self.use_per_token_scaling),
+            tuple(inputs[i] is not None for i in _CACHE_KEY_INPUT_INDICES),
+            self._cache_key_static_extras,
         )
 
     def precompile_tactics(
@@ -507,6 +535,26 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
     """Autotuned Prims-TS BF16 MoE runner using shared TRT-LLM routing/finalize."""
 
     valid_tactics_dict: dict = {}
+    _cache_inference_selection = True
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if not name.endswith("_cache"):
+            self.__dict__.pop("_autotuner_hash_cache", None)
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if not name.endswith("_cache"):
+            self.__dict__.pop("_autotuner_hash_cache", None)
+        object.__delattr__(self, name)
+
+    def __hash__(self) -> int:
+        cached = self.__dict__.get("_autotuner_hash_cache")
+        if cached is None:
+            # Preserve TunableRunner's exact hash, including extension fields.
+            # The base implementation already excludes *_cache attributes.
+            cached = super().__hash__()
+            self.__dict__["_autotuner_hash_cache"] = cached
+        return cached
 
     def __init__(
         self,
