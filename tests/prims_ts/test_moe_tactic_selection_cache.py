@@ -311,3 +311,25 @@ def test_selection_reuses_equivalent_new_prims_runners(state, monkeypatch):
         runner.set_cache_key_static_extras(enable_pdl=True)
         assert choose((tuner, runner, inputs, config)) == -1
     assert search.call_count == 1
+
+
+def test_runner_metadata_cache_keeps_runners_independent():
+    from flashinfer.prims_ts.moe.runner import _bf16_runner_metadata
+
+    _bf16_runner_metadata.cache_clear()
+    args = dict(top_k=2, num_local_experts=4, hidden_size=128, intermediate_size=256)
+    first = PrimsTsBf16MoERunner(object(), **args)
+    second = PrimsTsBf16MoERunner(object(), **args)
+    assert _bf16_runner_metadata.cache_info().misses == 1
+    assert _bf16_runner_metadata.cache_info().hits == 1
+    first.top_k = 4
+    first.set_cache_key_static_extras(enable_pdl=True)
+    assert second.top_k == 2
+    assert second._cache_key_static_extras == ()
+    third = PrimsTsBf16MoERunner(object(), **(args | {"top_k": 3}))
+    assert third.top_k == 3
+    assert _bf16_runner_metadata.cache_info().misses == 2
+    assert _bf16_runner_metadata.cache_info().maxsize == 256
+    hash(first)
+    first.__init__(second.moe_op, **args)
+    assert hash(first) == TunableRunner.__hash__(first)

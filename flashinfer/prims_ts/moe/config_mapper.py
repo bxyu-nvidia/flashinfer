@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 from copy import copy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import IntEnum
 from functools import lru_cache
 from importlib import resources
@@ -1792,10 +1792,17 @@ def map_trtllm_bf16_moe_tactic(
 
     # Frozen pair records contain mutable option dictionaries. Give every
     # caller independent specs so edits cannot poison subsequent cache hits.
-    return replace(
-        pair,
-        fc1=replace(pair.fc1, cfg=PrimsTsConfigSpec(dict(pair.fc1.cfg.kwargs))),
-        fc2=replace(pair.fc2, cfg=PrimsTsConfigSpec(dict(pair.fc2.cfg.kwargs))),
+    return PrimsTsGemmPair(
+        pair.tile_n,
+        pair.moe_config_index,
+        PrimsTsMoeGemmConfig(
+            PrimsTsConfigSpec(dict(pair.fc1.cfg.kwargs)),
+            pair.fc1.prims_ts_gemm_config_index,
+        ),
+        PrimsTsMoeGemmConfig(
+            PrimsTsConfigSpec(dict(pair.fc2.cfg.kwargs)),
+            pair.fc2.prims_ts_gemm_config_index,
+        ),
     )
 
 

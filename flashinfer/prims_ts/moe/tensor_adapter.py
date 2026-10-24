@@ -286,6 +286,7 @@ def _make_gemm1_oa_ptrs(
     gemm1_alpha: torch.Tensor | None,
     gemm1_beta: torch.Tensor | None,
     gemm1_clamp_limit: torch.Tensor | None,
+    dummy_float_ptr=None,
 ) -> tuple:
     alpha = _select_gemm1_oa_param(
         name="gemm1_alpha",
@@ -314,23 +315,35 @@ def _make_gemm1_oa_ptrs(
         num_experts=num_experts,
         device=device,
     )
-    alpha_dp = make_ptr(
-        cutlass.Float32,
-        alpha.data_ptr() if alpha is not None else dummy_data_ptr,
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
+    alpha_dp = (
+        dummy_float_ptr
+        if alpha is None and dummy_float_ptr is not None
+        else make_ptr(
+            cutlass.Float32,
+            alpha.data_ptr() if alpha is not None else dummy_data_ptr,
+            cutlass.AddressSpace.gmem,
+            assumed_align=16,
+        )
     )
-    beta_dp = make_ptr(
-        cutlass.Float32,
-        beta.data_ptr() if beta is not None else dummy_data_ptr,
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
+    beta_dp = (
+        dummy_float_ptr
+        if beta is None and dummy_float_ptr is not None
+        else make_ptr(
+            cutlass.Float32,
+            beta.data_ptr() if beta is not None else dummy_data_ptr,
+            cutlass.AddressSpace.gmem,
+            assumed_align=16,
+        )
     )
-    clamp_limit_dp = make_ptr(
-        cutlass.Float32,
-        clamp_limit.data_ptr() if clamp_limit is not None else dummy_data_ptr,
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
+    clamp_limit_dp = (
+        dummy_float_ptr
+        if clamp_limit is None and dummy_float_ptr is not None
+        else make_ptr(
+            cutlass.Float32,
+            clamp_limit.data_ptr() if clamp_limit is not None else dummy_data_ptr,
+            cutlass.AddressSpace.gmem,
+            assumed_align=16,
+        )
     )
     return alpha_dp, beta_dp, clamp_limit_dp, alpha, beta, clamp_limit
 
@@ -493,8 +506,11 @@ def build_bf16_launch_io(
         assumed_align=16,
     )
     dummy_data_ptr = output_buf.data_ptr()
-    sf_c_dp = make_ptr(
-        cutlass.BFloat16, dummy_data_ptr, cutlass.AddressSpace.gmem, assumed_align=16
+    # Pointer wrappers are immutable launch arguments. Reuse aliases within
+    # this invocation, while refreshing every address for the next invocation.
+    sf_c_dp = c0_dp
+    dummy_float_ptr = make_ptr(
+        cutlass.Float32, dummy_data_ptr, cutlass.AddressSpace.gmem, assumed_align=16
     )
     tile_idx_dp = make_ptr(
         cutlass.Int32, tile_idx.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=16
@@ -511,30 +527,19 @@ def build_bf16_launch_io(
         cutlass.AddressSpace.gmem,
         assumed_align=4,
     )
-    act_dp = make_ptr(
-        cutlass.BFloat16,
-        act_torch.data_ptr(),
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
+    act_dp = b_dp if cfg.is_swap_ab else a_dp
+    bias_dp = (
+        dummy_float_ptr
+        if bias_torch is None
+        else make_ptr(
+            cutlass.Float32,
+            bias_torch.data_ptr(),
+            cutlass.AddressSpace.gmem,
+            assumed_align=16,
+        )
     )
-    bias_dp = make_ptr(
-        cutlass.Float32,
-        bias_torch.data_ptr() if bias_torch is not None else dummy_data_ptr,
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
-    )
-    scale_c_dp = make_ptr(
-        cutlass.Float32,
-        dummy_data_ptr,
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
-    )
-    scale_gate_dp = make_ptr(
-        cutlass.Float32,
-        dummy_data_ptr,
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
-    )
+    scale_c_dp = dummy_float_ptr
+    scale_gate_dp = dummy_float_ptr
     (
         gemm1_alpha_dp,
         gemm1_beta_dp,
@@ -553,19 +558,10 @@ def build_bf16_launch_io(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        dummy_float_ptr=dummy_float_ptr,
     )
-    per_token_sf_a_dp = make_ptr(
-        cutlass.Float32,
-        dummy_data_ptr,
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
-    )
-    per_token_sf_b_dp = make_ptr(
-        cutlass.Float32,
-        dummy_data_ptr,
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
-    )
+    per_token_sf_a_dp = dummy_float_ptr
+    per_token_sf_b_dp = dummy_float_ptr
 
     _keepalive = [
         kernel_a,

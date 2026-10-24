@@ -531,6 +531,36 @@ class _PrimsTsMoERunnerMixin:
         return True
 
 
+@lru_cache(maxsize=256)
+def _bf16_runner_metadata(
+    top_k: int,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    activation_type: int,
+    use_shuffled_weight: bool,
+    weight_layout: int,
+    use_per_token_scaling: bool,
+    num_experts: int | None,
+) -> dict:
+    return dict(
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        dtype_act=DtypeTrtllmGen.Bfloat16,
+        dtype_weights=DtypeTrtllmGen.Bfloat16,
+        fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation_type=ActivationType(activation_type),
+        use_shuffled_weight=use_shuffled_weight,
+        weight_layout=WeightLayout(weight_layout),
+        use_per_token_scaling=use_per_token_scaling,
+        num_experts=num_experts if num_experts is not None else num_local_experts,
+        _topk_initializer_source=None,
+        _topk_initializer=None,
+    )
+
+
 class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
     """Autotuned Prims-TS BF16 MoE runner using shared TRT-LLM routing/finalize."""
 
@@ -570,21 +600,23 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         use_per_token_scaling: bool = False,
         num_experts: Optional[int] = None,
     ):
-        self.moe_op = moe_op
-        self.top_k = top_k
-        self.num_local_experts = num_local_experts
-        self.dtype_act = DtypeTrtllmGen.Bfloat16
-        self.dtype_weights = DtypeTrtllmGen.Bfloat16
-        self.fp8_quantization_type = Fp8QuantizationType.NoneFp8
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.activation_type = ActivationType(activation_type)
-        self.use_shuffled_weight = use_shuffled_weight
-        self.weight_layout = WeightLayout(weight_layout)
-        self.use_per_token_scaling = use_per_token_scaling
-        self.num_experts = num_experts if num_experts is not None else num_local_experts
-        self._topk_initializer_source = None
-        self._topk_initializer = None
+        # Only scalar model metadata is cached. Each call gets its own runner
+        # dict; tensors, static extras and mutable tuning state are never shared.
+        self.__dict__.pop("_autotuner_hash_cache", None)
+        self.__dict__.update(
+            moe_op=moe_op,
+            **_bf16_runner_metadata(
+                top_k,
+                num_local_experts,
+                hidden_size,
+                intermediate_size,
+                activation_type,
+                use_shuffled_weight,
+                weight_layout,
+                use_per_token_scaling,
+                num_experts,
+            ),
+        )
 
     def _make_tuning_config(
         self,

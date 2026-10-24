@@ -168,9 +168,8 @@ def test_launch_io_refreshes_tensor_pointers_and_shapes(
     import cutlass.cute.runtime
 
     # No GPU launches: use real CPU tensors and record each bound address.
-    monkeypatch.setattr(
-        cutlass.cute.runtime, "make_ptr", lambda dtype, address, space, **kw: address
-    )
+    make_ptr = Mock(side_effect=lambda dtype, address, space, **kw: address)
+    monkeypatch.setattr(cutlass.cute.runtime, "make_ptr", make_ptr)
     cfg = config_module.make_config(
         dtype_a=3,
         dtype_b=3,
@@ -207,7 +206,21 @@ def test_launch_io_refreshes_tensor_pointers_and_shapes(
 
     old_inputs, new_inputs = inputs(2), inputs(4)
     old = tensor_adapter.build_bf16_launch_io(**old_inputs)
+    assert make_ptr.call_count == 8
     new = tensor_adapter.build_bf16_launch_io(**new_inputs)
+    assert make_ptr.call_count == 16
+    for name in (
+        "bias_dp",
+        "scale_gate_dp",
+        "gemm1_alpha_dp",
+        "gemm1_beta_dp",
+        "gemm1_clamp_limit_dp",
+        "per_token_sf_a_dp",
+        "per_token_sf_b_dp",
+    ):
+        assert new[name] is new["scale_c_dp"]
+    assert new["sf_c_dp"] is new["c0_dp"]
+    assert new["act_dp"] is new["b_dp" if swap_ab else "a_dp"]
     activation = "hidden_states" if fc == "fc1" else "gemm1_output"
     weights = "gemm1_weights" if fc == "fc1" else "gemm2_weights"
     output = "gemm1_output" if fc == "fc1" else "gemm2_output"
@@ -228,3 +241,36 @@ def test_launch_io_refreshes_tensor_pointers_and_shapes(
     new_inputs["gemm1_weights" if fc == "fc1" else "gemm2_weights"] = torch.empty(1)
     with pytest.raises(ValueError, match="invalid MajorK shape"):
         tensor_adapter.build_bf16_launch_io(**new_inputs)
+
+
+@pytest.mark.parametrize("use_dummy", [False, True])
+def test_optional_activation_parameters_keep_live_pointers_and_validation(use_dummy):
+    import cutlass
+    from types import SimpleNamespace
+
+    cfg = SimpleNamespace(has_gemm1_alpha=1, has_gemm1_beta=0, has_gemm1_clamp_limit=0)
+    alpha = torch.ones(2, dtype=torch.float32)
+    make_ptr = Mock(side_effect=lambda dtype, address, space, **kw: (dtype, address))
+    dummy = object() if use_dummy else None
+    args = dict(
+        make_ptr=make_ptr,
+        cutlass=cutlass,
+        cfg=cfg,
+        fc="fc1",
+        dummy_data_ptr=123,
+        num_experts=2,
+        device=torch.device("cpu"),
+        gemm1_alpha=alpha,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        dummy_float_ptr=dummy,
+    )
+    result = tensor_adapter._make_gemm1_oa_ptrs(**args)
+    assert result[0] == (cutlass.Float32, alpha.data_ptr())
+    assert result[3] is alpha
+    assert make_ptr.call_count == (1 if use_dummy else 3)
+    if use_dummy:
+        assert result[1] is result[2] is dummy
+    args["gemm1_alpha"] = torch.ones(2, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="must be float32"):
+        tensor_adapter._make_gemm1_oa_ptrs(**args)
