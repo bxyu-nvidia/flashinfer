@@ -27,7 +27,7 @@ from flashinfer.tllm_enums import ActivationType, WeightLayout
 
 @pytest.mark.parametrize("warm", [False, True])
 @pytest.mark.parametrize("finalize", [False, True])
-def test_fc1_submission_overlaps_setup_and_preserves_cold_path(
+def test_fc1_submission_defers_unused_outputs_and_preserves_cold_path(
     monkeypatch, warm, finalize
 ):
     import cutlass.cute.runtime
@@ -173,9 +173,7 @@ def test_fc1_submission_overlaps_setup_and_preserves_cold_path(
         enable_pdl=False,
         do_finalize=finalize,
     )
-    # Submit routing before independent host preparation, allowing GPU routing
-    # to run while the runtime config and warm executable are looked up.
-    assert events[:3] == ["routing", "runtime_config", "find"]
+    assert events[:3] == ["runtime_config", "find", "routing"]
     split = events.index("fc1")
     assert [e for e in events[:split] if isinstance(e, tuple)] == [
         ("extract", slice(2, 8))

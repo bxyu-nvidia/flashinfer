@@ -733,6 +733,14 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
 
+        # Resolve the warm FC1 executable before routing. A cache miss still
+        # compiles below, once the actual routing buffers are available.
+        with torch.cuda.nvtx.range("prims_ts/fc1_pre_route"):
+            fc1_runtime_config = get_bf16_runtime_config(pair.fc1.cfg, self.hidden_size)
+            fc1_fn = find_compiled_gemm(
+                fc1_runtime_config[1], "fc1", {"_keepalive": (hidden_states,)}
+            )
+
         with torch.cuda.nvtx.range("prims_ts/routing"):
             routing_out = self.moe_op.trtllm_moe_run_routing(
                 moe_inputs.routing_logits,
@@ -758,15 +766,6 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 int(self.activation_type),
                 kwargs.get("norm_topk_prob", True),
                 kwargs.get("routing_replay_out"),
-            )
-
-        # Routing is submitted asynchronously on the same stream as FC1.
-        # Do independent CPU preparation now so it can overlap GPU routing.
-        # A cache miss still compiles below after adapting the routing buffers.
-        with torch.cuda.nvtx.range("prims_ts/fc1_config_lookup"):
-            fc1_runtime_config = get_bf16_runtime_config(pair.fc1.cfg, self.hidden_size)
-            fc1_fn = find_compiled_gemm(
-                fc1_runtime_config[1], "fc1", {"_keepalive": (hidden_states,)}
             )
 
         with torch.cuda.nvtx.range("prims_ts/routing_outputs"):
