@@ -333,3 +333,67 @@ def test_runner_metadata_cache_keeps_runners_independent():
     hash(first)
     first.__init__(second.moe_op, **args)
     assert hash(first) == TunableRunner.__hash__(first)
+
+
+def test_warm_selection_skips_profile_mapping_and_canonical_key(state, monkeypatch):
+    build = Mock(wraps=AutoTuner._get_cache_key)
+    nearest = Mock(wraps=AutoTuner._find_nearest_profile)
+    monkeypatch.setattr(AutoTuner, "_get_cache_key", build)
+    monkeypatch.setattr(AutoTuner, "_find_nearest_profile", nearest)
+    assert choose(state) == -1
+    assert build.call_count == nearest.call_count == 1
+    for _ in range(3):
+        assert choose(state) == -1
+    assert build.call_count == nearest.call_count == 1
+
+
+def test_selection_snapshots_mutable_specs_and_reuses_equivalent_copies(
+    state, monkeypatch
+):
+    from copy import copy
+    from flashinfer.autotuner.autotuner import ConstraintSpec
+
+    tuner, runner, inputs, _ = state
+    spec = DynamicTensorSpec(
+        input_idx=(0,),
+        dim_idx=(0,),
+        gen_tuning_buckets=(16, 32),
+        map_to_tuning_buckets=lambda n: 16,
+    )
+    config = TuningConfig(dynamic_tensor_specs=(spec,))
+    configured = (tuner, runner, inputs, config)
+    tuner.profiling_cache[key(configured)] = (7, None)
+    search = Mock(wraps=tuner.search_cache)
+    monkeypatch.setattr(tuner, "search_cache", search)
+    assert choose(configured) == 7
+    copied = TuningConfig(dynamic_tensor_specs=(copy(spec),))
+    assert choose((tuner, runner, inputs, copied)) == 7
+    assert search.call_count == 1
+    old_mapper = spec.map_to_tuning_buckets
+    spec.map_to_tuning_buckets = lambda n: 32
+    assert choose(configured) == -1
+    spec.map_to_tuning_buckets = old_mapper
+    assert choose(configured) == 7
+    assert search.call_count == 2
+    constraint = ConstraintSpec(input_idx=0, dim_idx=1, infer_shape=lambda shapes: 8)
+    config.constraint_specs = (constraint,)
+    assert choose(configured) == -1
+    constraint.dim_idx = 0
+    assert choose(configured) == -1
+    config.constraint_specs = ()
+    assert choose(configured) == 7
+    assert search.call_count == 4
+
+
+def test_selection_key_tracks_extras_independently_of_runner_hash(state, monkeypatch):
+    extras = [("variant", 0)]
+    monkeypatch.setattr(
+        SelectionRunner, "get_cache_key_extras", lambda self, inputs: tuple(extras)
+    )
+    tuner = state[0]
+    tuner.profiling_cache[key(state)] = (7, None)
+    assert choose(state) == 7
+    extras[0] = ("variant", 1)
+    assert choose(state) == -1
+    extras[0] = ("variant", 0)
+    assert choose(state) == 7

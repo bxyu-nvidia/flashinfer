@@ -2227,14 +2227,25 @@ class AutoTuner:
         if epoch != self._inference_selection_epoch:
             self._inference_selections.clear()
             self._inference_selection_epoch = epoch
-        cache_key = self._get_cache_key(
+        # This memo is for exact input shapes. Do not bucket-match or build a
+        # ProfilingCacheKey until a miss actually needs search_cache(). Snapshot
+        # the mutable spec records so edits cannot silently change stored keys;
+        # equivalent per-call copies still share the same selection.
+        return (
             custom_op,
-            runners[0],
+            runners[0].__class__.__name__,
+            hash(runners[0]),
             input_shapes,
-            tuning_config,
             runners[0].get_cache_key_extras(inputs),
+            tuple(
+                (spec.input_idx, spec.dim_idx, spec.map_to_tuning_buckets)
+                for spec in tuning_config.dynamic_tensor_specs
+            ),
+            tuple(
+                (spec.input_idx, spec.dim_idx)
+                for spec in tuning_config.constraint_specs
+            ),
         )
-        return cache_key, input_shapes
 
     def choose_one(
         self,
@@ -2311,21 +2322,20 @@ class AutoTuner:
                 selection_key = self._inference_selection_key(
                     custom_op, runners, input_shapes, tuning_config, inputs
                 )
-                if (
-                    selection_key is not None
-                    and selection_key in self._inference_selections
-                ):
-                    self._inference_selections.move_to_end(selection_key)
-                    return runners[0], self._inference_selections[selection_key]
+                if selection_key is not None:
+                    try:
+                        selected_tactic = self._inference_selections[selection_key]
+                    except KeyError:
+                        pass
+                    else:
+                        self._inference_selections.move_to_end(selection_key)
+                        return runners[0], selected_tactic
                 is_cache_hit, runner_id, tactic, _ = self.search_cache(
                     custom_op,
                     runners,
                     input_shapes,
                     tuning_config,
                     inputs=inputs,
-                    _runner_keys=[(0, selection_key[0])]
-                    if selection_key is not None
-                    else None,
                 )
                 runner = runners[runner_id]
                 # TODO: check the stored runner and tactic can implement this shape here
