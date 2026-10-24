@@ -24,6 +24,7 @@ from functools import lru_cache
 from typing import Any, List, Optional
 
 import torch
+from tvm_ffi import Array as FfiArray
 
 from flashinfer.autotuner import (
     OptimizationProfile,
@@ -184,6 +185,11 @@ def _torch_views_of_ffi_tensors(tensors: Any) -> list[Any]:
     Preserve those objects instead of exporting DLPack again: a cached raw DLPack
     capsule is one-shot and cannot safely be consumed by repeated runner calls.
     """
+    if isinstance(tensors, FfiArray):
+        # Array.__iter__ goes through __getitem__ (and an FFI length query)
+        # for every element. A public slice extracts all elements with one
+        # length check, while preserving FFI's tensor conversion/ownership.
+        tensors = tensors[:]
     return [
         (
             None
