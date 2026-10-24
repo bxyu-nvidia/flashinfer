@@ -7,6 +7,7 @@ import importlib
 import inspect
 import itertools
 import json
+import logging
 import os
 import statistics
 import tempfile
@@ -15,6 +16,7 @@ import weakref
 
 import tqdm
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from typing import (
     Any,
@@ -1498,6 +1500,49 @@ class _V2Local(threading.local):
     measure: Any = None
 
 
+class _VersionedConfigDict(dict):
+    """Track config mutations, including replacement of an existing winner."""
+
+    def __init__(self):
+        super().__init__()
+        self.token = object()
+        self.version = 0
+
+    def __setitem__(self, key, value):
+        self.version += 1
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        self.version += 1
+        super().__delitem__(key)
+
+    def clear(self):
+        self.version += 1
+        super().clear()
+
+    def update(self, *args, **kwargs):
+        # Bump before updating: even a partially failed update may mutate us.
+        self.version += 1
+        super().update(*args, **kwargs)
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self.version += 1
+        return super().setdefault(key, default)
+
+    def pop(self, *args):
+        self.version += 1
+        return super().pop(*args)
+
+    def popitem(self):
+        self.version += 1
+        return super().popitem()
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+
 class AutoTuner:
     """AutoTuner for optimizing TensorRT-LLM operations.
 
@@ -1522,7 +1567,7 @@ class AutoTuner:
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache: dict[
             ProfilingCacheKey, tuple[Any, OptimizationProfile | None]
-        ] = {}
+        ] = _VersionedConfigDict()
         # Ranked shortlists are process-local. Persisted configs retain the
         # selected winner; a later tuning session rebuilds the shortlist when
         # compound refinement needs more than one candidate.
@@ -1563,7 +1608,11 @@ class AutoTuner:
                 )
 
         # User-loaded configs from JSON files (populated by load_configs or autotune(cache=))
-        self._file_configs: dict[str, tuple[str, Any]] = {}
+        self._file_configs: dict[str, tuple[str, Any]] = _VersionedConfigDict()
+        # Opt-in, single-runner inference selections. No tensors or runners are
+        # retained; config generations invalidate both winners and fallbacks.
+        self._inference_selections: OrderedDict[tuple, Any] = OrderedDict()
+        self._inference_selection_epoch: tuple | None = None
         # AMBIENT managed store attached by autotune_v2 (ManagedAutotuneCache).
         # Design doc: docs/design_docs/autotuner_v2.md §2.1 -- process-lifetime
         # attach is forced by both consumers serving OUTSIDE any context; a
@@ -1810,7 +1859,7 @@ class AutoTuner:
             key = ("__policy__", *fields)
         part = self._winner_partitions.get(key)
         if part is None:
-            part = self._winner_partitions[key] = {}
+            part = self._winner_partitions[key] = _VersionedConfigDict()
         return part
 
     def _get_skip_ops_stack(self) -> list[frozenset[str]]:
@@ -1902,6 +1951,8 @@ class AutoTuner:
         input_shapes: tuple[tuple[int, ...], ...],
         tuning_config: TuningConfig,
         inputs: list[torch.Tensor] | None = None,
+        *,
+        _runner_keys: list[tuple[int, ProfilingCacheKey]] | None = None,
     ) -> tuple[bool, int, Any, OptimizationProfile | None]:
         """Search for cached profiling results matching the current configuration.
 
@@ -1943,12 +1994,16 @@ class AutoTuner:
             winners = self._winner_cache()
             runner_keys: list[tuple[int, ProfilingCacheKey]] = []
             for r_id, r in enumerate(runners):
-                cache_key = AutoTuner._get_cache_key(
-                    custom_op,
-                    r,
-                    input_shapes,
-                    tuning_config,
-                    r.get_cache_key_extras(inputs) if inputs is not None else (),
+                cache_key = (
+                    _runner_keys[r_id][1]
+                    if _runner_keys is not None
+                    else AutoTuner._get_cache_key(
+                        custom_op,
+                        r,
+                        input_shapes,
+                        tuning_config,
+                        r.get_cache_key_extras(inputs) if inputs is not None else (),
+                    )
                 )
                 runner_keys.append((r_id, cache_key))
                 if cache_key in winners:
@@ -2140,6 +2195,58 @@ class AutoTuner:
         )
         return new_config
 
+    def _inference_selection_key(
+        self,
+        custom_op: str,
+        runners: list[TunableRunner],
+        input_shapes: tuple[tuple[int, ...], ...],
+        tuning_config: TuningConfig,
+        inputs: list[torch.Tensor],
+    ) -> tuple | None:
+        # Only runners whose inference selection depends on shapes and key
+        # extras may opt in. Dynamic validators and external stores keep their
+        # normal lookup path. Caller holds _lock and has applied overrides.
+        if (
+            len(runners) != 1
+            or not getattr(runners[0], "_cache_inference_selection", False)
+            or callable(getattr(runners[0], "validate_tactic", None))
+            or self._active_managed_store is not None
+            or os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
+            or logger.isEnabledFor(logging.DEBUG)
+        ):
+            return None
+        winners = self._winner_cache()
+        files = self._file_configs
+        if not isinstance(winners, _VersionedConfigDict) or not isinstance(
+            files, _VersionedConfigDict
+        ):
+            # A caller replacing the public dict with an untracked mapping
+            # must still see subsequent mutations immediately.
+            return None
+        epoch = (winners.token, winners.version, files.token, files.version)
+        if epoch != self._inference_selection_epoch:
+            self._inference_selections.clear()
+            self._inference_selection_epoch = epoch
+        # This memo is for exact input shapes. Do not bucket-match or build a
+        # ProfilingCacheKey until a miss actually needs search_cache(). Snapshot
+        # the mutable spec records so edits cannot silently change stored keys;
+        # equivalent per-call copies still share the same selection.
+        return (
+            custom_op,
+            runners[0].__class__.__name__,
+            hash(runners[0]),
+            input_shapes,
+            runners[0].get_cache_key_extras(inputs),
+            tuple(
+                (spec.input_idx, spec.dim_idx, spec.map_to_tuning_buckets)
+                for spec in tuning_config.dynamic_tensor_specs
+            ),
+            tuple(
+                (spec.input_idx, spec.dim_idx)
+                for spec in tuning_config.constraint_specs
+            ),
+        )
+
     def choose_one(
         self,
         custom_op: str,
@@ -2212,8 +2319,23 @@ class AutoTuner:
 
             # Early return if it's not tuning, use cache found one or fallback one
             if not self.is_tuning_mode:
+                selection_key = self._inference_selection_key(
+                    custom_op, runners, input_shapes, tuning_config, inputs
+                )
+                if selection_key is not None:
+                    try:
+                        selected_tactic = self._inference_selections[selection_key]
+                    except KeyError:
+                        pass
+                    else:
+                        self._inference_selections.move_to_end(selection_key)
+                        return runners[0], selected_tactic
                 is_cache_hit, runner_id, tactic, _ = self.search_cache(
-                    custom_op, runners, input_shapes, tuning_config, inputs=inputs
+                    custom_op,
+                    runners,
+                    input_shapes,
+                    tuning_config,
+                    inputs=inputs,
                 )
                 runner = runners[runner_id]
                 # TODO: check the stored runner and tactic can implement this shape here
@@ -2222,12 +2344,22 @@ class AutoTuner:
                 # Record the cache miss config.
                 # Expect no cache miss in inference. Thus, any cache miss should be recorded.
                 if not is_cache_hit:
-                    logger.debug(
-                        f"[AutoTuner]: Using fallback tactic for {custom_op} with input shapes {input_shapes}"
-                    )
-                    logger.debug(
-                        f"[AutoTuner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config, runners[0].get_cache_key_extras(inputs))}"
-                    )
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "[AutoTuner]: Using fallback tactic for %s with input shapes %s",
+                            custom_op,
+                            input_shapes,
+                        )
+                        logger.debug(
+                            "[AutoTuner]: Generated key%s",
+                            AutoTuner._get_cache_key(
+                                custom_op,
+                                runners[0],
+                                input_shapes,
+                                tuning_config,
+                                runners[0].get_cache_key_extras(inputs),
+                            ),
+                        )
 
                     # If the user has loaded an autotune cache (via
                     # ``autotune(cache=...)``) or warmed up profiling
@@ -2277,8 +2409,14 @@ class AutoTuner:
                                 f"max_num_tokens during the next tuning "
                                 f"pass to avoid this perf cliff."
                             )
+                if selection_key is not None:
+                    self._inference_selections[selection_key] = tactic
+                    if len(self._inference_selections) > 1024:
+                        self._inference_selections.popitem(last=False)
                 return runner, tactic
 
+            # Never let a serving fallback survive a tuning pass.
+            self._inference_selections.clear()
             assert len(runners) > 0, "At least one runner is required"
             assert all([isinstance(r, TunableRunner) for r in runners]), (
                 "All Given runners must be subclass of TunableRunner"
@@ -3830,6 +3968,8 @@ class AutoTuner:
     def clear_cache(self) -> None:
         """Clear the profiling cache and user-loaded file configs."""
         with self._lock:
+            self._inference_selections.clear()
+            self._inference_selection_epoch = None
             self.profiling_cache.clear()
             self._ranked_tactics_cache.clear()
             self._profiling_cache_policies.clear()

@@ -16,12 +16,16 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from copy import copy
+from functools import lru_cache
+from threading import Lock
 from typing import List, Optional, Union
 
 import torch
 
 from flashinfer.api_logging import flashinfer_api
-from flashinfer.autotuner import AutoTuner
+from flashinfer.autotuner import AutoTuner, TuningConfig
 from flashinfer.fused_moe.shared.inputs import (
     MoeRunnerInputs,
     RoutingInputMode,
@@ -32,7 +36,10 @@ from flashinfer.fused_moe.shared.validation import (
     validate_bf16_gemm1_activation_params as _validate_bf16_gemm1_activation_params,
 )
 from flashinfer.prims_ts.moe.runner import PrimsTsBf16MoERunner
-from flashinfer.prims_ts.moe.support import is_prims_ts_bf16_supported
+from flashinfer.prims_ts.moe.support import (
+    _check_prims_ts_bf16_call,
+    _prepare_prims_ts_bf16_tactic,
+)
 from flashinfer.tllm_enums import ActivationType, WeightLayout
 from flashinfer.trace.templates.moe import (
     trtllm_bf16_moe_trace,
@@ -44,6 +51,62 @@ from flashinfer.utils import (
     register_custom_op,
     register_fake_op,
 )
+
+
+_BF16_TUNING_CONFIG_CACHE: OrderedDict[tuple, TuningConfig] = OrderedDict()
+_BF16_TUNING_CONFIG_CACHE_LOCK = Lock()
+_BF16_TUNING_CONFIG_CACHE_SIZE = 256
+
+
+@lru_cache(maxsize=64)
+def _empty_routing_placeholder(
+    device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    # Callers pass hidden_states.device, which includes the CUDA device index.
+    # These tensors have no elements and are only read as absent-route markers.
+    return torch.empty(0, dtype=dtype, device=device)
+
+
+def _get_bf16_tuning_config(
+    runner: PrimsTsBf16MoERunner,
+    inputs: MoeRunnerInputs,
+    *,
+    tune_max_num_tokens: int,
+    routing_input_mode: RoutingInputMode,
+) -> TuningConfig:
+    # BF16 setup supplies no scale, LoRA, or per-token-scale tensors. Its tuning
+    # layout depends on input presence, not token count, tensor addresses or
+    # device. Initializers capture expert count/routing mode, never live inputs.
+    key = (
+        runner.num_experts,
+        runner.hidden_size,
+        routing_input_mode,
+        tune_max_num_tokens,
+        tuple(getattr(inputs, name) is not None for name in MoeRunnerInputs._FIELDS),
+    )
+    with _BF16_TUNING_CONFIG_CACHE_LOCK:
+        config = _BF16_TUNING_CONFIG_CACHE.get(key)
+        if config is not None:
+            _BF16_TUNING_CONFIG_CACHE.move_to_end(key)
+    if config is None:
+        config = runner._make_tuning_config(
+            inputs,
+            tune_max_num_tokens=tune_max_num_tokens,
+            routing_input_mode=routing_input_mode,
+            use_cuda_graph=True,
+            use_cold_l2_cache=True,
+        )
+        with _BF16_TUNING_CONFIG_CACHE_LOCK:
+            config = _BF16_TUNING_CONFIG_CACHE.setdefault(key, config)
+            _BF16_TUNING_CONFIG_CACHE.move_to_end(key)
+            if len(_BF16_TUNING_CONFIG_CACHE) > _BF16_TUNING_CONFIG_CACHE_SIZE:
+                _BF16_TUNING_CONFIG_CACHE.popitem(last=False)
+    # Preserve per-call mutable records while reusing buckets and callbacks.
+    result = copy(config)
+    result.dynamic_tensor_specs = tuple(
+        copy(spec) for spec in config.dynamic_tensor_specs
+    )
+    return result
 
 
 def _get_moe_op():
@@ -87,149 +150,163 @@ def prims_ts_bf16_moe_op(
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
-    assert routing_logits is not None or topk_ids is not None, (
-        "either routing_logits or topk_ids must be provided"
-    )
-    if gemm1_lora_delta is not None:
-        raise NotImplementedError("Prims-TS BF16 MoE does not support gemm1_lora_delta")
-
-    _validate_bf16_gemm1_activation_params(
-        activation_type,
-        gemm1_alpha,
-        gemm1_beta,
-        gemm1_clamp_limit,
-        local_num_experts,
-        hidden_states.device,
-    )
-    if enable_pdl is None:
-        enable_pdl = device_support_pdl(hidden_states.device)
-
-    num_tokens = hidden_states.shape[0]
-    hidden_size = hidden_states.shape[-1]
-    if output is None:
-        output = alloc_trtllm_moe_output(
-            num_tokens, hidden_size, do_finalize, hidden_states.device
+    with torch.cuda.nvtx.range("prims_ts/setup"):
+        assert routing_logits is not None or topk_ids is not None, (
+            "either routing_logits or topk_ids must be provided"
         )
-    elif do_finalize:
-        check_shape_dtype_device(
-            output,
-            (num_tokens, hidden_size),
-            torch.bfloat16,
-            hidden_states.device,
-            "output",
-        )
-
-    if routing_logits is not None:
-        topk_ids = torch.empty(0, dtype=torch.int32, device=hidden_states.device)
-        expert_weights = torch.empty(
-            0, dtype=routing_logits.dtype, device=hidden_states.device
-        )
-    else:
-        assert topk_ids is not None
-        if topk_ids.dtype != torch.int32:
-            raise ValueError(
-                "topk_ids must be int32 for Prims-TS BF16 precomputed routing"
+        if gemm1_lora_delta is not None:
+            raise NotImplementedError(
+                "Prims-TS BF16 MoE does not support gemm1_lora_delta"
             )
-        expert_weights = (
-            expert_weights
-            if expert_weights is not None
-            else torch.empty(0, dtype=torch.bfloat16, device=hidden_states.device)
+
+        _validate_bf16_gemm1_activation_params(
+            activation_type,
+            gemm1_alpha,
+            gemm1_beta,
+            gemm1_clamp_limit,
+            local_num_experts,
+            hidden_states.device,
         )
-    routing_input_mode = (
-        RoutingInputMode.FromLogits
-        if routing_logits is not None
-        else (
-            RoutingInputMode.UnpackedPrecomputed
-            if expert_weights.numel() > 0
-            else RoutingInputMode.PackedPrecomputed
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(hidden_states.device)
+
+        num_tokens = hidden_states.shape[0]
+        hidden_size = hidden_states.shape[-1]
+        if output is None:
+            output = alloc_trtllm_moe_output(
+                num_tokens, hidden_size, do_finalize, hidden_states.device
+            )
+        elif do_finalize:
+            check_shape_dtype_device(
+                output,
+                (num_tokens, hidden_size),
+                torch.bfloat16,
+                hidden_states.device,
+                "output",
+            )
+
+        if routing_logits is not None:
+            topk_ids = _empty_routing_placeholder(hidden_states.device, torch.int32)
+            expert_weights = _empty_routing_placeholder(
+                hidden_states.device, routing_logits.dtype
+            )
+        else:
+            assert topk_ids is not None
+            if topk_ids.dtype != torch.int32:
+                raise ValueError(
+                    "topk_ids must be int32 for Prims-TS BF16 precomputed routing"
+                )
+            expert_weights = (
+                expert_weights
+                if expert_weights is not None
+                else _empty_routing_placeholder(hidden_states.device, torch.bfloat16)
+            )
+        routing_input_mode = (
+            RoutingInputMode.FromLogits
+            if routing_logits is not None
+            else (
+                RoutingInputMode.UnpackedPrecomputed
+                if expert_weights.numel() > 0
+                else RoutingInputMode.PackedPrecomputed
+            )
         )
-    )
 
-    moe_op = _get_moe_op()
-    moe_runner = PrimsTsBf16MoERunner(
-        moe_op,
-        top_k=top_k,
-        num_local_experts=local_num_experts,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        activation_type=activation_type,
-        use_shuffled_weight=use_shuffled_weight,
-        weight_layout=weight_layout,
-        num_experts=num_experts,
-    )
-    moe_inputs = MoeRunnerInputs(
-        output=output,
-        routing_logits=routing_logits,
-        topk_ids=topk_ids,
-        expert_weights=expert_weights,
-        hidden_states=hidden_states,
-        hidden_states_scale=None,
-        gemm1_lora_delta=None,
-        per_token_scale=None,
-    )
-    tuning_config = moe_runner._make_tuning_config(
-        moe_inputs,
-        tune_max_num_tokens=tune_max_num_tokens,
-        routing_input_mode=routing_input_mode,
-        use_cuda_graph=True,
-        use_cold_l2_cache=True,
-    )
+        moe_op = _get_moe_op()
+        moe_runner = PrimsTsBf16MoERunner(
+            moe_op,
+            top_k=top_k,
+            num_local_experts=local_num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_type=activation_type,
+            use_shuffled_weight=use_shuffled_weight,
+            weight_layout=weight_layout,
+            num_experts=num_experts,
+        )
+        moe_inputs = MoeRunnerInputs(
+            output=output,
+            routing_logits=routing_logits,
+            topk_ids=topk_ids,
+            expert_weights=expert_weights,
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
+            gemm1_lora_delta=None,
+            per_token_scale=None,
+        )
+        tuning_config = _get_bf16_tuning_config(
+            moe_runner,
+            moe_inputs,
+            tune_max_num_tokens=tune_max_num_tokens,
+            routing_input_mode=routing_input_mode,
+        )
 
-    common_kwargs = dict(
-        routing_bias=routing_bias,
-        gemm1_weights=gemm1_weights,
-        gemm2_weights=gemm2_weights,
-        gemm1_alpha=gemm1_alpha,
-        gemm1_beta=gemm1_beta,
-        gemm1_clamp_limit=gemm1_clamp_limit,
-        num_experts=num_experts,
-        n_group=n_group,
-        topk_group=topk_group,
-        local_expert_offset=local_expert_offset,
-        local_num_experts=local_num_experts,
-        routed_scaling_factor=routed_scaling_factor,
-        routing_method_type=routing_method_type,
-        use_shuffled_weight=use_shuffled_weight,
-        weight_layout=weight_layout,
-        do_finalize=do_finalize,
-        enable_pdl=enable_pdl,
-        activation_type=activation_type,
-        norm_topk_prob=norm_topk_prob,
-        routing_replay_out=routing_replay_out,
-    )
-    moe_runner.set_cache_key_static_extras(**common_kwargs)
-    ok, reason = is_prims_ts_bf16_supported(
-        moe_runner,
-        moe_inputs,
-        [-1, -1],
-        **common_kwargs,
-    )
-    if not ok:
-        raise RuntimeError(f"Config not supported by Prims-TS BF16 kernel ({reason})")
+        common_kwargs = dict(
+            routing_bias=routing_bias,
+            gemm1_weights=gemm1_weights,
+            gemm2_weights=gemm2_weights,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+            num_experts=num_experts,
+            n_group=n_group,
+            topk_group=topk_group,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_num_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            routing_method_type=routing_method_type,
+            use_shuffled_weight=use_shuffled_weight,
+            weight_layout=weight_layout,
+            do_finalize=do_finalize,
+            enable_pdl=enable_pdl,
+            activation_type=activation_type,
+            norm_topk_prob=norm_topk_prob,
+            routing_replay_out=routing_replay_out,
+        )
+        moe_runner.set_cache_key_static_extras(**common_kwargs)
+    with torch.cuda.nvtx.range("prims_ts/pre_tune_support_check"):
+        ok, reason = _check_prims_ts_bf16_call(moe_runner, moe_inputs, **common_kwargs)
+        if not ok:
+            raise RuntimeError(
+                f"Config not supported by Prims-TS BF16 kernel ({reason})"
+            )
+        try:
+            pair = _prepare_prims_ts_bf16_tactic(
+                moe_runner, moe_inputs, [-1, -1], **common_kwargs
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Config not supported by Prims-TS BF16 kernel ({exc})"
+            ) from exc
 
-    _, tactic = AutoTuner.get().choose_one(
-        "flashinfer::prims_ts_bf16_moe",
-        [moe_runner],
-        tuning_config,
-        moe_inputs.to_list(),
-        **common_kwargs,
-    )
+    with torch.cuda.nvtx.range("prims_ts/tactic_selection"):
+        _, tactic = AutoTuner.get().choose_one(
+            "flashinfer::prims_ts_bf16_moe",
+            [moe_runner],
+            tuning_config,
+            moe_inputs.to_list(),
+            **common_kwargs,
+        )
 
-    ok, reason = is_prims_ts_bf16_supported(
-        moe_runner,
-        moe_inputs,
-        [-1, -1] if tactic == -1 else tactic,
-        **common_kwargs,
-    )
-    if not ok:
-        raise RuntimeError(f"Config not supported by Prims-TS BF16 kernel ({reason})")
+    with torch.cuda.nvtx.range("prims_ts/post_tune_support_check"):
+        # The unchanged default already passed validation before tuning. An
+        # explicit selected tactic must be checked against the current tensors.
+        selected_tactic = [-1, -1] if tactic == -1 else tactic
+        if tuple(selected_tactic) != (-1, -1):
+            try:
+                pair = _prepare_prims_ts_bf16_tactic(
+                    moe_runner, moe_inputs, selected_tactic, **common_kwargs
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Config not supported by Prims-TS BF16 kernel ({exc})"
+                ) from exc
 
-    intermediate_output = moe_runner.forward(
-        moe_inputs.to_list(),
-        tactic=tactic,
-        **common_kwargs,
-    )
-    return unpack_trtllm_moe_output(intermediate_output, output, do_finalize, None)
+    with torch.cuda.nvtx.range("prims_ts/forward"):
+        intermediate_output = moe_runner._forward_prepared(
+            moe_inputs, pair, **common_kwargs
+        )
+    with torch.cuda.nvtx.range("prims_ts/output_unpack"):
+        return unpack_trtllm_moe_output(intermediate_output, output, do_finalize, None)
 
 
 @register_fake_op("flashinfer::prims_ts_bf16_moe")

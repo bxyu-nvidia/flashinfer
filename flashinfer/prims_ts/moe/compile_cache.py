@@ -20,11 +20,133 @@ from __future__ import annotations
 
 import functools
 import json
-from dataclasses import asdict, is_dataclass
-from typing import Any
+from copy import copy
+from dataclasses import asdict, dataclass, fields, is_dataclass
+from typing import TYPE_CHECKING, Any
 
 from flashinfer.jit.cute_dsl_core import _get_compile_arch
 from flashinfer.prims_ts.utils import get_prims_ts_compile_options
+
+from .config_mapper import (
+    PrimsTsConfigSpec,
+    _ImmutablePrimsTsConfigSpec,
+    _build_config_cached,
+)
+
+
+if TYPE_CHECKING:
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import BatchedGemmConfig
+
+
+@functools.lru_cache(maxsize=8)
+def _config_field_names(config_type: type[BatchedGemmConfig]) -> tuple[str, ...]:
+    return tuple(field.name for field in fields(config_type) if field.init)
+
+
+def get_bf16_runtime_config(
+    cfg: BatchedGemmConfig | PrimsTsConfigSpec | _ImmutablePrimsTsConfigSpec,
+    in_hidden: int,
+) -> tuple[BatchedGemmConfig, str]:
+    """Reuse scalar BF16 launch configuration and its compilation cache key.
+
+    Tensor pointers, routing metadata, and buffers remain per-call. Copies keep
+    kernel assembly's in-place warp-layout updates out of the cached template.
+    """
+    if isinstance(cfg, _ImmutablePrimsTsConfigSpec):
+        template, config_hash = _bf16_spec_runtime_config_cached(
+            cfg.config_items, in_hidden
+        )
+        return _copy_bf16_template(template), config_hash
+
+    if isinstance(cfg, PrimsTsConfigSpec):
+        # Use the original options directly: no build/copy followed by a scan
+        # of every derived config field just to locate the cached result.
+        template, config_hash = _bf16_spec_runtime_config_cached(
+            tuple(sorted(cfg.kwargs.items())), in_hidden
+        )
+        return _copy_bf16_template(template), config_hash
+
+    names = _config_field_names(type(cfg))
+    template, config_hash = _bf16_runtime_config_cached(
+        type(cfg), tuple(getattr(cfg, name) for name in names), in_hidden
+    )
+    return copy(template), config_hash
+
+
+@dataclass(frozen=True, slots=True)
+class Bf16LaunchMetadata:
+    """Scalar launch properties; mutable kernel configs remain compilation-only."""
+
+    config_hash: str
+    is_swap_ab: bool
+    has_gated_epilogue: bool
+    has_bias_m: bool
+    has_gemm1_alpha: bool
+    has_gemm1_beta: bool
+    has_gemm1_clamp_limit: bool
+    use_early_exit: bool
+    tile_m: int
+    tile_n: int
+    cluster_m: int
+
+
+def get_bf16_launch_metadata(
+    cfg: _ImmutablePrimsTsConfigSpec, in_hidden: int
+) -> Bf16LaunchMetadata:
+    """Return immutable launch metadata without copying a runtime config."""
+    return _bf16_launch_metadata_cached(cfg.config_items, in_hidden)
+
+
+@functools.lru_cache(maxsize=1024)
+def _bf16_launch_metadata_cached(
+    config_items: tuple[tuple[str, int], ...], in_hidden: int
+) -> Bf16LaunchMetadata:
+    cfg, key = _bf16_spec_runtime_config_cached(config_items, in_hidden)
+    return Bf16LaunchMetadata(
+        key,
+        cfg.is_swap_ab,
+        cfg.has_gated_epilogue,
+        cfg.has_bias_m,
+        bool(cfg.has_gemm1_alpha),
+        bool(cfg.has_gemm1_beta),
+        bool(cfg.has_gemm1_clamp_limit),
+        bool(cfg.use_early_exit),
+        cfg.tile_m,
+        cfg.tile_n,
+        cfg.cluster_m,
+    )
+
+
+def _copy_bf16_template(template: BatchedGemmConfig) -> BatchedGemmConfig:
+    # make_config returns a plain, dict-backed dataclass of scalar fields.
+    # Avoid copy.copy's pickle/reconstruction dispatch on every GEMM launch.
+    # Keep the instance and its field dictionary private to this invocation.
+    cfg = object.__new__(type(template))
+    cfg.__dict__ = template.__dict__.copy()
+    return cfg
+
+
+@functools.lru_cache(maxsize=1024)
+def _bf16_spec_runtime_config_cached(
+    config_items: tuple[tuple[str, int], ...], in_hidden: int
+) -> tuple[BatchedGemmConfig, str]:
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import _runtime_config
+
+    cfg = _runtime_config(copy(_build_config_cached(config_items)), in_hidden)
+    return cfg, stable_config_hash(cfg)
+
+
+@functools.lru_cache(maxsize=1024)
+def _bf16_runtime_config_cached(
+    config_type: type[BatchedGemmConfig], config_values: tuple[int, ...], in_hidden: int
+) -> tuple[BatchedGemmConfig, str]:
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import _runtime_config
+
+    cfg = config_type(
+        **dict(zip(_config_field_names(config_type), config_values, strict=True))
+    )
+    cfg = _runtime_config(cfg, in_hidden)
+    return cfg, stable_config_hash(cfg)
 
 
 def stable_config_hash(cfg: Any, **constexpr_args: Any) -> str:
@@ -68,6 +190,22 @@ def _compile_target_key(io: dict) -> tuple[int, str]:
     return int(device_index), _get_compile_arch()
 
 
+def _compiled_gemm_key(cfg_hash: str, fc1_or_fc2: str, io: dict) -> tuple:
+    device_index, compile_arch = _compile_target_key(io)
+    return (
+        cfg_hash,
+        fc1_or_fc2,
+        get_compile_options(),
+        device_index,
+        compile_arch,
+    )
+
+
+def find_compiled_gemm(cfg_hash: str, fc1_or_fc2: str, io: dict) -> Any | None:
+    """Look up an existing GEMM without requiring routing buffers or compiling."""
+    return _COMPILED_GEMM_CACHE.get(_compiled_gemm_key(cfg_hash, fc1_or_fc2, io))
+
+
 def get_compiled_gemm(cfg_hash: str, fc1_or_fc2: str, io: dict, stream: Any) -> Any:
     """Compile and cache a TS GEMM for the supplied launch IO.
 
@@ -77,14 +215,7 @@ def get_compiled_gemm(cfg_hash: str, fc1_or_fc2: str, io: dict, stream: Any) -> 
     does not depend on their values and they must not be part of the cache key.
     """
 
-    device_index, compile_arch = _compile_target_key(io)
-    key = (
-        cfg_hash,
-        fc1_or_fc2,
-        get_compile_options(),
-        device_index,
-        compile_arch,
-    )
+    key = _compiled_gemm_key(cfg_hash, fc1_or_fc2, io)
     if key in _COMPILED_GEMM_CACHE:
         return _COMPILED_GEMM_CACHE[key]
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import _compile_for_launch

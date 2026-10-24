@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import contextlib
 import os
+from functools import lru_cache
 from typing import Any, List, Optional
 
 import torch
+from tvm_ffi import Array as FfiArray
 
 from flashinfer.autotuner import (
     OptimizationProfile,
@@ -46,9 +48,16 @@ from flashinfer.tllm_enums import (
 )
 from flashinfer.utils import get_compute_capability, round_up
 
-from .compile_cache import get_compiled_gemm, stable_config_hash
+from .compile_cache import (
+    find_compiled_gemm,
+    get_bf16_launch_metadata,
+    get_bf16_runtime_config,
+    get_compiled_gemm,
+    stable_config_hash,
+)
 from .config_mapper import (
-    map_trtllm_bf16_moe_tactic,
+    _ImmutablePrimsTsConfigSpec,
+    PrimsTsGemmPair,
     map_trtllm_deepseek_fp8_moe_tactic,
     map_trtllm_fp8_per_tensor_moe_tactic,
     map_trtllm_mxfp4_bf16_moe_tactic,
@@ -64,7 +73,8 @@ from .config_mapper import (
     valid_prims_ts_nvfp4_moe_tactics,
 )
 from .support import (
-    is_prims_ts_bf16_supported,
+    _check_prims_ts_bf16_call,
+    _prepare_prims_ts_bf16_tactic,
     is_prims_ts_fp8_block_scale_supported,
     is_prims_ts_fp8_per_tensor_supported,
     is_prims_ts_mxfp4_bf16_supported,
@@ -78,6 +88,7 @@ from .tensor_adapter import (
     build_mxfp4_bf16_launch_io,
     build_mxfp4_mxfp8_launch_io,
     build_nvfp4_launch_io,
+    prepare_bf16_fc1_inputs,
 )
 
 
@@ -182,6 +193,11 @@ def _torch_views_of_ffi_tensors(tensors: Any) -> list[Any]:
     Preserve those objects instead of exporting DLPack again: a cached raw DLPack
     capsule is one-shot and cannot safely be consumed by repeated runner calls.
     """
+    if isinstance(tensors, FfiArray):
+        # Array.__iter__ goes through __getitem__ (and an FFI length query)
+        # for every element. A public slice extracts all elements with one
+        # length check, while preserving FFI's tensor conversion/ownership.
+        tensors = tensors[:]
     return [
         (
             None
@@ -272,6 +288,14 @@ def _routed_token_capacity(
     )
     top_k = int(getattr(runner, "top_k", 0))
 
+    return _routing_capacity_cached(num_tokens, num_experts, top_k, tile_n)
+
+
+@lru_cache(maxsize=1024)
+def _routing_capacity_cached(
+    num_tokens: int, num_experts: int, top_k: int, tile_n: int
+) -> int:
+    # Only scalar layout inputs are cached; routing buffers remain per-call.
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         compute_max_num_ctas_in_token_dim_for_moe,
     )
@@ -398,6 +422,44 @@ def _quantize_nvfp4_fc1_output_for_fc2(
     return activation_output, activation_output_scale, per_token_scale_fc2
 
 
+# Cache only scalar metadata, never input tensors. Avoid reconstructing the
+# MoeRunnerInputs dataclass just to inspect four optional fields.
+_CACHE_KEY_INPUT_INDICES = tuple(
+    MoeRunnerInputs.idx(name)
+    for name in (
+        "per_token_scale",
+        "gemm1_lora_delta",
+        "routing_logits",
+        "expert_weights",
+    )
+)
+
+
+@lru_cache(maxsize=256)
+def _prims_ts_cache_key_extras(
+    dtype_act: int,
+    dtype_weights: int,
+    fp8_quantization_type: int,
+    activation_type: int,
+    use_per_token_scaling: bool,
+    input_presence: tuple[bool, ...],
+    static_extras: tuple,
+) -> tuple:
+    return (
+        ("prims_ts_moe_config_version", 4),
+        ("dtype_act", dtype_act),
+        ("dtype_weights", dtype_weights),
+        ("fp8_quantization_type", fp8_quantization_type),
+        ("activation_type", activation_type),
+        ("use_per_token_scaling", use_per_token_scaling),
+        ("per_token_scale", input_presence[0]),
+        ("gemm1_lora_delta", input_presence[1]),
+        ("routing_logits", input_presence[2]),
+        ("expert_weights", input_presence[3]),
+        *static_extras,
+    )
+
+
 class _PrimsTsMoERunnerMixin:
     _cache_key_static_extras: tuple = ()
 
@@ -439,25 +501,14 @@ class _PrimsTsMoERunnerMixin:
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-        moe_inputs = MoeRunnerInputs.from_list(inputs)
-        return (
-            ("prims_ts_moe_config_version", 4),
-            ("dtype_act", int(self.dtype_act)),
-            ("dtype_weights", int(self.dtype_weights)),
-            ("fp8_quantization_type", int(self.fp8_quantization_type)),
-            ("activation_type", int(self.activation_type)),
-            ("use_per_token_scaling", bool(self.use_per_token_scaling)),
-            ("per_token_scale", moe_inputs.per_token_scale is not None),
-            ("gemm1_lora_delta", moe_inputs.gemm1_lora_delta is not None),
-            (
-                "routing_logits",
-                moe_inputs.routing_logits is not None,
-            ),
-            (
-                "expert_weights",
-                moe_inputs.expert_weights is not None,
-            ),
-            *getattr(self, "_cache_key_static_extras", ()),
+        return _prims_ts_cache_key_extras(
+            int(self.dtype_act),
+            int(self.dtype_weights),
+            int(self.fp8_quantization_type),
+            int(self.activation_type),
+            bool(self.use_per_token_scaling),
+            tuple(inputs[i] is not None for i in _CACHE_KEY_INPUT_INDICES),
+            self._cache_key_static_extras,
         )
 
     def precompile_tactics(
@@ -502,10 +553,60 @@ class _PrimsTsMoERunnerMixin:
         return True
 
 
+@lru_cache(maxsize=256)
+def _bf16_runner_metadata(
+    top_k: int,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    activation_type: int,
+    use_shuffled_weight: bool,
+    weight_layout: int,
+    use_per_token_scaling: bool,
+    num_experts: int | None,
+) -> dict:
+    return dict(
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        dtype_act=DtypeTrtllmGen.Bfloat16,
+        dtype_weights=DtypeTrtllmGen.Bfloat16,
+        fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation_type=ActivationType(activation_type),
+        use_shuffled_weight=use_shuffled_weight,
+        weight_layout=WeightLayout(weight_layout),
+        use_per_token_scaling=use_per_token_scaling,
+        num_experts=num_experts if num_experts is not None else num_local_experts,
+        _topk_initializer_source=None,
+        _topk_initializer=None,
+    )
+
+
 class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
     """Autotuned Prims-TS BF16 MoE runner using shared TRT-LLM routing/finalize."""
 
     valid_tactics_dict: dict = {}
+    _cache_inference_selection = True
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if not name.endswith("_cache"):
+            self.__dict__.pop("_autotuner_hash_cache", None)
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if not name.endswith("_cache"):
+            self.__dict__.pop("_autotuner_hash_cache", None)
+        object.__delattr__(self, name)
+
+    def __hash__(self) -> int:
+        cached = self.__dict__.get("_autotuner_hash_cache")
+        if cached is None:
+            # Preserve TunableRunner's exact hash, including extension fields.
+            # The base implementation already excludes *_cache attributes.
+            cached = super().__hash__()
+            self.__dict__["_autotuner_hash_cache"] = cached
+        return cached
 
     def __init__(
         self,
@@ -521,21 +622,23 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         use_per_token_scaling: bool = False,
         num_experts: Optional[int] = None,
     ):
-        self.moe_op = moe_op
-        self.top_k = top_k
-        self.num_local_experts = num_local_experts
-        self.dtype_act = DtypeTrtllmGen.Bfloat16
-        self.dtype_weights = DtypeTrtllmGen.Bfloat16
-        self.fp8_quantization_type = Fp8QuantizationType.NoneFp8
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.activation_type = ActivationType(activation_type)
-        self.use_shuffled_weight = use_shuffled_weight
-        self.weight_layout = WeightLayout(weight_layout)
-        self.use_per_token_scaling = use_per_token_scaling
-        self.num_experts = num_experts if num_experts is not None else num_local_experts
-        self._topk_initializer_source = None
-        self._topk_initializer = None
+        # Only scalar model metadata is cached. Each call gets its own runner
+        # dict; tensors, static extras and mutable tuning state are never shared.
+        self.__dict__.pop("_autotuner_hash_cache", None)
+        self.__dict__.update(
+            moe_op=moe_op,
+            **_bf16_runner_metadata(
+                top_k,
+                num_local_experts,
+                hidden_size,
+                intermediate_size,
+                activation_type,
+                use_shuffled_weight,
+                weight_layout,
+                use_per_token_scaling,
+                num_experts,
+            ),
+        )
 
     def _make_tuning_config(
         self,
@@ -610,165 +713,237 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         del do_preparation
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         requested_tactic = [-1, -1] if tactic == -1 else tactic
+        with torch.cuda.nvtx.range("prims_ts/support_check"):
+            ok, reason = _check_prims_ts_bf16_call(self, moe_inputs, **kwargs)
+            if not ok:
+                raise RuntimeError(
+                    f"Config not supported by Prims-TS BF16 kernel ({reason})"
+                )
+        with torch.cuda.nvtx.range("prims_ts/config_mapping"):
+            try:
+                pair = _prepare_prims_ts_bf16_tactic(
+                    self, moe_inputs, requested_tactic, **kwargs
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Config not supported by Prims-TS BF16 kernel ({exc})"
+                ) from exc
+        return self._forward_prepared(moe_inputs, pair, **kwargs)
+
+    def _forward_prepared(
+        self, moe_inputs: MoeRunnerInputs, pair: PrimsTsGemmPair, **kwargs
+    ):
+        """Execute an invocation checked by the wrapper or public forward()."""
         hidden_states = moe_inputs.hidden_states
         output = moe_inputs.output
         num_tokens = hidden_states.shape[0]
-        pair = map_trtllm_bf16_moe_tactic(
-            requested_tactic,
-            activation_type=int(self.activation_type),
-            num_tokens=num_tokens,
-            top_k=self.top_k,
-            num_local_experts=self.num_local_experts,
-            weight_layout=int(kwargs.get("weight_layout", self.weight_layout)),
-            fc1_has_bias=kwargs.get("gemm1_bias") is not None,
-            fc2_has_bias=kwargs.get("gemm2_bias") is not None,
-            enable_pdl=bool(kwargs.get("enable_pdl", False)),
-            **_gemm1_oa_flags_from_kwargs(kwargs),
-        )
         resolved_tactic = _concrete_tactic(pair)
-        ok, reason = is_prims_ts_bf16_supported(
-            self,
-            moe_inputs,
-            resolved_tactic,
-            **kwargs,
-        )
-        if not ok:
-            raise RuntimeError(
-                f"Config not supported by Prims-TS BF16 kernel ({reason})"
-            )
 
         import cuda.bindings.driver as cuda_drv
 
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
 
-        routing_out = self.moe_op.trtllm_moe_run_routing(
-            moe_inputs.routing_logits,
-            kwargs["routing_bias"],
-            moe_inputs.topk_ids,
-            moe_inputs.expert_weights,
-            hidden_states,
-            kwargs["gemm1_weights"],
-            kwargs["gemm2_weights"],
-            kwargs["num_experts"],
-            self.top_k,
-            kwargs["n_group"],
-            kwargs["topk_group"],
-            self.intermediate_size,
-            kwargs["local_expert_offset"],
-            self.num_local_experts,
-            kwargs["routed_scaling_factor"],
-            kwargs["routing_method_type"],
-            kwargs["use_shuffled_weight"],
-            kwargs["weight_layout"],
-            kwargs["enable_pdl"],
-            resolved_tactic,
-            int(self.activation_type),
-            kwargs.get("norm_topk_prob", True),
-            kwargs.get("routing_replay_out"),
-        )
+        # Warm calls need scalar metadata, not a mutable compilation config.
+        # Bind routing-independent inputs first to shorten the GPU routing-to-FC1 gap.
+        fc1_pre_route_inputs = None
+        with torch.cuda.nvtx.range("prims_ts/fc1_pre_route"):
+            if isinstance(pair.fc1.cfg, _ImmutablePrimsTsConfigSpec):
+                metadata = get_bf16_launch_metadata(pair.fc1.cfg, self.hidden_size)
+                fc1_runtime_config = (metadata, metadata.config_hash)
+            else:
+                metadata = None
+                fc1_runtime_config = get_bf16_runtime_config(
+                    pair.fc1.cfg, self.hidden_size
+                )
+            fc1_fn = find_compiled_gemm(
+                fc1_runtime_config[1], "fc1", {"_keepalive": (hidden_states,)}
+            )
+            if metadata is not None:
+                if fc1_fn is None:
+                    fc1_runtime_config = get_bf16_runtime_config(
+                        pair.fc1.cfg, self.hidden_size
+                    )
+                else:
+                    fc1_pre_route_inputs = prepare_bf16_fc1_inputs(
+                        metadata=metadata,
+                        spec=pair.fc1.cfg,
+                        hidden_states=hidden_states,
+                        weights=kwargs["gemm1_weights"],
+                        num_experts=self.num_local_experts,
+                        intermediate_size=self.intermediate_size,
+                        hidden_size=self.hidden_size,
+                        activation_type=int(self.activation_type),
+                        gemm1_bias=kwargs.get("gemm1_bias"),
+                        **_gemm1_oa_io_kwargs(kwargs),
+                    )
 
-        (
-            expert_weights,
-            expanded_idx_to_permuted_idx,
-            permuted_idx_to_token_idx,
-            tile_idx,
-            mn_limit,
-            num_non_exiting_ctas,
-            total_num_padded_tokens,
-            gemm1_output,
-            gemm2_output,
-        ) = _torch_views_of_ffi_tensors(routing_out)
-        expert_weights = _select_expert_weights(moe_inputs, expert_weights)
-        routed_token_capacity = _routed_token_capacity(
-            self,
-            moe_inputs,
-            resolved_tactic,
-            total_num_padded_tokens,
-            kwargs,
-        )
-
-        fc1_cfg = pair.fc1.cfg.build()
-        fc2_cfg = pair.fc2.cfg.build()
-
-        fc1_io = build_bf16_launch_io(
-            fc="fc1",
-            cfg=fc1_cfg,
-            hidden_states=hidden_states,
-            gemm1_weights=kwargs["gemm1_weights"],
-            gemm2_weights=kwargs["gemm2_weights"],
-            gemm1_bias=kwargs.get("gemm1_bias"),
-            gemm2_bias=kwargs.get("gemm2_bias"),
-            **_gemm1_oa_io_kwargs(kwargs),
-            gemm1_output=gemm1_output,
-            gemm2_output=gemm2_output,
-            tile_idx=tile_idx,
-            mn_limit=mn_limit,
-            route_map=permuted_idx_to_token_idx,
-            num_non_exiting_ctas=num_non_exiting_ctas,
-            total_num_padded_tokens=total_num_padded_tokens,
-            routed_token_capacity=routed_token_capacity,
-            activation_type=int(self.activation_type),
-            num_experts=self.num_local_experts,
-            num_tokens=num_tokens,
-            top_k=self.top_k,
-            intermediate_size=self.intermediate_size,
-            hidden_size=self.hidden_size,
-        )
-        fc1_hash = stable_config_hash(fc1_io["cfg"])
-        fc1_fn = get_compiled_gemm(fc1_hash, "fc1", fc1_io, stream)
-        fc1_fn(*self._launch_args(fc1_io, stream))
-
-        fc2_io = build_bf16_launch_io(
-            fc="fc2",
-            cfg=fc2_cfg,
-            hidden_states=hidden_states,
-            gemm1_weights=kwargs["gemm1_weights"],
-            gemm2_weights=kwargs["gemm2_weights"],
-            gemm1_bias=kwargs.get("gemm1_bias"),
-            gemm2_bias=kwargs.get("gemm2_bias"),
-            **_gemm1_oa_io_kwargs(kwargs),
-            gemm1_output=gemm1_output,
-            gemm2_output=gemm2_output,
-            tile_idx=tile_idx,
-            mn_limit=mn_limit,
-            route_map=permuted_idx_to_token_idx,
-            num_non_exiting_ctas=num_non_exiting_ctas,
-            total_num_padded_tokens=total_num_padded_tokens,
-            routed_token_capacity=routed_token_capacity,
-            activation_type=int(self.activation_type),
-            num_experts=self.num_local_experts,
-            num_tokens=num_tokens,
-            top_k=self.top_k,
-            intermediate_size=self.intermediate_size,
-            hidden_size=self.hidden_size,
-        )
-        fc2_hash = stable_config_hash(fc2_io["cfg"])
-        fc2_fn = get_compiled_gemm(fc2_hash, "fc2", fc2_io, stream)
-        fc2_fn(*self._launch_args(fc2_io, stream))
-
-        if kwargs["do_finalize"]:
-            self.moe_op.trtllm_moe_run_finalize(
-                gemm2_output,
-                output,
-                expert_weights,
-                expanded_idx_to_permuted_idx,
-                total_num_padded_tokens,
-                num_tokens,
+        prepare_routing = getattr(self.moe_op, "trtllm_moe_prepare_routing", None)
+        if prepare_routing is None:
+            logger.warning_once(
+                "Prims-TS prepared routing is unavailable in the loaded MoE binary; "
+                "using eager routing. Rebuild the TRTLLM MoE module from current "
+                "FlashInfer sources to enable preparation before routing submission."
+            )
+        route = prepare_routing or self.moe_op.trtllm_moe_run_routing
+        with torch.cuda.nvtx.range(
+            "prims_ts/routing_prepare"
+            if prepare_routing is not None
+            else "prims_ts/routing"
+        ):
+            routing_out = route(
+                moe_inputs.routing_logits,
+                kwargs["routing_bias"],
+                moe_inputs.topk_ids,
+                moe_inputs.expert_weights,
+                hidden_states,
+                kwargs["gemm1_weights"],
+                kwargs["gemm2_weights"],
                 kwargs["num_experts"],
                 self.top_k,
-                self.hidden_size,
+                kwargs["n_group"],
+                kwargs["topk_group"],
+                self.intermediate_size,
+                kwargs["local_expert_offset"],
+                self.num_local_experts,
+                kwargs["routed_scaling_factor"],
+                kwargs["routing_method_type"],
+                kwargs["use_shuffled_weight"],
+                kwargs["weight_layout"],
                 kwargs["enable_pdl"],
-                False,
+                resolved_tactic,
+                int(self.activation_type),
+                kwargs.get("norm_topk_prob", True),
+                kwargs.get("routing_replay_out"),
             )
+
+        submit_routing = None
+        if prepare_routing is not None:
+            routing_out, submit_routing = routing_out[:]
+
+        with torch.cuda.nvtx.range("prims_ts/routing_outputs"):
+            (
+                permuted_idx_to_token_idx,
+                tile_idx,
+                mn_limit,
+                num_non_exiting_ctas,
+                total_num_padded_tokens,
+                gemm1_output,
+            ) = _torch_views_of_ffi_tensors(routing_out[2:8])
+            routed_token_capacity = _routed_token_capacity(
+                self,
+                moe_inputs,
+                resolved_tactic,
+                total_num_padded_tokens,
+                kwargs,
+            )
+
+        with torch.cuda.nvtx.range("prims_ts/fc1_prepare"):
+            fc1_io = build_bf16_launch_io(
+                fc="fc1",
+                cfg=pair.fc1.cfg,
+                _prepared_runtime_config=fc1_runtime_config,
+                _pre_route_inputs=fc1_pre_route_inputs,
+                hidden_states=hidden_states,
+                gemm1_weights=kwargs["gemm1_weights"],
+                gemm2_weights=kwargs["gemm2_weights"],
+                gemm1_bias=kwargs.get("gemm1_bias"),
+                gemm2_bias=kwargs.get("gemm2_bias"),
+                **_gemm1_oa_io_kwargs(kwargs),
+                gemm1_output=gemm1_output,
+                gemm2_output=None,
+                tile_idx=tile_idx,
+                mn_limit=mn_limit,
+                route_map=permuted_idx_to_token_idx,
+                num_non_exiting_ctas=num_non_exiting_ctas,
+                total_num_padded_tokens=total_num_padded_tokens,
+                routed_token_capacity=routed_token_capacity,
+                activation_type=int(self.activation_type),
+                num_experts=self.num_local_experts,
+                num_tokens=num_tokens,
+                top_k=self.top_k,
+                intermediate_size=self.intermediate_size,
+                hidden_size=self.hidden_size,
+            )
+
+            fc1_launch_args = self._launch_args(fc1_io, stream)
+
+        if fc1_fn is None:
+            with torch.cuda.nvtx.range("prims_ts/fc1_compile_lookup"):
+                fc1_fn = get_compiled_gemm(fc1_io["config_hash"], "fc1", fc1_io, stream)
+
+        # All FC1 buffers, pointer wrappers and launch arguments are ready.
+        # Submit on the same stream; FC1 consumes routing results in stream order.
+        if submit_routing is not None:
+            with torch.cuda.nvtx.range("prims_ts/routing"):
+                submit_routing(hidden_states)
+        with torch.cuda.nvtx.range("prims_ts/fc1_launch"):
+            fc1_fn(*fc1_launch_args)
+
+        # These three outputs are only needed by FC2/finalize. Convert them
+        # after submitting FC1 so their host overhead can overlap its execution.
+        with torch.cuda.nvtx.range("prims_ts/routing_outputs_deferred"):
+            expert_weights, expanded_idx_to_permuted_idx, gemm2_output = (
+                _torch_views_of_ffi_tensors(routing_out[:2] + routing_out[8:9])
+            )
+            expert_weights = _select_expert_weights(moe_inputs, expert_weights)
+
+        with torch.cuda.nvtx.range("prims_ts/fc2_prepare"):
+            fc2_io = build_bf16_launch_io(
+                fc="fc2",
+                cfg=pair.fc2.cfg,
+                _reuse_fc1_io=fc1_io,
+                hidden_states=hidden_states,
+                gemm1_weights=kwargs["gemm1_weights"],
+                gemm2_weights=kwargs["gemm2_weights"],
+                gemm1_bias=kwargs.get("gemm1_bias"),
+                gemm2_bias=kwargs.get("gemm2_bias"),
+                **_gemm1_oa_io_kwargs(kwargs),
+                gemm1_output=gemm1_output,
+                gemm2_output=gemm2_output,
+                tile_idx=tile_idx,
+                mn_limit=mn_limit,
+                route_map=permuted_idx_to_token_idx,
+                num_non_exiting_ctas=num_non_exiting_ctas,
+                total_num_padded_tokens=total_num_padded_tokens,
+                routed_token_capacity=routed_token_capacity,
+                activation_type=int(self.activation_type),
+                num_experts=self.num_local_experts,
+                num_tokens=num_tokens,
+                top_k=self.top_k,
+                intermediate_size=self.intermediate_size,
+                hidden_size=self.hidden_size,
+            )
+
+        with torch.cuda.nvtx.range("prims_ts/fc2_compile_lookup"):
+            fc2_hash = fc2_io["config_hash"]
+            fc2_fn = get_compiled_gemm(fc2_hash, "fc2", fc2_io, stream)
+
+        with torch.cuda.nvtx.range("prims_ts/fc2_launch"):
+            fc2_fn(*self._launch_args(fc2_io, stream))
+
+        if kwargs["do_finalize"]:
+            with torch.cuda.nvtx.range("prims_ts/finalize"):
+                self.moe_op.trtllm_moe_run_finalize(
+                    gemm2_output,
+                    output,
+                    expert_weights,
+                    expanded_idx_to_permuted_idx,
+                    total_num_padded_tokens,
+                    num_tokens,
+                    kwargs["num_experts"],
+                    self.top_k,
+                    self.hidden_size,
+                    kwargs["enable_pdl"],
+                    False,
+                )
+
             return []
         return [gemm2_output, expert_weights, expanded_idx_to_permuted_idx]
 
     @staticmethod
     def _launch_args(io: dict, stream) -> tuple:
-        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import _launch_arg_tuple
-
-        return _launch_arg_tuple(io, stream)
+        return (*io["_launch_args"], stream)
 
 
 class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):

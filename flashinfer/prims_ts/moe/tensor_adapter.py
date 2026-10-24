@@ -18,11 +18,18 @@ Adapters from TRT-LLM MoE stage tensors to Prims-TS batched GEMM launch IO.
 
 from __future__ import annotations
 
-from typing import Literal
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
 from flashinfer.tllm_enums import ActivationType, Fp8QuantizationType, WeightLayout
+
+
+if TYPE_CHECKING:
+    from .compile_cache import Bf16LaunchMetadata
+    from .config_mapper import _ImmutablePrimsTsConfigSpec
 
 
 _expert_scale_ones: dict[tuple[torch.device, int], torch.Tensor] = {}
@@ -39,6 +46,7 @@ def _get_expert_scale_ones(num_experts: int, device: torch.device) -> torch.Tens
     return scales
 
 
+@lru_cache(maxsize=16)
 def _is_gated_activation(activation_type: int) -> bool:
     return ActivationType(int(activation_type)).is_gated
 
@@ -91,7 +99,7 @@ def _validate_weight_storage(
             int(out_hidden),
             weight_bits // element_bits,
         )
-        if tensor.ndim != 3 or tuple(int(dim) for dim in tensor.shape) != expected:
+        if tensor.ndim != 3 or tensor.shape != expected:
             raise ValueError(
                 f"{name} has invalid MajorK shape {tuple(tensor.shape)}, "
                 f"expected {expected}"
@@ -131,11 +139,64 @@ def _validate_weight_storage(
         int(out_hidden),
         block_bytes // tensor.element_size(),
     )
-    if tuple(int(dim) for dim in tensor.shape) != expected:
+    if tensor.shape != expected:
         raise ValueError(
             f"{name} has invalid BlockMajorK shape {tuple(tensor.shape)}, "
             f"expected {expected}"
         )
+
+
+@lru_cache(maxsize=1024)
+def _immutable_weight_shape(
+    layout: int,
+    weight_bits: int,
+    block_bytes: int,
+    element_bytes: int,
+    num_experts: int,
+    out_hidden: int,
+    in_hidden: int,
+) -> tuple[int, ...] | None:
+    # Only scalar layout arithmetic is cached. The caller must compare the
+    # current tensor's shape every time, including on a cache hit.
+    k_bits = in_hidden * weight_bits
+    if layout == int(WeightLayout.MajorK):
+        if k_bits % (element_bytes * 8) == 0:
+            return (num_experts, out_hidden, k_bits // (element_bytes * 8))
+    elif layout == int(WeightLayout.BlockMajorK):
+        if (
+            block_bytes > 0
+            and k_bits % (block_bytes * 8) == 0
+            and block_bytes % element_bytes == 0
+        ):
+            return (
+                num_experts,
+                k_bits // (block_bytes * 8),
+                out_hidden,
+                block_bytes // element_bytes,
+            )
+    # Leave invalid layouts to the existing validator for detailed errors.
+    return None
+
+
+@lru_cache(maxsize=1024)
+def _token_cta_bound(
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    token_tile_size: int,
+    cluster_dim_in_token: int,
+) -> int:
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        compute_max_num_ctas_in_token_dim_for_moe,
+    )
+
+    return compute_max_num_ctas_in_token_dim_for_moe(
+        num_tokens=num_tokens,
+        num_experts=num_experts,
+        top_k=top_k,
+        token_tile_size=token_tile_size,
+        cluster_dim_in_token=cluster_dim_in_token,
+    )
 
 
 def _logical_token_capacity(
@@ -187,18 +248,12 @@ def _launch_early_exit_max_token_ctas(
     if not cfg.use_early_exit:
         return 0
 
-    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
-        compute_max_num_ctas_in_token_dim_for_moe,
-    )
-
-    token_tile_size = int(cfg.tile_n if cfg.is_swap_ab else cfg.tile_m)
-    cluster_dim_in_token = 1 if cfg.is_swap_ab else int(cfg.cluster_m)
-    launch_token_ctas = compute_max_num_ctas_in_token_dim_for_moe(
-        num_tokens=int(num_tokens),
-        num_experts=int(num_routed_experts),
-        top_k=int(top_k),
-        token_tile_size=token_tile_size,
-        cluster_dim_in_token=cluster_dim_in_token,
+    launch_token_ctas = _token_cta_bound(
+        int(num_tokens),
+        int(num_routed_experts),
+        int(top_k),
+        int(cfg.tile_n if cfg.is_swap_ab else cfg.tile_m),
+        1 if cfg.is_swap_ab else int(cfg.cluster_m),
     )
     if launch_token_ctas > int(metadata_token_ctas):
         raise ValueError(
@@ -286,6 +341,7 @@ def _make_gemm1_oa_ptrs(
     gemm1_alpha: torch.Tensor | None,
     gemm1_beta: torch.Tensor | None,
     gemm1_clamp_limit: torch.Tensor | None,
+    dummy_float_ptr=None,
 ) -> tuple:
     alpha = _select_gemm1_oa_param(
         name="gemm1_alpha",
@@ -314,25 +370,193 @@ def _make_gemm1_oa_ptrs(
         num_experts=num_experts,
         device=device,
     )
-    alpha_dp = make_ptr(
-        cutlass.Float32,
-        alpha.data_ptr() if alpha is not None else dummy_data_ptr,
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
+    alpha_dp = (
+        dummy_float_ptr
+        if alpha is None and dummy_float_ptr is not None
+        else make_ptr(
+            cutlass.Float32,
+            alpha.data_ptr() if alpha is not None else dummy_data_ptr,
+            cutlass.AddressSpace.gmem,
+            assumed_align=16,
+        )
     )
-    beta_dp = make_ptr(
-        cutlass.Float32,
-        beta.data_ptr() if beta is not None else dummy_data_ptr,
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
+    beta_dp = (
+        dummy_float_ptr
+        if beta is None and dummy_float_ptr is not None
+        else make_ptr(
+            cutlass.Float32,
+            beta.data_ptr() if beta is not None else dummy_data_ptr,
+            cutlass.AddressSpace.gmem,
+            assumed_align=16,
+        )
     )
-    clamp_limit_dp = make_ptr(
-        cutlass.Float32,
-        clamp_limit.data_ptr() if clamp_limit is not None else dummy_data_ptr,
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
+    clamp_limit_dp = (
+        dummy_float_ptr
+        if clamp_limit is None and dummy_float_ptr is not None
+        else make_ptr(
+            cutlass.Float32,
+            clamp_limit.data_ptr() if clamp_limit is not None else dummy_data_ptr,
+            cutlass.AddressSpace.gmem,
+            assumed_align=16,
+        )
     )
     return alpha_dp, beta_dp, clamp_limit_dp, alpha, beta, clamp_limit
+
+
+def _validate_bf16_weight_storage(
+    fc: str,
+    tensor: torch.Tensor,
+    spec,
+    cfg,
+    num_experts: int,
+    out_hidden: int,
+    in_hidden: int,
+) -> None:
+    expected_weight_shape = (
+        _immutable_weight_shape(
+            spec.weight_layout,
+            spec.weight_dtype_tma_bits,
+            spec.block_major_k_bytes,
+            tensor.element_size(),
+            num_experts,
+            out_hidden,
+            in_hidden,
+        )
+        if spec is not None
+        else None
+    )
+    if expected_weight_shape is None or tensor.shape != expected_weight_shape:
+        _validate_weight_storage(
+            name="gemm1_weights" if fc == "fc1" else "gemm2_weights",
+            tensor=tensor,
+            cfg=spec if spec is not None else cfg,
+            num_experts=num_experts,
+            out_hidden=out_hidden,
+            in_hidden=in_hidden,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _Bf16Fc1Inputs:
+    """Per-invocation input bindings, retained until submission completes."""
+
+    a_dp: object
+    b_dp: object
+    bias_dp: object | None
+    oa_ptrs: tuple[object | None, object | None, object | None]
+    tensors: tuple[torch.Tensor | None, ...]
+
+
+def prepare_bf16_fc1_inputs(
+    *,
+    metadata: Bf16LaunchMetadata,
+    spec: _ImmutablePrimsTsConfigSpec,
+    hidden_states: torch.Tensor,
+    weights: torch.Tensor,
+    num_experts: int,
+    intermediate_size: int,
+    hidden_size: int,
+    activation_type: int,
+    gemm1_bias: torch.Tensor | None = None,
+    gemm1_alpha: torch.Tensor | None = None,
+    gemm1_beta: torch.Tensor | None = None,
+    gemm1_clamp_limit: torch.Tensor | None = None,
+) -> _Bf16Fc1Inputs:
+    """Validate and bind live FC1 inputs before submitting GPU routing.
+
+    Only weights, activations and optional parameters are bound here. Routing
+    results and output buffers are validated and bound after routing returns.
+    This object is local to one invocation; GPU pointers are never cached.
+    """
+    from cutlass.cute.runtime import make_ptr
+    import cutlass
+
+    out_hidden = _fc1_out_hidden(intermediate_size, activation_type)
+    _validate_bf16_weight_storage(
+        "fc1", weights, spec, metadata, num_experts, out_hidden, hidden_size
+    )
+    if metadata.is_swap_ab and out_hidden % metadata.tile_m != 0:
+        raise ValueError(
+            f"swapAB requires out_hidden to be a multiple of tile_m={metadata.tile_m}, "
+            f"got {out_hidden}"
+        )
+    bias = _select_bias(
+        fc="fc1",
+        cfg=metadata,
+        gemm1_bias=gemm1_bias,
+        gemm2_bias=None,
+        num_experts=num_experts,
+        out_hidden=out_hidden,
+        device=hidden_states.device,
+    )
+    if (
+        not metadata.has_gemm1_alpha
+        and not metadata.has_gemm1_beta
+        and not metadata.has_gemm1_clamp_limit
+        and gemm1_alpha is None
+        and gemm1_beta is None
+        and gemm1_clamp_limit is None
+    ):
+        params = (None, None, None)
+        oa_ptrs = (None, None, None)
+    else:
+        params = tuple(
+            _select_gemm1_oa_param(
+                name=name,
+                tensor=tensor,
+                cfg=metadata,
+                flag_name="has_" + name,
+                fc="fc1",
+                num_experts=num_experts,
+                device=hidden_states.device,
+            )
+            for name, tensor in (
+                ("gemm1_alpha", gemm1_alpha),
+                ("gemm1_beta", gemm1_beta),
+                ("gemm1_clamp_limit", gemm1_clamp_limit),
+            )
+        )
+        oa_ptrs = tuple(
+            None
+            if tensor is None
+            else make_ptr(
+                cutlass.Float32,
+                tensor.data_ptr(),
+                cutlass.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            for tensor in params
+        )
+    activation_dp = make_ptr(
+        cutlass.BFloat16,
+        hidden_states.data_ptr(),
+        cutlass.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    weights_dp = make_ptr(
+        cutlass.BFloat16,
+        weights.data_ptr(),
+        cutlass.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    a_dp, b_dp = (
+        (weights_dp, activation_dp)
+        if metadata.is_swap_ab
+        else (activation_dp, weights_dp)
+    )
+    bias_dp = (
+        None
+        if bias is None
+        else make_ptr(
+            cutlass.Float32,
+            bias.data_ptr(),
+            cutlass.AddressSpace.gmem,
+            assumed_align=16,
+        )
+    )
+    return _Bf16Fc1Inputs(
+        a_dp, b_dp, bias_dp, oa_ptrs, (hidden_states, weights, bias, *params)
+    )
 
 
 def build_bf16_launch_io(
@@ -348,7 +572,7 @@ def build_bf16_launch_io(
     gemm1_beta: torch.Tensor | None = None,
     gemm1_clamp_limit: torch.Tensor | None = None,
     gemm1_output: torch.Tensor,
-    gemm2_output: torch.Tensor,
+    gemm2_output: torch.Tensor | None,
     tile_idx: torch.Tensor,
     mn_limit: torch.Tensor,
     route_map: torch.Tensor,
@@ -361,14 +585,20 @@ def build_bf16_launch_io(
     top_k: int,
     intermediate_size: int,
     hidden_size: int,
+    _reuse_fc1_io: dict | None = None,
+    _prepared_runtime_config: tuple | None = None,
+    _pre_route_inputs: _Bf16Fc1Inputs | None = None,
 ) -> dict:
-    """Build Prims-TS launch IO from TRT-LLM routing/workspace tensors."""
+    """Build Prims-TS launch IO from TRT-LLM routing/workspace tensors.
+
+    Internal warm FC1 calls supply input bindings from immediately before
+    routing and receive launch-only IO. Other calls receive compilation IO.
+    """
     from cutlass.cute.runtime import make_ptr
     import cutlass
 
-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
-        _runtime_config,
-    )
+    from .compile_cache import get_bf16_runtime_config
+    from .config_mapper import _ImmutablePrimsTsConfigSpec
 
     if fc == "fc1":
         out_hidden = _fc1_out_hidden(intermediate_size, activation_type)
@@ -381,24 +611,30 @@ def build_bf16_launch_io(
         in_hidden = intermediate_size
         weights = gemm2_weights
         activation_compact = gemm1_output
+        if gemm2_output is None:
+            raise ValueError("gemm2_output is required for FC2")
         output_buf = gemm2_output
 
-    cfg = _runtime_config(cfg, in_hidden)
-    _validate_weight_storage(
-        name="gemm1_weights" if fc == "fc1" else "gemm2_weights",
-        tensor=weights,
-        cfg=cfg,
-        num_experts=num_experts,
-        out_hidden=out_hidden,
-        in_hidden=in_hidden,
+    # K normalization changes scheduling fields, not weight-storage layout.
+    # Warm FC1 uses frozen metadata; compilation receives a private config.
+    weight_storage_cfg = cfg if isinstance(cfg, _ImmutablePrimsTsConfigSpec) else None
+    cfg, config_hash = (
+        get_bf16_runtime_config(cfg, in_hidden)
+        if _prepared_runtime_config is None
+        else _prepared_runtime_config
     )
+    if _pre_route_inputs is None:
+        _validate_bf16_weight_storage(
+            fc, weights, weight_storage_cfg, cfg, num_experts, out_hidden, in_hidden
+        )
     logical_token_capacity = _logical_token_capacity(
         fc=fc,
         output_buf=output_buf,
         total_num_padded_tokens=total_num_padded_tokens,
         routed_token_capacity=routed_token_capacity,
     )
-    if tile_idx.numel() != mn_limit.numel():
+    metadata_token_ctas = tile_idx.numel()
+    if metadata_token_ctas != mn_limit.numel():
         raise ValueError(
             f"tile_idx/mn_limit capacity mismatch: {tile_idx.numel()} vs {mn_limit.numel()}"
         )
@@ -420,14 +656,16 @@ def build_bf16_launch_io(
         num_tokens=num_tokens,
         num_routed_experts=int(weights.shape[0]),
         top_k=top_k,
-        metadata_token_ctas=tile_idx.numel(),
+        metadata_token_ctas=metadata_token_ctas,
     )
-    if cfg.is_swap_ab and out_hidden % cfg.tile_m != 0:
+    is_swap_ab = cfg.is_swap_ab
+    has_gated_epilogue = cfg.has_gated_epilogue
+    if is_swap_ab and out_hidden % cfg.tile_m != 0:
         raise ValueError(
             f"swapAB requires out_hidden to be a multiple of tile_m={cfg.tile_m}, "
             f"got {out_hidden}"
         )
-    if output_buf.shape[1] < out_hidden and not cfg.has_gated_epilogue:
+    if output_buf.shape[1] < out_hidden and not has_gated_epilogue:
         raise ValueError(
             f"{fc} output buffer hidden dim too small: need {out_hidden}, "
             f"got {output_buf.shape[1]}"
@@ -437,7 +675,7 @@ def build_bf16_launch_io(
     # offline; Prims-TS consumes MajorK or BlockMajorK storage directly.
     preprocessed_weights = weights
 
-    if cfg.is_swap_ab:
+    if is_swap_ab:
         m_val, n_val, k_val, l_val = (
             out_hidden,
             logical_token_capacity,
@@ -456,9 +694,7 @@ def build_bf16_launch_io(
         kernel_a = activation_compact
         kernel_b = preprocessed_weights
 
-    logical_output_m = (
-        m_val // 2 if cfg.is_swap_ab and cfg.has_gated_epilogue else m_val
-    )
+    logical_output_m = m_val // 2 if is_swap_ab and has_gated_epilogue else m_val
     if output_buf.numel() < logical_output_m * n_val:
         raise ValueError(
             f"{fc} output buffer too small: need {logical_output_m * n_val}, "
@@ -466,108 +702,155 @@ def build_bf16_launch_io(
         )
 
     act_torch = activation_compact
-    bias_torch = _select_bias(
-        fc=fc,
-        cfg=cfg,
-        gemm1_bias=gemm1_bias,
-        gemm2_bias=gemm2_bias,
-        num_experts=num_experts,
-        out_hidden=out_hidden,
-        device=hidden_states.device,
-    )
+    if _pre_route_inputs is not None:
+        bias_torch = _pre_route_inputs.tensors[2]
+    else:
+        bias_torch = _select_bias(
+            fc=fc,
+            cfg=cfg,
+            gemm1_bias=gemm1_bias,
+            gemm2_bias=gemm2_bias,
+            num_experts=num_experts,
+            out_hidden=out_hidden,
+            device=hidden_states.device,
+        )
 
-    a_dp = make_ptr(
-        cutlass.BFloat16,
-        kernel_a.data_ptr(),
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
+    # Reuse only within FC1/FC2 of this invocation. Always read current
+    # addresses so tensor replacement or resize cannot reuse a stale pointer.
+    reuse = (
+        _reuse_fc1_io
+        if fc == "fc2"
+        and _reuse_fc1_io is not None
+        and _reuse_fc1_io["_device"] == hidden_states.device
+        else None
     )
-    b_dp = make_ptr(
-        cutlass.BFloat16,
-        kernel_b.data_ptr(),
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
-    )
-    c0_dp = make_ptr(
-        cutlass.BFloat16,
-        output_buf.data_ptr(),
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
-    )
+    if _pre_route_inputs is not None:
+        a_dp, b_dp = _pre_route_inputs.a_dp, _pre_route_inputs.b_dp
+    else:
+        activation_address = activation_compact.data_ptr()
+        if reuse is not None and reuse["_output_data_ptr"] == activation_address:
+            activation_dp = reuse["c0_dp"]
+        else:
+            activation_dp = make_ptr(
+                cutlass.BFloat16,
+                activation_address,
+                cutlass.AddressSpace.gmem,
+                assumed_align=16,
+            )
+        weights_dp = make_ptr(
+            cutlass.BFloat16,
+            weights.data_ptr(),
+            cutlass.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        a_dp, b_dp = (
+            (weights_dp, activation_dp) if is_swap_ab else (activation_dp, weights_dp)
+        )
     dummy_data_ptr = output_buf.data_ptr()
-    sf_c_dp = make_ptr(
+    c0_dp = make_ptr(
         cutlass.BFloat16, dummy_data_ptr, cutlass.AddressSpace.gmem, assumed_align=16
     )
-    tile_idx_dp = make_ptr(
-        cutlass.Int32, tile_idx.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=16
+    sf_c_dp = c0_dp
+    dummy_float_ptr = make_ptr(
+        cutlass.Float32, dummy_data_ptr, cutlass.AddressSpace.gmem, assumed_align=16
     )
-    route_map_dp = make_ptr(
-        cutlass.Int32, route_map.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=16
-    )
-    mn_limit_dp = make_ptr(
-        cutlass.Int32, mn_limit.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=16
-    )
-    num_non_exiting_ctas_dp = make_ptr(
-        cutlass.Int32,
+    routing_data_ptrs = (
+        tile_idx.data_ptr(),
+        route_map.data_ptr(),
+        mn_limit.data_ptr(),
         num_non_exiting_ctas.data_ptr(),
-        cutlass.AddressSpace.gmem,
-        assumed_align=4,
     )
-    act_dp = make_ptr(
-        cutlass.BFloat16,
-        act_torch.data_ptr(),
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
-    )
-    bias_dp = make_ptr(
-        cutlass.Float32,
-        bias_torch.data_ptr() if bias_torch is not None else dummy_data_ptr,
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
-    )
-    scale_c_dp = make_ptr(
-        cutlass.Float32,
-        dummy_data_ptr,
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
-    )
-    scale_gate_dp = make_ptr(
-        cutlass.Float32,
-        dummy_data_ptr,
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
-    )
-    (
-        gemm1_alpha_dp,
-        gemm1_beta_dp,
-        gemm1_clamp_limit_dp,
-        selected_gemm1_alpha,
-        selected_gemm1_beta,
-        selected_gemm1_clamp_limit,
-    ) = _make_gemm1_oa_ptrs(
-        make_ptr=make_ptr,
-        cutlass=cutlass,
-        cfg=cfg,
-        fc=fc,
-        dummy_data_ptr=dummy_data_ptr,
-        num_experts=num_experts,
-        device=hidden_states.device,
-        gemm1_alpha=gemm1_alpha,
-        gemm1_beta=gemm1_beta,
-        gemm1_clamp_limit=gemm1_clamp_limit,
-    )
-    per_token_sf_a_dp = make_ptr(
-        cutlass.Float32,
-        dummy_data_ptr,
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
-    )
-    per_token_sf_b_dp = make_ptr(
-        cutlass.Float32,
-        dummy_data_ptr,
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
-    )
+    if reuse is not None and reuse["_routing_data_ptrs"] == routing_data_ptrs:
+        tile_idx_dp = reuse["tile_idx_dp"]
+        route_map_dp = reuse["route_map_dp"]
+        mn_limit_dp = reuse["mn_limit_dp"]
+        num_non_exiting_ctas_dp = reuse["num_non_exiting_ctas_dp"]
+    else:
+        tile_idx_dp = make_ptr(
+            cutlass.Int32,
+            routing_data_ptrs[0],
+            cutlass.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        route_map_dp = make_ptr(
+            cutlass.Int32,
+            routing_data_ptrs[1],
+            cutlass.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        mn_limit_dp = make_ptr(
+            cutlass.Int32,
+            routing_data_ptrs[2],
+            cutlass.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        num_non_exiting_ctas_dp = make_ptr(
+            cutlass.Int32,
+            routing_data_ptrs[3],
+            cutlass.AddressSpace.gmem,
+            assumed_align=4,
+        )
+    act_dp = b_dp if is_swap_ab else a_dp
+    if _pre_route_inputs is not None:
+        bias_dp = _pre_route_inputs.bias_dp
+        if bias_dp is None:
+            bias_dp = dummy_float_ptr
+    else:
+        bias_dp = (
+            dummy_float_ptr
+            if bias_torch is None
+            else make_ptr(
+                cutlass.Float32,
+                bias_torch.data_ptr(),
+                cutlass.AddressSpace.gmem,
+                assumed_align=16,
+            )
+        )
+    scale_c_dp = dummy_float_ptr
+    scale_gate_dp = dummy_float_ptr
+    if _pre_route_inputs is not None:
+        alpha_dp, beta_dp, clamp_dp = _pre_route_inputs.oa_ptrs
+        gemm1_alpha_dp = dummy_float_ptr if alpha_dp is None else alpha_dp
+        gemm1_beta_dp = dummy_float_ptr if beta_dp is None else beta_dp
+        gemm1_clamp_limit_dp = dummy_float_ptr if clamp_dp is None else clamp_dp
+        selected_gemm1_alpha, selected_gemm1_beta, selected_gemm1_clamp_limit = (
+            _pre_route_inputs.tensors[3:]
+        )
+    elif (
+        not cfg.has_gemm1_alpha
+        and not cfg.has_gemm1_beta
+        and not cfg.has_gemm1_clamp_limit
+        and gemm1_alpha is None
+        and gemm1_beta is None
+        and gemm1_clamp_limit is None
+    ):
+        # Ordinary BF16 calls need three aliases, not three parameter helpers.
+        # Any supplied tensor or enabled feature still uses full validation.
+        gemm1_alpha_dp = gemm1_beta_dp = gemm1_clamp_limit_dp = dummy_float_ptr
+        selected_gemm1_alpha = selected_gemm1_beta = selected_gemm1_clamp_limit = None
+    else:
+        (
+            gemm1_alpha_dp,
+            gemm1_beta_dp,
+            gemm1_clamp_limit_dp,
+            selected_gemm1_alpha,
+            selected_gemm1_beta,
+            selected_gemm1_clamp_limit,
+        ) = _make_gemm1_oa_ptrs(
+            make_ptr=make_ptr,
+            cutlass=cutlass,
+            cfg=cfg,
+            fc=fc,
+            dummy_data_ptr=dummy_data_ptr,
+            num_experts=num_experts,
+            device=hidden_states.device,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+            dummy_float_ptr=dummy_float_ptr,
+        )
+    per_token_sf_a_dp = dummy_float_ptr
+    per_token_sf_b_dp = dummy_float_ptr
 
     _keepalive = [
         kernel_a,
@@ -585,8 +868,51 @@ def build_bf16_launch_io(
         total_num_padded_tokens,
     ]
 
+    shape = (m_val, n_val, k_val, l_val, num_tokens)
+    # Match batched_gemm_run._launch_arg_tuple, binding from local values once.
+    # The stream is appended at submission; no tensor/pointer is cached across calls.
+    launch_args = (
+        a_dp,
+        b_dp,
+        a_dp,
+        b_dp,
+        c0_dp,
+        sf_c_dp,
+        tile_idx_dp,
+        route_map_dp,
+        mn_limit_dp,
+        num_non_exiting_ctas_dp,
+        num_non_exiting_ctas_dp,
+        act_dp,
+        per_token_sf_a_dp,
+        per_token_sf_b_dp,
+        bias_dp,
+        scale_c_dp,
+        scale_gate_dp,
+        gemm1_alpha_dp,
+        gemm1_beta_dp,
+        gemm1_clamp_limit_dp,
+        shape,
+        launch_early_exit_max_token_ctas,
+    )
+
+    if _pre_route_inputs is not None:
+        return {
+            "_launch_args": launch_args,
+            "_keepalive": _keepalive,
+            "c0_dp": c0_dp,
+            "tile_idx_dp": tile_idx_dp,
+            "route_map_dp": route_map_dp,
+            "mn_limit_dp": mn_limit_dp,
+            "num_non_exiting_ctas_dp": num_non_exiting_ctas_dp,
+            "_device": hidden_states.device,
+            "_output_data_ptr": dummy_data_ptr,
+            "_routing_data_ptrs": routing_data_ptrs,
+        }
+
     return {
         "cfg": cfg,
+        "config_hash": config_hash,
         "launch_early_exit_max_token_ctas": launch_early_exit_max_token_ctas,
         "M": m_val,
         "N": n_val,
@@ -597,7 +923,8 @@ def build_bf16_launch_io(
         "out_hidden": out_hidden,
         "in_hidden": in_hidden,
         "logical_output_m": logical_output_m,
-        "shape": (m_val, n_val, k_val, l_val, num_tokens),
+        "shape": shape,
+        "_launch_args": launch_args,
         "a_dp": a_dp,
         "b_dp": b_dp,
         "sfa_dp": a_dp,
@@ -618,6 +945,9 @@ def build_bf16_launch_io(
         "gemm1_beta_dp": gemm1_beta_dp,
         "gemm1_clamp_limit_dp": gemm1_clamp_limit_dp,
         "_keepalive": _keepalive,
+        "_device": hidden_states.device,
+        "_output_data_ptr": dummy_data_ptr,
+        "_routing_data_ptrs": routing_data_ptrs,
     }
 
 
