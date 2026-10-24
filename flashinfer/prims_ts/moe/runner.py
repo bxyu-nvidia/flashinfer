@@ -48,7 +48,7 @@ from flashinfer.utils import get_compute_capability, round_up
 
 from .compile_cache import get_compiled_gemm, stable_config_hash
 from .config_mapper import (
-    map_trtllm_bf16_moe_tactic,
+    PrimsTsGemmPair,
     map_trtllm_deepseek_fp8_moe_tactic,
     map_trtllm_fp8_per_tensor_moe_tactic,
     map_trtllm_mxfp4_bf16_moe_tactic,
@@ -64,7 +64,8 @@ from .config_mapper import (
     valid_prims_ts_nvfp4_moe_tactics,
 )
 from .support import (
-    is_prims_ts_bf16_supported,
+    _check_prims_ts_bf16_call,
+    _prepare_prims_ts_bf16_tactic,
     is_prims_ts_fp8_block_scale_supported,
     is_prims_ts_fp8_per_tensor_supported,
     is_prims_ts_mxfp4_bf16_supported,
@@ -610,35 +611,31 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         del do_preparation
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         requested_tactic = [-1, -1] if tactic == -1 else tactic
-        hidden_states = moe_inputs.hidden_states
-        output = moe_inputs.output
-        num_tokens = hidden_states.shape[0]
-        with torch.cuda.nvtx.range("prims_ts/config_mapping"):
-            pair = map_trtllm_bf16_moe_tactic(
-                requested_tactic,
-                activation_type=int(self.activation_type),
-                num_tokens=num_tokens,
-                top_k=self.top_k,
-                num_local_experts=self.num_local_experts,
-                weight_layout=int(kwargs.get("weight_layout", self.weight_layout)),
-                fc1_has_bias=kwargs.get("gemm1_bias") is not None,
-                fc2_has_bias=kwargs.get("gemm2_bias") is not None,
-                enable_pdl=bool(kwargs.get("enable_pdl", False)),
-                **_gemm1_oa_flags_from_kwargs(kwargs),
-            )
-            resolved_tactic = _concrete_tactic(pair)
-
         with torch.cuda.nvtx.range("prims_ts/support_check"):
-            ok, reason = is_prims_ts_bf16_supported(
-                self,
-                moe_inputs,
-                resolved_tactic,
-                **kwargs,
-            )
+            ok, reason = _check_prims_ts_bf16_call(self, moe_inputs, **kwargs)
             if not ok:
                 raise RuntimeError(
                     f"Config not supported by Prims-TS BF16 kernel ({reason})"
                 )
+        with torch.cuda.nvtx.range("prims_ts/config_mapping"):
+            try:
+                pair = _prepare_prims_ts_bf16_tactic(
+                    self, moe_inputs, requested_tactic, **kwargs
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Config not supported by Prims-TS BF16 kernel ({exc})"
+                ) from exc
+        return self._forward_prepared(moe_inputs, pair, **kwargs)
+
+    def _forward_prepared(
+        self, moe_inputs: MoeRunnerInputs, pair: PrimsTsGemmPair, **kwargs
+    ):
+        """Execute an invocation checked by the wrapper or public forward()."""
+        hidden_states = moe_inputs.hidden_states
+        output = moe_inputs.output
+        num_tokens = hidden_states.shape[0]
+        resolved_tactic = _concrete_tactic(pair)
 
         import cuda.bindings.driver as cuda_drv
 

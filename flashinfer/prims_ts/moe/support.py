@@ -19,7 +19,7 @@ Support matrix checks for the Prims-TS BF16 MoE MVP.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import torch
 
@@ -32,6 +32,11 @@ from flashinfer.tllm_enums import (
     WeightLayout,
 )
 from flashinfer.utils import get_compute_capability
+
+if TYPE_CHECKING:
+    from .config_mapper import PrimsTsGemmPair
+
+_SUPPORTED_PRIMS_TS_DEVICES: set[torch.device] = set()
 
 _SUPPORTED_ACTIVATIONS = (
     ActivationType.Identity,
@@ -152,10 +157,23 @@ def _validate_block_major_k_storage_matches_config(
 
 
 def _device_supports_prims_ts(device: torch.device) -> bool:
-    if device.type != "cuda" or not torch.cuda.is_available():
+    if device.type != "cuda":
+        return False
+    # Resolve an unindexed CUDA device before caching: the current device can
+    # change between calls. Real input tensors already have explicit indices.
+    if device.index is None:
+        if not torch.cuda.is_available():
+            return False
+        device = torch.device("cuda", torch.cuda.current_device())
+    if device in _SUPPORTED_PRIMS_TS_DEVICES:
+        return True
+    if not torch.cuda.is_available():
         return False
     major, minor = get_compute_capability(device)
-    return (major, minor) in ((10, 0), (10, 3))
+    supported = (major, minor) in ((10, 0), (10, 3))
+    if supported:
+        _SUPPORTED_PRIMS_TS_DEVICES.add(device)
+    return supported
 
 
 def _has_gemm1_oa_params(kwargs: dict[str, Any]) -> bool:
@@ -250,14 +268,10 @@ def _validate_gemm1_oa_params(
     return True, ""
 
 
-def is_prims_ts_bf16_supported(
-    runner: Any,
-    moe_inputs: Any,
-    tactic: int | Sequence[int],
-    **kwargs: Any,
+def _check_prims_ts_bf16_call(
+    runner: Any, moe_inputs: Any, **kwargs: Any
 ) -> tuple[bool, str]:
-    """Return whether this BF16 MoE call is eligible for the Prims-TS path."""
-
+    """Validate call-wide properties once; tensor checks are never memoized."""
     hidden_states = moe_inputs.hidden_states
     if not is_prims_ts_available():
         return False, "nvidia-cutlass-dsl Prims-TS dependencies are not importable"
@@ -300,29 +314,52 @@ def is_prims_ts_bf16_supported(
     if kwargs.get("num_fused_shared_experts", 0):
         return False, "fused shared experts are not supported"
 
-    try:
-        from .config_mapper import map_trtllm_bf16_moe_tactic
+    return True, ""
 
-        pair = map_trtllm_bf16_moe_tactic(
-            tactic,
-            activation_type=int(activation_type),
-            num_tokens=int(hidden_states.shape[0]),
-            top_k=getattr(runner, "top_k", None),
-            num_local_experts=getattr(runner, "num_local_experts", None),
-            weight_layout=_weight_layout_arg(runner, kwargs),
-            fc1_has_bias=kwargs.get("gemm1_bias") is not None,
-            fc2_has_bias=kwargs.get("gemm2_bias") is not None,
-            enable_pdl=bool(kwargs.get("enable_pdl", False)),
-            **_gemm1_oa_flags(kwargs),
-        )
-        ok, reason = _validate_block_major_k_storage_matches_config(
-            runner, kwargs, pair.fc1.cfg.build(), pair.fc2.cfg.build()
-        )
-        if not ok:
-            return False, reason
+
+def _prepare_prims_ts_bf16_tactic(
+    runner: Any,
+    moe_inputs: Any,
+    tactic: int | Sequence[int],
+    **kwargs: Any,
+) -> PrimsTsGemmPair:
+    """Resolve and check one tactic after call-wide validation has succeeded."""
+    from .config_mapper import map_trtllm_bf16_moe_tactic
+
+    pair = map_trtllm_bf16_moe_tactic(
+        tactic,
+        activation_type=int(kwargs.get("activation_type", runner.activation_type)),
+        num_tokens=int(moe_inputs.hidden_states.shape[0]),
+        top_k=getattr(runner, "top_k", None),
+        num_local_experts=getattr(runner, "num_local_experts", None),
+        weight_layout=_weight_layout_arg(runner, kwargs),
+        fc1_has_bias=kwargs.get("gemm1_bias") is not None,
+        fc2_has_bias=kwargs.get("gemm2_bias") is not None,
+        enable_pdl=bool(kwargs.get("enable_pdl", False)),
+        **_gemm1_oa_flags(kwargs),
+    )
+    ok, reason = _validate_block_major_k_storage_matches_config(
+        runner, kwargs, pair.fc1.cfg.build(), pair.fc2.cfg.build()
+    )
+    if not ok:
+        raise ValueError(reason)
+    return pair
+
+
+def is_prims_ts_bf16_supported(
+    runner: Any,
+    moe_inputs: Any,
+    tactic: int | Sequence[int],
+    **kwargs: Any,
+) -> tuple[bool, str]:
+    """Return whether this BF16 MoE call and tactic are supported."""
+    ok, reason = _check_prims_ts_bf16_call(runner, moe_inputs, **kwargs)
+    if not ok:
+        return False, reason
+    try:
+        _prepare_prims_ts_bf16_tactic(runner, moe_inputs, tactic, **kwargs)
     except Exception as exc:
         return False, str(exc)
-
     return True, ""
 
 

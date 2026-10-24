@@ -36,7 +36,10 @@ from flashinfer.fused_moe.shared.validation import (
     validate_bf16_gemm1_activation_params as _validate_bf16_gemm1_activation_params,
 )
 from flashinfer.prims_ts.moe.runner import PrimsTsBf16MoERunner
-from flashinfer.prims_ts.moe.support import is_prims_ts_bf16_supported
+from flashinfer.prims_ts.moe.support import (
+    _check_prims_ts_bf16_call,
+    _prepare_prims_ts_bf16_tactic,
+)
 from flashinfer.tllm_enums import ActivationType, WeightLayout
 from flashinfer.trace.templates.moe import (
     trtllm_bf16_moe_trace,
@@ -261,16 +264,19 @@ def prims_ts_bf16_moe_op(
         )
         moe_runner.set_cache_key_static_extras(**common_kwargs)
     with torch.cuda.nvtx.range("prims_ts/pre_tune_support_check"):
-        ok, reason = is_prims_ts_bf16_supported(
-            moe_runner,
-            moe_inputs,
-            [-1, -1],
-            **common_kwargs,
-        )
+        ok, reason = _check_prims_ts_bf16_call(moe_runner, moe_inputs, **common_kwargs)
         if not ok:
             raise RuntimeError(
                 f"Config not supported by Prims-TS BF16 kernel ({reason})"
             )
+        try:
+            pair = _prepare_prims_ts_bf16_tactic(
+                moe_runner, moe_inputs, [-1, -1], **common_kwargs
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Config not supported by Prims-TS BF16 kernel ({exc})"
+            ) from exc
 
     with torch.cuda.nvtx.range("prims_ts/tactic_selection"):
         _, tactic = AutoTuner.get().choose_one(
@@ -282,22 +288,22 @@ def prims_ts_bf16_moe_op(
         )
 
     with torch.cuda.nvtx.range("prims_ts/post_tune_support_check"):
-        ok, reason = is_prims_ts_bf16_supported(
-            moe_runner,
-            moe_inputs,
-            [-1, -1] if tactic == -1 else tactic,
-            **common_kwargs,
-        )
-        if not ok:
-            raise RuntimeError(
-                f"Config not supported by Prims-TS BF16 kernel ({reason})"
-            )
+        # The unchanged default already passed validation before tuning. An
+        # explicit selected tactic must be checked against the current tensors.
+        selected_tactic = [-1, -1] if tactic == -1 else tactic
+        if tuple(selected_tactic) != (-1, -1):
+            try:
+                pair = _prepare_prims_ts_bf16_tactic(
+                    moe_runner, moe_inputs, selected_tactic, **common_kwargs
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Config not supported by Prims-TS BF16 kernel ({exc})"
+                ) from exc
 
     with torch.cuda.nvtx.range("prims_ts/forward"):
-        intermediate_output = moe_runner.forward(
-            moe_inputs.to_list(),
-            tactic=tactic,
-            **common_kwargs,
+        intermediate_output = moe_runner._forward_prepared(
+            moe_inputs, pair, **common_kwargs
         )
     with torch.cuda.nvtx.range("prims_ts/output_unpack"):
         return unpack_trtllm_moe_output(intermediate_output, output, do_finalize, None)
