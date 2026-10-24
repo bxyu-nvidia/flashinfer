@@ -724,7 +724,7 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             )
 
         with torch.cuda.nvtx.range("prims_ts/fc1_compile_lookup"):
-            fc1_hash = stable_config_hash(fc1_io["cfg"])
+            fc1_hash = fc1_io["config_hash"]
             fc1_fn = get_compiled_gemm(fc1_hash, "fc1", fc1_io, stream)
 
         with torch.cuda.nvtx.range("prims_ts/fc1_launch"):
@@ -757,7 +757,7 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             )
 
         with torch.cuda.nvtx.range("prims_ts/fc2_compile_lookup"):
-            fc2_hash = stable_config_hash(fc2_io["cfg"])
+            fc2_hash = fc2_io["config_hash"]
             fc2_fn = get_compiled_gemm(fc2_hash, "fc2", fc2_io, stream)
 
         with torch.cuda.nvtx.range("prims_ts/fc2_launch"):

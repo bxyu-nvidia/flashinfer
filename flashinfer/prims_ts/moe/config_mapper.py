@@ -19,7 +19,8 @@ Map Prims-TS MoE autotuner tactics to local Prims-TS GEMM configs.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from copy import copy
+from dataclasses import dataclass, replace
 from enum import IntEnum
 from functools import lru_cache
 from importlib import resources
@@ -100,9 +101,16 @@ class PrimsTsConfigSpec:
     kwargs: dict[str, int]
 
     def build(self) -> object:
-        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config
+        # Kernel assembly mutates warp layout fields. Never expose the cached
+        # template; its fields are scalar integers, so a shallow copy suffices.
+        return copy(_build_config_cached(tuple(sorted(self.kwargs.items()))))
 
-        return make_config(**self.kwargs)
+
+@lru_cache(maxsize=1024)
+def _build_config_cached(config_items: tuple[tuple[str, int], ...]) -> object:
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config
+
+    return make_config(**dict(config_items))
 
 
 @dataclass(frozen=True)
@@ -1760,7 +1768,8 @@ def map_trtllm_bf16_moe_tactic(
     if moe_config_index < -1:
         raise ValueError(f"Unsupported MoE config index={moe_config_index}")
 
-    return _required_json_moe_config_pair(
+    pair = _bf16_config_pair_cached(
+        debug_checks=os.environ.get("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "0").lower(),
         tile_n=tile_n,
         moe_config_index=moe_config_index,
         num_tokens=num_tokens,
@@ -1780,6 +1789,22 @@ def map_trtllm_bf16_moe_tactic(
         enable_pdl=enable_pdl,
         weight_layout=weight_layout,
     )
+
+    # Frozen pair records contain mutable option dictionaries. Give every
+    # caller independent specs so edits cannot poison subsequent cache hits.
+    return replace(
+        pair,
+        fc1=replace(pair.fc1, cfg=PrimsTsConfigSpec(dict(pair.fc1.cfg.kwargs))),
+        fc2=replace(pair.fc2, cfg=PrimsTsConfigSpec(dict(pair.fc2.cfg.kwargs))),
+    )
+
+
+@lru_cache(maxsize=1024)
+def _bf16_config_pair_cached(*, debug_checks: str, **kwargs) -> PrimsTsGemmPair:
+    # Schedule validation reads the environment itself. Partition results by
+    # debug mode so a cached production check never bypasses debug validation.
+    del debug_checks
+    return _required_json_moe_config_pair(**kwargs)
 
 
 def map_trtllm_nvfp4_moe_tactic(

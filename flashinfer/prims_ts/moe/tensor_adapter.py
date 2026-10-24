@@ -366,9 +366,7 @@ def build_bf16_launch_io(
     from cutlass.cute.runtime import make_ptr
     import cutlass
 
-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
-        _runtime_config,
-    )
+    from .compile_cache import get_bf16_runtime_config
 
     if fc == "fc1":
         out_hidden = _fc1_out_hidden(intermediate_size, activation_type)
@@ -383,7 +381,7 @@ def build_bf16_launch_io(
         activation_compact = gemm1_output
         output_buf = gemm2_output
 
-    cfg = _runtime_config(cfg, in_hidden)
+    cfg, config_hash = get_bf16_runtime_config(cfg, in_hidden)
     _validate_weight_storage(
         name="gemm1_weights" if fc == "fc1" else "gemm2_weights",
         tensor=weights,
@@ -587,6 +585,7 @@ def build_bf16_launch_io(
 
     return {
         "cfg": cfg,
+        "config_hash": config_hash,
         "launch_early_exit_max_token_ctas": launch_early_exit_max_token_ctas,
         "M": m_val,
         "N": n_val,

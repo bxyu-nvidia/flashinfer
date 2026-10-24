@@ -20,11 +20,49 @@ from __future__ import annotations
 
 import functools
 import json
-from dataclasses import asdict, is_dataclass
-from typing import Any
+from copy import copy
+from dataclasses import asdict, fields, is_dataclass
+from typing import TYPE_CHECKING, Any
 
 from flashinfer.jit.cute_dsl_core import _get_compile_arch
 from flashinfer.prims_ts.utils import get_prims_ts_compile_options
+
+
+if TYPE_CHECKING:
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import BatchedGemmConfig
+
+
+@functools.lru_cache(maxsize=8)
+def _config_field_names(config_type: type[BatchedGemmConfig]) -> tuple[str, ...]:
+    return tuple(field.name for field in fields(config_type) if field.init)
+
+
+def get_bf16_runtime_config(
+    cfg: BatchedGemmConfig, in_hidden: int
+) -> tuple[BatchedGemmConfig, str]:
+    """Reuse scalar BF16 launch configuration and its compilation cache key.
+
+    Tensor pointers, routing metadata, and buffers remain per-call. Copies keep
+    kernel assembly's in-place warp-layout updates out of the cached template.
+    """
+    names = _config_field_names(type(cfg))
+    template, config_hash = _bf16_runtime_config_cached(
+        type(cfg), tuple(getattr(cfg, name) for name in names), in_hidden
+    )
+    return copy(template), config_hash
+
+
+@functools.lru_cache(maxsize=1024)
+def _bf16_runtime_config_cached(
+    config_type: type[BatchedGemmConfig], config_values: tuple[int, ...], in_hidden: int
+) -> tuple[BatchedGemmConfig, str]:
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import _runtime_config
+
+    cfg = config_type(
+        **dict(zip(_config_field_names(config_type), config_values, strict=True))
+    )
+    cfg = _runtime_config(cfg, in_hidden)
+    return cfg, stable_config_hash(cfg)
 
 
 def stable_config_hash(cfg: Any, **constexpr_args: Any) -> str:
