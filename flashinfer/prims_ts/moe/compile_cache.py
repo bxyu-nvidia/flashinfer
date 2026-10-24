@@ -21,7 +21,7 @@ from __future__ import annotations
 import functools
 import json
 from copy import copy
-from dataclasses import asdict, fields, is_dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass
 from typing import TYPE_CHECKING, Any
 
 from flashinfer.jit.cute_dsl_core import _get_compile_arch
@@ -71,6 +71,50 @@ def get_bf16_runtime_config(
         type(cfg), tuple(getattr(cfg, name) for name in names), in_hidden
     )
     return copy(template), config_hash
+
+
+@dataclass(frozen=True, slots=True)
+class Bf16LaunchMetadata:
+    """Scalar launch properties; mutable kernel configs remain compilation-only."""
+
+    config_hash: str
+    is_swap_ab: bool
+    has_gated_epilogue: bool
+    has_bias_m: bool
+    has_gemm1_alpha: bool
+    has_gemm1_beta: bool
+    has_gemm1_clamp_limit: bool
+    use_early_exit: bool
+    tile_m: int
+    tile_n: int
+    cluster_m: int
+
+
+def get_bf16_launch_metadata(
+    cfg: _ImmutablePrimsTsConfigSpec, in_hidden: int
+) -> Bf16LaunchMetadata:
+    """Return immutable launch metadata without copying a runtime config."""
+    return _bf16_launch_metadata_cached(cfg.config_items, in_hidden)
+
+
+@functools.lru_cache(maxsize=1024)
+def _bf16_launch_metadata_cached(
+    config_items: tuple[tuple[str, int], ...], in_hidden: int
+) -> Bf16LaunchMetadata:
+    cfg, key = _bf16_spec_runtime_config_cached(config_items, in_hidden)
+    return Bf16LaunchMetadata(
+        key,
+        cfg.is_swap_ab,
+        cfg.has_gated_epilogue,
+        cfg.has_bias_m,
+        bool(cfg.has_gemm1_alpha),
+        bool(cfg.has_gemm1_beta),
+        bool(cfg.has_gemm1_clamp_limit),
+        bool(cfg.use_early_exit),
+        cfg.tile_m,
+        cfg.tile_n,
+        cfg.cluster_m,
+    )
 
 
 def _copy_bf16_template(template: BatchedGemmConfig) -> BatchedGemmConfig:

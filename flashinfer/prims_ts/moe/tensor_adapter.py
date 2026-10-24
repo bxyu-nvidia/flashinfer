@@ -18,12 +18,18 @@ Adapters from TRT-LLM MoE stage tensors to Prims-TS batched GEMM launch IO.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
 from flashinfer.tllm_enums import ActivationType, Fp8QuantizationType, WeightLayout
+
+
+if TYPE_CHECKING:
+    from .compile_cache import Bf16LaunchMetadata
+    from .config_mapper import _ImmutablePrimsTsConfigSpec
 
 
 _expert_scale_ones: dict[tuple[torch.device, int], torch.Tensor] = {}
@@ -397,6 +403,162 @@ def _make_gemm1_oa_ptrs(
     return alpha_dp, beta_dp, clamp_limit_dp, alpha, beta, clamp_limit
 
 
+def _validate_bf16_weight_storage(
+    fc: str,
+    tensor: torch.Tensor,
+    spec,
+    cfg,
+    num_experts: int,
+    out_hidden: int,
+    in_hidden: int,
+) -> None:
+    expected_weight_shape = (
+        _immutable_weight_shape(
+            spec.weight_layout,
+            spec.weight_dtype_tma_bits,
+            spec.block_major_k_bytes,
+            tensor.element_size(),
+            num_experts,
+            out_hidden,
+            in_hidden,
+        )
+        if spec is not None
+        else None
+    )
+    if expected_weight_shape is None or tensor.shape != expected_weight_shape:
+        _validate_weight_storage(
+            name="gemm1_weights" if fc == "fc1" else "gemm2_weights",
+            tensor=tensor,
+            cfg=spec if spec is not None else cfg,
+            num_experts=num_experts,
+            out_hidden=out_hidden,
+            in_hidden=in_hidden,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _Bf16Fc1Inputs:
+    """Per-invocation input bindings, retained until submission completes."""
+
+    a_dp: object
+    b_dp: object
+    bias_dp: object | None
+    oa_ptrs: tuple[object | None, object | None, object | None]
+    tensors: tuple[torch.Tensor | None, ...]
+
+
+def prepare_bf16_fc1_inputs(
+    *,
+    metadata: Bf16LaunchMetadata,
+    spec: _ImmutablePrimsTsConfigSpec,
+    hidden_states: torch.Tensor,
+    weights: torch.Tensor,
+    num_experts: int,
+    intermediate_size: int,
+    hidden_size: int,
+    activation_type: int,
+    gemm1_bias: torch.Tensor | None = None,
+    gemm1_alpha: torch.Tensor | None = None,
+    gemm1_beta: torch.Tensor | None = None,
+    gemm1_clamp_limit: torch.Tensor | None = None,
+) -> _Bf16Fc1Inputs:
+    """Validate and bind live FC1 inputs before submitting GPU routing.
+
+    Only weights, activations and optional parameters are bound here. Routing
+    results and output buffers are validated and bound after routing returns.
+    This object is local to one invocation; GPU pointers are never cached.
+    """
+    from cutlass.cute.runtime import make_ptr
+    import cutlass
+
+    out_hidden = _fc1_out_hidden(intermediate_size, activation_type)
+    _validate_bf16_weight_storage(
+        "fc1", weights, spec, metadata, num_experts, out_hidden, hidden_size
+    )
+    if metadata.is_swap_ab and out_hidden % metadata.tile_m != 0:
+        raise ValueError(
+            f"swapAB requires out_hidden to be a multiple of tile_m={metadata.tile_m}, "
+            f"got {out_hidden}"
+        )
+    bias = _select_bias(
+        fc="fc1",
+        cfg=metadata,
+        gemm1_bias=gemm1_bias,
+        gemm2_bias=None,
+        num_experts=num_experts,
+        out_hidden=out_hidden,
+        device=hidden_states.device,
+    )
+    if (
+        not metadata.has_gemm1_alpha
+        and not metadata.has_gemm1_beta
+        and not metadata.has_gemm1_clamp_limit
+        and gemm1_alpha is None
+        and gemm1_beta is None
+        and gemm1_clamp_limit is None
+    ):
+        params = (None, None, None)
+        oa_ptrs = (None, None, None)
+    else:
+        params = tuple(
+            _select_gemm1_oa_param(
+                name=name,
+                tensor=tensor,
+                cfg=metadata,
+                flag_name="has_" + name,
+                fc="fc1",
+                num_experts=num_experts,
+                device=hidden_states.device,
+            )
+            for name, tensor in (
+                ("gemm1_alpha", gemm1_alpha),
+                ("gemm1_beta", gemm1_beta),
+                ("gemm1_clamp_limit", gemm1_clamp_limit),
+            )
+        )
+        oa_ptrs = tuple(
+            None
+            if tensor is None
+            else make_ptr(
+                cutlass.Float32,
+                tensor.data_ptr(),
+                cutlass.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            for tensor in params
+        )
+    activation_dp = make_ptr(
+        cutlass.BFloat16,
+        hidden_states.data_ptr(),
+        cutlass.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    weights_dp = make_ptr(
+        cutlass.BFloat16,
+        weights.data_ptr(),
+        cutlass.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    a_dp, b_dp = (
+        (weights_dp, activation_dp)
+        if metadata.is_swap_ab
+        else (activation_dp, weights_dp)
+    )
+    bias_dp = (
+        None
+        if bias is None
+        else make_ptr(
+            cutlass.Float32,
+            bias.data_ptr(),
+            cutlass.AddressSpace.gmem,
+            assumed_align=16,
+        )
+    )
+    return _Bf16Fc1Inputs(
+        a_dp, b_dp, bias_dp, oa_ptrs, (hidden_states, weights, bias, *params)
+    )
+
+
 def build_bf16_launch_io(
     *,
     fc: Literal["fc1", "fc2"],
@@ -425,8 +587,13 @@ def build_bf16_launch_io(
     hidden_size: int,
     _reuse_fc1_io: dict | None = None,
     _prepared_runtime_config: tuple | None = None,
+    _pre_route_inputs: _Bf16Fc1Inputs | None = None,
 ) -> dict:
-    """Build Prims-TS launch IO from TRT-LLM routing/workspace tensors."""
+    """Build Prims-TS launch IO from TRT-LLM routing/workspace tensors.
+
+    Internal warm FC1 calls supply input bindings from immediately before
+    routing and receive launch-only IO. Other calls receive compilation IO.
+    """
     from cutlass.cute.runtime import make_ptr
     import cutlass
 
@@ -449,34 +616,16 @@ def build_bf16_launch_io(
         output_buf = gemm2_output
 
     # K normalization changes scheduling fields, not weight-storage layout.
-    # Retain the precomputed scalar layout while making a private launch config.
+    # Warm FC1 uses frozen metadata; compilation receives a private config.
     weight_storage_cfg = cfg if isinstance(cfg, _ImmutablePrimsTsConfigSpec) else None
     cfg, config_hash = (
         get_bf16_runtime_config(cfg, in_hidden)
         if _prepared_runtime_config is None
         else _prepared_runtime_config
     )
-    expected_weight_shape = (
-        _immutable_weight_shape(
-            weight_storage_cfg.weight_layout,
-            weight_storage_cfg.weight_dtype_tma_bits,
-            weight_storage_cfg.block_major_k_bytes,
-            weights.element_size(),
-            num_experts,
-            out_hidden,
-            in_hidden,
-        )
-        if weight_storage_cfg is not None
-        else None
-    )
-    if expected_weight_shape is None or weights.shape != expected_weight_shape:
-        _validate_weight_storage(
-            name="gemm1_weights" if fc == "fc1" else "gemm2_weights",
-            tensor=weights,
-            cfg=weight_storage_cfg if weight_storage_cfg is not None else cfg,
-            num_experts=num_experts,
-            out_hidden=out_hidden,
-            in_hidden=in_hidden,
+    if _pre_route_inputs is None:
+        _validate_bf16_weight_storage(
+            fc, weights, weight_storage_cfg, cfg, num_experts, out_hidden, in_hidden
         )
     logical_token_capacity = _logical_token_capacity(
         fc=fc,
@@ -553,15 +702,18 @@ def build_bf16_launch_io(
         )
 
     act_torch = activation_compact
-    bias_torch = _select_bias(
-        fc=fc,
-        cfg=cfg,
-        gemm1_bias=gemm1_bias,
-        gemm2_bias=gemm2_bias,
-        num_experts=num_experts,
-        out_hidden=out_hidden,
-        device=hidden_states.device,
-    )
+    if _pre_route_inputs is not None:
+        bias_torch = _pre_route_inputs.tensors[2]
+    else:
+        bias_torch = _select_bias(
+            fc=fc,
+            cfg=cfg,
+            gemm1_bias=gemm1_bias,
+            gemm2_bias=gemm2_bias,
+            num_experts=num_experts,
+            out_hidden=out_hidden,
+            device=hidden_states.device,
+        )
 
     # Reuse only within FC1/FC2 of this invocation. Always read current
     # addresses so tensor replacement or resize cannot reuse a stale pointer.
@@ -572,25 +724,28 @@ def build_bf16_launch_io(
         and _reuse_fc1_io["_device"] == hidden_states.device
         else None
     )
-    activation_address = activation_compact.data_ptr()
-    if reuse is not None and reuse["_output_data_ptr"] == activation_address:
-        activation_dp = reuse["c0_dp"]
+    if _pre_route_inputs is not None:
+        a_dp, b_dp = _pre_route_inputs.a_dp, _pre_route_inputs.b_dp
     else:
-        activation_dp = make_ptr(
+        activation_address = activation_compact.data_ptr()
+        if reuse is not None and reuse["_output_data_ptr"] == activation_address:
+            activation_dp = reuse["c0_dp"]
+        else:
+            activation_dp = make_ptr(
+                cutlass.BFloat16,
+                activation_address,
+                cutlass.AddressSpace.gmem,
+                assumed_align=16,
+            )
+        weights_dp = make_ptr(
             cutlass.BFloat16,
-            activation_address,
+            weights.data_ptr(),
             cutlass.AddressSpace.gmem,
             assumed_align=16,
         )
-    weights_dp = make_ptr(
-        cutlass.BFloat16,
-        weights.data_ptr(),
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
-    )
-    a_dp, b_dp = (
-        (weights_dp, activation_dp) if is_swap_ab else (activation_dp, weights_dp)
-    )
+        a_dp, b_dp = (
+            (weights_dp, activation_dp) if is_swap_ab else (activation_dp, weights_dp)
+        )
     dummy_data_ptr = output_buf.data_ptr()
     c0_dp = make_ptr(
         cutlass.BFloat16, dummy_data_ptr, cutlass.AddressSpace.gmem, assumed_align=16
@@ -636,19 +791,32 @@ def build_bf16_launch_io(
             assumed_align=4,
         )
     act_dp = b_dp if is_swap_ab else a_dp
-    bias_dp = (
-        dummy_float_ptr
-        if bias_torch is None
-        else make_ptr(
-            cutlass.Float32,
-            bias_torch.data_ptr(),
-            cutlass.AddressSpace.gmem,
-            assumed_align=16,
+    if _pre_route_inputs is not None:
+        bias_dp = _pre_route_inputs.bias_dp
+        if bias_dp is None:
+            bias_dp = dummy_float_ptr
+    else:
+        bias_dp = (
+            dummy_float_ptr
+            if bias_torch is None
+            else make_ptr(
+                cutlass.Float32,
+                bias_torch.data_ptr(),
+                cutlass.AddressSpace.gmem,
+                assumed_align=16,
+            )
         )
-    )
     scale_c_dp = dummy_float_ptr
     scale_gate_dp = dummy_float_ptr
-    if (
+    if _pre_route_inputs is not None:
+        alpha_dp, beta_dp, clamp_dp = _pre_route_inputs.oa_ptrs
+        gemm1_alpha_dp = dummy_float_ptr if alpha_dp is None else alpha_dp
+        gemm1_beta_dp = dummy_float_ptr if beta_dp is None else beta_dp
+        gemm1_clamp_limit_dp = dummy_float_ptr if clamp_dp is None else clamp_dp
+        selected_gemm1_alpha, selected_gemm1_beta, selected_gemm1_clamp_limit = (
+            _pre_route_inputs.tensors[3:]
+        )
+    elif (
         not cfg.has_gemm1_alpha
         and not cfg.has_gemm1_beta
         and not cfg.has_gemm1_clamp_limit
@@ -727,6 +895,20 @@ def build_bf16_launch_io(
         shape,
         launch_early_exit_max_token_ctas,
     )
+
+    if _pre_route_inputs is not None:
+        return {
+            "_launch_args": launch_args,
+            "_keepalive": _keepalive,
+            "c0_dp": c0_dp,
+            "tile_idx_dp": tile_idx_dp,
+            "route_map_dp": route_map_dp,
+            "mn_limit_dp": mn_limit_dp,
+            "num_non_exiting_ctas_dp": num_non_exiting_ctas_dp,
+            "_device": hidden_states.device,
+            "_output_data_ptr": dummy_data_ptr,
+            "_routing_data_ptrs": routing_data_ptrs,
+        }
 
     return {
         "cfg": cfg,

@@ -50,11 +50,13 @@ from flashinfer.utils import get_compute_capability, round_up
 
 from .compile_cache import (
     find_compiled_gemm,
+    get_bf16_launch_metadata,
     get_bf16_runtime_config,
     get_compiled_gemm,
     stable_config_hash,
 )
 from .config_mapper import (
+    _ImmutablePrimsTsConfigSpec,
     PrimsTsGemmPair,
     map_trtllm_deepseek_fp8_moe_tactic,
     map_trtllm_fp8_per_tensor_moe_tactic,
@@ -86,6 +88,7 @@ from .tensor_adapter import (
     build_mxfp4_bf16_launch_io,
     build_mxfp4_mxfp8_launch_io,
     build_nvfp4_launch_io,
+    prepare_bf16_fc1_inputs,
 )
 
 
@@ -741,13 +744,39 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
 
-        # Resolve the warm FC1 executable before routing. A cache miss still
-        # compiles below, once the actual routing buffers are available.
+        # Warm calls need scalar metadata, not a mutable compilation config.
+        # Bind routing-independent inputs first to shorten the GPU routing-to-FC1 gap.
+        fc1_pre_route_inputs = None
         with torch.cuda.nvtx.range("prims_ts/fc1_pre_route"):
-            fc1_runtime_config = get_bf16_runtime_config(pair.fc1.cfg, self.hidden_size)
+            if isinstance(pair.fc1.cfg, _ImmutablePrimsTsConfigSpec):
+                metadata = get_bf16_launch_metadata(pair.fc1.cfg, self.hidden_size)
+                fc1_runtime_config = (metadata, metadata.config_hash)
+            else:
+                metadata = None
+                fc1_runtime_config = get_bf16_runtime_config(
+                    pair.fc1.cfg, self.hidden_size
+                )
             fc1_fn = find_compiled_gemm(
                 fc1_runtime_config[1], "fc1", {"_keepalive": (hidden_states,)}
             )
+            if metadata is not None:
+                if fc1_fn is None:
+                    fc1_runtime_config = get_bf16_runtime_config(
+                        pair.fc1.cfg, self.hidden_size
+                    )
+                else:
+                    fc1_pre_route_inputs = prepare_bf16_fc1_inputs(
+                        metadata=metadata,
+                        spec=pair.fc1.cfg,
+                        hidden_states=hidden_states,
+                        weights=kwargs["gemm1_weights"],
+                        num_experts=self.num_local_experts,
+                        intermediate_size=self.intermediate_size,
+                        hidden_size=self.hidden_size,
+                        activation_type=int(self.activation_type),
+                        gemm1_bias=kwargs.get("gemm1_bias"),
+                        **_gemm1_oa_io_kwargs(kwargs),
+                    )
 
         with torch.cuda.nvtx.range("prims_ts/routing"):
             routing_out = self.moe_op.trtllm_moe_run_routing(
@@ -798,6 +827,7 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 fc="fc1",
                 cfg=pair.fc1.cfg,
                 _prepared_runtime_config=fc1_runtime_config,
+                _pre_route_inputs=fc1_pre_route_inputs,
                 hidden_states=hidden_states,
                 gemm1_weights=kwargs["gemm1_weights"],
                 gemm2_weights=kwargs["gemm2_weights"],

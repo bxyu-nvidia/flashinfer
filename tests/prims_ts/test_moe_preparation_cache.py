@@ -32,6 +32,7 @@ def clear_caches():
         config_mapper._bf16_config_pair_cached,
         config_mapper._block_major_k_bytes_cached,
         config_mapper._immutable_config_spec_cached,
+        compile_cache._bf16_launch_metadata_cached,
         compile_cache._bf16_spec_runtime_config_cached,
         compile_cache._bf16_runtime_config_cached,
     )
@@ -672,3 +673,183 @@ def test_cached_cta_bound_rechecks_capacity_and_config(
         tensor_adapter._launch_early_exit_max_token_ctas(**dict(args, **{name: value}))
     assert compute.call_count == 5
     assert tensor_adapter._token_cta_bound.cache_info().maxsize == 1024
+
+
+@pytest.mark.parametrize("layout", [WeightLayout.MajorK, WeightLayout.BlockMajorK])
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("optional", [False, True])
+@pytest.mark.parametrize("gated", [False, True])
+def test_compact_fc1_matches_full_launch_and_rebinds_inputs(
+    monkeypatch, layout, swap_ab, optional, gated
+):
+    import cutlass.cute.runtime
+
+    make_ptr = Mock(
+        side_effect=lambda dtype, addr, space, **kw: (dtype, addr, kw["assumed_align"])
+    )
+    monkeypatch.setattr(cutlass.cute.runtime, "make_ptr", make_ptr)
+    opts = dict(
+        dtype_a=3,
+        dtype_b=3,
+        dtype_c=3,
+        mma_k=16,
+        tile_k=64,
+        weight_layout=int(layout),
+        batch_mode=0 if swap_ab else 1,
+        transpose_mma_output=int(swap_ab),
+        act_kind=1 if gated else 0,
+        bias_type=int(optional),
+        has_gemm1_alpha=int(optional),
+        has_gemm1_beta=int(optional),
+        has_gemm1_clamp_limit=int(optional),
+    )
+    spec = config_mapper._immutable_config_spec_cached(tuple(sorted(opts.items())))
+    meta = compile_cache.get_bf16_launch_metadata(spec, 128)
+    out_hidden = 256 if gated else 128
+    activation_type = int(ActivationType.Swiglu if gated else ActivationType.Identity)
+    weight_shape = (
+        (2, out_hidden, 128)
+        if layout == WeightLayout.MajorK
+        else (2, 2, out_hidden, 64)
+    )
+    previous = None
+    for tokens in (2, 4):
+        hidden = torch.empty(tokens, 128, dtype=torch.bfloat16)
+        weights = torch.empty(weight_shape, dtype=torch.bfloat16)
+        params = dict(
+            gemm1_bias=torch.ones(2, out_hidden) if optional else None,
+            gemm1_alpha=torch.ones(2) if optional else None,
+            gemm1_beta=torch.ones(2) if optional else None,
+            gemm1_clamp_limit=torch.ones(2) if optional else None,
+        )
+        pre_args = dict(
+            metadata=meta,
+            spec=spec,
+            hidden_states=hidden,
+            weights=weights,
+            num_experts=2,
+            intermediate_size=128,
+            hidden_size=128,
+            activation_type=activation_type,
+            **params,
+        )
+        inputs = dict(
+            fc="fc1",
+            cfg=spec,
+            hidden_states=hidden,
+            gemm1_weights=weights,
+            gemm2_weights=weights,
+            gemm1_output=torch.empty(tokens, out_hidden, dtype=torch.bfloat16),
+            gemm2_output=None,
+            tile_idx=torch.zeros(4, dtype=torch.int32),
+            mn_limit=torch.zeros(4, dtype=torch.int32),
+            route_map=torch.zeros(tokens, dtype=torch.int32),
+            num_non_exiting_ctas=torch.ones(1, dtype=torch.int32),
+            total_num_padded_tokens=torch.tensor([tokens], dtype=torch.int32),
+            routed_token_capacity=tokens,
+            activation_type=activation_type,
+            num_experts=2,
+            num_tokens=tokens,
+            top_k=1,
+            intermediate_size=128,
+            hidden_size=128,
+            **params,
+        )
+        full = tensor_adapter.build_bf16_launch_io(**inputs)
+        prepared = tensor_adapter.prepare_bf16_fc1_inputs(**pre_args)
+        compact = tensor_adapter.build_bf16_launch_io(
+            **inputs,
+            _prepared_runtime_config=(meta, meta.config_hash),
+            _pre_route_inputs=prepared,
+        )
+        assert compact["_launch_args"] == full["_launch_args"]
+        assert "cfg" not in compact and "config_hash" not in compact
+        assert len(compact) < len(full)
+        assert compact["_launch_args"][11][1] == hidden.data_ptr()
+        assert compact["_launch_args"][0 if swap_ab else 1][1] == weights.data_ptr()
+        assert any(tensor is hidden for tensor in compact["_keepalive"])
+        assert any(tensor is weights for tensor in compact["_keepalive"])
+        if optional:
+            for tensor in params.values():
+                assert any(item is tensor for item in compact["_keepalive"])
+        if previous is not None:
+            assert compact["_launch_args"][11] != previous["_launch_args"][11]
+        previous = compact
+        # FC2 can reuse the compact FC1's routing/output pointers just like full IO.
+        fc2_inputs = dict(
+            inputs,
+            fc="fc2",
+            gemm2_output=torch.empty(tokens, 128, dtype=torch.bfloat16),
+        )
+        fc2_inputs["cfg"] = config_mapper._immutable_config_spec_cached(
+            tuple(
+                sorted(
+                    dict(
+                        opts,
+                        act_kind=0,
+                        bias_type=0,
+                        has_gemm1_alpha=0,
+                        has_gemm1_beta=0,
+                        has_gemm1_clamp_limit=0,
+                    ).items()
+                )
+            )
+        )
+        fc2_inputs["gemm2_weights"] = torch.empty(
+            (2, 128, 128) if layout == WeightLayout.MajorK else (2, 2, 128, 64),
+            dtype=torch.bfloat16,
+        )
+        fc2_full = tensor_adapter.build_bf16_launch_io(**fc2_inputs, _reuse_fc1_io=full)
+        fc2_compact = tensor_adapter.build_bf16_launch_io(
+            **fc2_inputs, _reuse_fc1_io=compact
+        )
+        assert fc2_compact["_launch_args"] == fc2_full["_launch_args"]
+        # Current routing strides and output capacity remain checked after binding.
+        bad_route = inputs["route_map"].as_strided((tokens,), (0,))
+        with pytest.raises(ValueError, match="route_map must be contiguous"):
+            tensor_adapter.build_bf16_launch_io(
+                **dict(inputs, route_map=bad_route),
+                _prepared_runtime_config=(meta, meta.config_hash),
+                _pre_route_inputs=prepared,
+            )
+        with pytest.raises(ValueError, match="token capacity too small"):
+            tensor_adapter.build_bf16_launch_io(
+                **dict(inputs, gemm1_output=inputs["gemm1_output"][:1]),
+                _prepared_runtime_config=(meta, meta.config_hash),
+                _pre_route_inputs=prepared,
+            )
+        # Pre-route validation cannot be bypassed by the metadata cache.
+        with pytest.raises(ValueError, match="shape|rank-4 storage"):
+            tensor_adapter.prepare_bf16_fc1_inputs(
+                **dict(pre_args, weights=weights[:1])
+            )
+        with pytest.raises(ValueError, match="float32|disabled"):
+            tensor_adapter.prepare_bf16_fc1_inputs(
+                **dict(pre_args, gemm1_alpha=torch.ones(2, dtype=torch.bfloat16))
+            )
+
+
+def test_launch_metadata_is_immutable_and_does_not_copy_runtime_config(monkeypatch):
+    from dataclasses import FrozenInstanceError
+
+    spec = config_mapper._immutable_config_spec_cached((("tile_k", 64),))
+    meta = compile_cache.get_bf16_launch_metadata(spec, 128)
+    runtime, key = compile_cache.get_bf16_runtime_config(spec, 128)
+    assert meta.config_hash == key
+    for name in meta.__dataclass_fields__:
+        if name != "config_hash":
+            assert getattr(meta, name) == getattr(runtime, name)
+    with pytest.raises(FrozenInstanceError):
+        meta.tile_m = 64
+    runtime.tile_m = 512
+    assert meta.tile_m != runtime.tile_m
+
+    def unexpected_copy(*args):
+        pytest.fail("Warm metadata must not copy a mutable compilation config")
+
+    monkeypatch.setattr(compile_cache, "_copy_bf16_template", unexpected_copy)
+    assert compile_cache.get_bf16_launch_metadata(spec, 128) is meta
+    assert compile_cache.get_bf16_launch_metadata(spec, 192) is not meta
+    changed = config_mapper._immutable_config_spec_cached((("tile_k", 128),))
+    assert compile_cache.get_bf16_launch_metadata(changed, 128) is not meta
+    assert compile_cache._bf16_launch_metadata_cached.cache_info().maxsize == 1024

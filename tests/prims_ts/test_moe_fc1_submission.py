@@ -25,10 +25,11 @@ from flashinfer.prims_ts.moe import compile_cache, config_mapper
 from flashinfer.tllm_enums import ActivationType, WeightLayout
 
 
+@pytest.mark.parametrize("immutable", [False, True])
 @pytest.mark.parametrize("warm", [False, True])
 @pytest.mark.parametrize("finalize", [False, True])
 def test_fc1_submission_defers_unused_outputs_and_preserves_cold_path(
-    monkeypatch, warm, finalize
+    monkeypatch, warm, finalize, immutable
 ):
     import cutlass.cute.runtime
 
@@ -88,16 +89,16 @@ def test_fc1_submission_defers_unused_outputs_and_preserves_cold_path(
     monkeypatch.setattr(module, "get_bf16_runtime_config", runtime_config)
     monkeypatch.setattr(compile_cache, "get_bf16_runtime_config", runtime_config)
 
-    def launch_fc1(io):
+    def launch_fc1(*args):
         events.append("fc1")
-        assert io["c0_dp"] == fc1_output.data_ptr()
-        assert io["act_dp"] == hidden.data_ptr()
+        assert args[4] == fc1_output.data_ptr()
+        assert args[11] == hidden.data_ptr()
         fc1_output.copy_(hidden + 1)
 
-    def launch_fc2(io):
+    def launch_fc2(*args):
         events.append("fc2")
-        assert io["c0_dp"] == fc2_output.data_ptr()
-        assert io["act_dp"] == fc1_output.data_ptr()
+        assert args[4] == fc2_output.data_ptr()
+        assert args[11] == fc1_output.data_ptr()
         fc2_output.copy_(fc1_output * 2)
 
     def find(*args):
@@ -106,7 +107,26 @@ def test_fc1_submission_defers_unused_outputs_and_preserves_cold_path(
 
     def compile_kernel(key, fc, io, stream):
         events.append("compile_" + fc)
+        assert "cfg" in io and "config_hash" in io
+        assert not isinstance(io["cfg"], compile_cache.Bf16LaunchMetadata)
         return launch_fc1 if fc == "fc1" else launch_fc2
+
+    original_prepare = module.prepare_bf16_fc1_inputs
+    original_build = module.build_bf16_launch_io
+
+    def prepare_inputs(**kwargs):
+        events.append("pre_route_inputs")
+        return original_prepare(**kwargs)
+
+    def build_io(**kwargs):
+        io = original_build(**kwargs)
+        if kwargs["fc"] == "fc1":
+            assert ("cfg" not in io) == (warm and immutable)
+            assert ("config_hash" not in io) == (warm and immutable)
+        return io
+
+    monkeypatch.setattr(module, "prepare_bf16_fc1_inputs", prepare_inputs)
+    monkeypatch.setattr(module, "build_bf16_launch_io", build_io)
 
     def route(*args):
         events.append("routing")
@@ -130,7 +150,7 @@ def test_fc1_submission_defers_unused_outputs_and_preserves_cold_path(
         moe_op=SimpleNamespace(
             trtllm_moe_run_routing=route, trtllm_moe_run_finalize=finish
         ),
-        _launch_args=lambda io, stream: (io,),
+        _launch_args=lambda io, stream: (*io["_launch_args"], stream),
     )
     inputs = SimpleNamespace(
         hidden_states=hidden,
@@ -153,7 +173,7 @@ def test_fc1_submission_defers_unused_outputs_and_preserves_cold_path(
             )
         )
     )
-    fc = config_mapper.PrimsTsMoeGemmConfig(spec, 0)
+    fc = config_mapper.PrimsTsMoeGemmConfig(spec if immutable else spec.build(), 0)
     pair = config_mapper.PrimsTsGemmPair(128, 0, fc, fc)
     result = module.PrimsTsBf16MoERunner._forward_prepared(
         model,
@@ -173,7 +193,15 @@ def test_fc1_submission_defers_unused_outputs_and_preserves_cold_path(
         enable_pdl=False,
         do_finalize=finalize,
     )
-    assert events[:3] == ["runtime_config", "find", "routing"]
+    assert events[:3] == (
+        (
+            ["find", "pre_route_inputs", "routing"]
+            if warm
+            else ["find", "runtime_config", "routing"]
+        )
+        if immutable
+        else ["runtime_config", "find", "routing"]
+    )
     split = events.index("fc1")
     assert [e for e in events[:split] if isinstance(e, tuple)] == [
         ("extract", slice(2, 8))
@@ -183,7 +211,7 @@ def test_fc1_submission_defers_unused_outputs_and_preserves_cold_path(
         ("extract", slice(8, 9)),
     ]
     assert events.index("fc2") > split
-    assert events.count("runtime_config") == 2
+    assert events.count("runtime_config") == (1 if warm and immutable else 2)
     assert ("compile_fc1" in events) == (not warm)
     if finalize:
         assert result == []
