@@ -18,6 +18,7 @@ Adapters from TRT-LLM MoE stage tensors to Prims-TS batched GEMM launch IO.
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Literal
 
 import torch
@@ -39,6 +40,7 @@ def _get_expert_scale_ones(num_experts: int, device: torch.device) -> torch.Tens
     return scales
 
 
+@lru_cache(maxsize=16)
 def _is_gated_activation(activation_type: int) -> bool:
     return ActivationType(int(activation_type)).is_gated
 
@@ -138,6 +140,59 @@ def _validate_weight_storage(
         )
 
 
+@lru_cache(maxsize=1024)
+def _immutable_weight_shape(
+    layout: int,
+    weight_bits: int,
+    block_bytes: int,
+    element_bytes: int,
+    num_experts: int,
+    out_hidden: int,
+    in_hidden: int,
+) -> tuple[int, ...] | None:
+    # Only scalar layout arithmetic is cached. The caller must compare the
+    # current tensor's shape every time, including on a cache hit.
+    k_bits = in_hidden * weight_bits
+    if layout == int(WeightLayout.MajorK):
+        if k_bits % (element_bytes * 8) == 0:
+            return (num_experts, out_hidden, k_bits // (element_bytes * 8))
+    elif layout == int(WeightLayout.BlockMajorK):
+        if (
+            block_bytes > 0
+            and k_bits % (block_bytes * 8) == 0
+            and block_bytes % element_bytes == 0
+        ):
+            return (
+                num_experts,
+                k_bits // (block_bytes * 8),
+                out_hidden,
+                block_bytes // element_bytes,
+            )
+    # Leave invalid layouts to the existing validator for detailed errors.
+    return None
+
+
+@lru_cache(maxsize=1024)
+def _token_cta_bound(
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    token_tile_size: int,
+    cluster_dim_in_token: int,
+) -> int:
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        compute_max_num_ctas_in_token_dim_for_moe,
+    )
+
+    return compute_max_num_ctas_in_token_dim_for_moe(
+        num_tokens=num_tokens,
+        num_experts=num_experts,
+        top_k=top_k,
+        token_tile_size=token_tile_size,
+        cluster_dim_in_token=cluster_dim_in_token,
+    )
+
+
 def _logical_token_capacity(
     *,
     fc: Literal["fc1", "fc2"],
@@ -187,18 +242,12 @@ def _launch_early_exit_max_token_ctas(
     if not cfg.use_early_exit:
         return 0
 
-    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
-        compute_max_num_ctas_in_token_dim_for_moe,
-    )
-
-    token_tile_size = int(cfg.tile_n if cfg.is_swap_ab else cfg.tile_m)
-    cluster_dim_in_token = 1 if cfg.is_swap_ab else int(cfg.cluster_m)
-    launch_token_ctas = compute_max_num_ctas_in_token_dim_for_moe(
-        num_tokens=int(num_tokens),
-        num_experts=int(num_routed_experts),
-        top_k=int(top_k),
-        token_tile_size=token_tile_size,
-        cluster_dim_in_token=cluster_dim_in_token,
+    launch_token_ctas = _token_cta_bound(
+        int(num_tokens),
+        int(num_routed_experts),
+        int(top_k),
+        int(cfg.tile_n if cfg.is_swap_ab else cfg.tile_m),
+        1 if cfg.is_swap_ab else int(cfg.cluster_m),
     )
     if launch_token_ctas > int(metadata_token_ctas):
         raise ValueError(
@@ -407,14 +456,28 @@ def build_bf16_launch_io(
         if _prepared_runtime_config is None
         else _prepared_runtime_config
     )
-    _validate_weight_storage(
-        name="gemm1_weights" if fc == "fc1" else "gemm2_weights",
-        tensor=weights,
-        cfg=weight_storage_cfg if weight_storage_cfg is not None else cfg,
-        num_experts=num_experts,
-        out_hidden=out_hidden,
-        in_hidden=in_hidden,
+    expected_weight_shape = (
+        _immutable_weight_shape(
+            weight_storage_cfg.weight_layout,
+            weight_storage_cfg.weight_dtype_tma_bits,
+            weight_storage_cfg.block_major_k_bytes,
+            weights.element_size(),
+            num_experts,
+            out_hidden,
+            in_hidden,
+        )
+        if weight_storage_cfg is not None
+        else None
     )
+    if expected_weight_shape is None or weights.shape != expected_weight_shape:
+        _validate_weight_storage(
+            name="gemm1_weights" if fc == "fc1" else "gemm2_weights",
+            tensor=weights,
+            cfg=weight_storage_cfg if weight_storage_cfg is not None else cfg,
+            num_experts=num_experts,
+            out_hidden=out_hidden,
+            in_hidden=in_hidden,
+        )
     logical_token_capacity = _logical_token_capacity(
         fc=fc,
         output_buf=output_buf,

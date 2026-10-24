@@ -25,6 +25,9 @@ from flashinfer.tllm_enums import ActivationType, WeightLayout
 @pytest.fixture(autouse=True)
 def clear_caches():
     caches = (
+        tensor_adapter._immutable_weight_shape,
+        tensor_adapter._token_cta_bound,
+        tensor_adapter._is_gated_activation,
         config_mapper._build_config_cached,
         config_mapper._bf16_config_pair_cached,
         config_mapper._block_major_k_bytes_cached,
@@ -283,8 +286,17 @@ def test_launch_io_refreshes_tensor_pointers_and_shapes(
         else compile_cache._bf16_runtime_config_cached
     )
     assert cache.cache_info().misses == 1
-    # A hit must still run input validation.
-    new_inputs["gemm1_weights" if fc == "fc1" else "gemm2_weights"] = torch.empty(1)
+    # A hit must still compare the live shape, including an in-place reshape
+    # with unchanged storage and element count.
+    weight_name = "gemm1_weights" if fc == "fc1" else "gemm2_weights"
+    weight = new_inputs[weight_name]
+    address = weight.data_ptr()
+    wrong_shape = (1, *weight.shape[1:-1], weight.shape[-1] * 2)
+    weight.resize_(wrong_shape)
+    assert weight.data_ptr() == address
+    with pytest.raises(ValueError, match="invalid .* shape"):
+        tensor_adapter.build_bf16_launch_io(**new_inputs)
+    new_inputs[weight_name] = torch.empty(1)
     error = (
         "invalid MajorK shape" if layout == WeightLayout.MajorK else "rank-4 storage"
     )
@@ -595,3 +607,68 @@ def test_spec_runtime_copy_avoids_generic_copy_and_preserves_private_fields(
     first.num_mma_warps = 99
     third, _ = compile_cache.get_bf16_runtime_config(spec, 128)
     assert asdict(third) == expected
+
+
+@pytest.mark.parametrize("layout", [WeightLayout.MajorK, WeightLayout.BlockMajorK])
+@pytest.mark.parametrize("element_bytes", [1, 2, 4])
+def test_cached_weight_shape_includes_storage_and_model_dimensions(
+    layout, element_bytes
+):
+    cache = tensor_adapter._immutable_weight_shape
+    args = (int(layout), 16, 128, element_bytes, 4, 256, 128)
+    expected = (
+        (4, 256, 256 // element_bytes)
+        if layout == WeightLayout.MajorK
+        else (4, 2, 256, 128 // element_bytes)
+    )
+    assert cache(*args) == expected
+    assert cache(*args) == expected
+    assert cache.cache_info().hits == 1
+    assert cache.cache_info().maxsize == 1024
+    # Each storage/model dimension must participate in the key.
+    for index in (1, 3, 4, 5, 6):
+        changed = list(args)
+        changed[index] *= 2
+        assert cache(*changed) != expected
+    if layout == WeightLayout.BlockMajorK:
+        assert cache(int(layout), 16, 256, element_bytes, 4, 256, 128) != expected
+        assert cache(int(layout), 16, 128, element_bytes, 4, 256, 65) is None
+    else:
+        assert cache(int(layout), 1, 128, element_bytes, 4, 256, 1) is None
+
+
+@pytest.mark.parametrize("swap_ab", [False, True])
+def test_cached_cta_bound_rechecks_capacity_and_config(
+    monkeypatch, config_module, swap_ab
+):
+    from types import SimpleNamespace
+
+    compute = Mock(wraps=config_module.compute_max_num_ctas_in_token_dim_for_moe)
+    monkeypatch.setattr(
+        config_module, "compute_max_num_ctas_in_token_dim_for_moe", compute
+    )
+    cfg = SimpleNamespace(
+        use_early_exit=True, is_swap_ab=swap_ab, tile_m=128, tile_n=128, cluster_m=2
+    )
+    args = dict(
+        cfg=cfg,
+        num_tokens=1024,
+        num_routed_experts=4,
+        top_k=2,
+        metadata_token_ctas=1024,
+    )
+    first = tensor_adapter._launch_early_exit_max_token_ctas(**args)
+    assert tensor_adapter._launch_early_exit_max_token_ctas(**args) == first
+    assert compute.call_count == 1
+    with pytest.raises(ValueError, match="routing metadata capacity"):
+        tensor_adapter._launch_early_exit_max_token_ctas(
+            **dict(args, metadata_token_ctas=first - 1)
+        )
+    assert compute.call_count == 1
+    cfg.tile_m = cfg.tile_n = 64
+    assert tensor_adapter._launch_early_exit_max_token_ctas(**args) > first
+    assert compute.call_count == 2
+    for name, value in (("num_tokens", 2048), ("num_routed_experts", 8), ("top_k", 1)):
+        tensor_adapter._launch_early_exit_max_token_ctas(**dict(args, **{name: value}))
+    assert compute.call_count == 5
+    assert tensor_adapter._token_cta_bound.cache_info().maxsize == 1024
