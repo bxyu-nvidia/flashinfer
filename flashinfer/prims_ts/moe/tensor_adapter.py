@@ -91,7 +91,7 @@ def _validate_weight_storage(
             int(out_hidden),
             weight_bits // element_bits,
         )
-        if tensor.ndim != 3 or tuple(int(dim) for dim in tensor.shape) != expected:
+        if tensor.ndim != 3 or tensor.shape != expected:
             raise ValueError(
                 f"{name} has invalid MajorK shape {tuple(tensor.shape)}, "
                 f"expected {expected}"
@@ -131,7 +131,7 @@ def _validate_weight_storage(
         int(out_hidden),
         block_bytes // tensor.element_size(),
     )
-    if tuple(int(dim) for dim in tensor.shape) != expected:
+    if tensor.shape != expected:
         raise ValueError(
             f"{name} has invalid BlockMajorK shape {tuple(tensor.shape)}, "
             f"expected {expected}"
@@ -585,26 +585,39 @@ def build_bf16_launch_io(
     )
     scale_c_dp = dummy_float_ptr
     scale_gate_dp = dummy_float_ptr
-    (
-        gemm1_alpha_dp,
-        gemm1_beta_dp,
-        gemm1_clamp_limit_dp,
-        selected_gemm1_alpha,
-        selected_gemm1_beta,
-        selected_gemm1_clamp_limit,
-    ) = _make_gemm1_oa_ptrs(
-        make_ptr=make_ptr,
-        cutlass=cutlass,
-        cfg=cfg,
-        fc=fc,
-        dummy_data_ptr=dummy_data_ptr,
-        num_experts=num_experts,
-        device=hidden_states.device,
-        gemm1_alpha=gemm1_alpha,
-        gemm1_beta=gemm1_beta,
-        gemm1_clamp_limit=gemm1_clamp_limit,
-        dummy_float_ptr=dummy_float_ptr,
-    )
+    if (
+        not cfg.has_gemm1_alpha
+        and not cfg.has_gemm1_beta
+        and not cfg.has_gemm1_clamp_limit
+        and gemm1_alpha is None
+        and gemm1_beta is None
+        and gemm1_clamp_limit is None
+    ):
+        # Ordinary BF16 calls need three aliases, not three parameter helpers.
+        # Any supplied tensor or enabled feature still uses full validation.
+        gemm1_alpha_dp = gemm1_beta_dp = gemm1_clamp_limit_dp = dummy_float_ptr
+        selected_gemm1_alpha = selected_gemm1_beta = selected_gemm1_clamp_limit = None
+    else:
+        (
+            gemm1_alpha_dp,
+            gemm1_beta_dp,
+            gemm1_clamp_limit_dp,
+            selected_gemm1_alpha,
+            selected_gemm1_beta,
+            selected_gemm1_clamp_limit,
+        ) = _make_gemm1_oa_ptrs(
+            make_ptr=make_ptr,
+            cutlass=cutlass,
+            cfg=cfg,
+            fc=fc,
+            dummy_data_ptr=dummy_data_ptr,
+            num_experts=num_experts,
+            device=hidden_states.device,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+            dummy_float_ptr=dummy_float_ptr,
+        )
     per_token_sf_a_dp = dummy_float_ptr
     per_token_sf_b_dp = dummy_float_ptr
 
@@ -624,6 +637,34 @@ def build_bf16_launch_io(
         total_num_padded_tokens,
     ]
 
+    shape = (m_val, n_val, k_val, l_val, num_tokens)
+    # Match batched_gemm_run._launch_arg_tuple, binding from local values once.
+    # The stream is appended at submission; no tensor/pointer is cached across calls.
+    launch_args = (
+        a_dp,
+        b_dp,
+        a_dp,
+        b_dp,
+        c0_dp,
+        sf_c_dp,
+        tile_idx_dp,
+        route_map_dp,
+        mn_limit_dp,
+        num_non_exiting_ctas_dp,
+        num_non_exiting_ctas_dp,
+        act_dp,
+        per_token_sf_a_dp,
+        per_token_sf_b_dp,
+        bias_dp,
+        scale_c_dp,
+        scale_gate_dp,
+        gemm1_alpha_dp,
+        gemm1_beta_dp,
+        gemm1_clamp_limit_dp,
+        shape,
+        launch_early_exit_max_token_ctas,
+    )
+
     return {
         "cfg": cfg,
         "config_hash": config_hash,
@@ -637,7 +678,8 @@ def build_bf16_launch_io(
         "out_hidden": out_hidden,
         "in_hidden": in_hidden,
         "logical_output_m": logical_output_m,
-        "shape": (m_val, n_val, k_val, l_val, num_tokens),
+        "shape": shape,
+        "_launch_args": launch_args,
         "a_dp": a_dp,
         "b_dp": b_dp,
         "sfa_dp": a_dp,

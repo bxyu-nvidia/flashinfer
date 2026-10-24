@@ -285,6 +285,14 @@ def _routed_token_capacity(
     )
     top_k = int(getattr(runner, "top_k", 0))
 
+    return _routing_capacity_cached(num_tokens, num_experts, top_k, tile_n)
+
+
+@lru_cache(maxsize=1024)
+def _routing_capacity_cached(
+    num_tokens: int, num_experts: int, top_k: int, tile_n: int
+) -> int:
+    # Only scalar layout inputs are cached; routing buffers remain per-call.
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         compute_max_num_ctas_in_token_dim_for_moe,
     )
@@ -882,9 +890,7 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
     @staticmethod
     def _launch_args(io: dict, stream) -> tuple:
-        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import _launch_arg_tuple
-
-        return _launch_arg_tuple(io, stream)
+        return (*io["_launch_args"], stream)
 
 
 class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):

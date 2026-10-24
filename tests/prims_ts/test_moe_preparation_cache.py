@@ -223,6 +223,8 @@ def test_launch_io_refreshes_tensor_pointers_and_shapes(
         )
 
     old_inputs, new_inputs = inputs(2), inputs(4)
+    optional_params = Mock(wraps=tensor_adapter._make_gemm1_oa_ptrs)
+    monkeypatch.setattr(tensor_adapter, "_make_gemm1_oa_ptrs", optional_params)
     old = tensor_adapter.build_bf16_launch_io(**old_inputs)
     assert make_ptr.call_count == 8
     if use_spec == "immutable":
@@ -263,6 +265,18 @@ def test_launch_io_refreshes_tensor_pointers_and_shapes(
     assert new["shape"] == ((128, 4, 128, 2, 4) if swap_ab else (4, 128, 128, 2, 4))
     assert old["shape"] == ((128, 2, 128, 2, 2) if swap_ab else (2, 128, 128, 2, 2))
     assert new["config_hash"] == old["config_hash"]
+    optional_params.assert_not_called()
+    # The prebound tuple must track the shared kernel ABI and live IO values.
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import _launch_arg_tuple
+
+    for io in (old, new):
+        assert (*io["_launch_args"], 123) == _launch_arg_tuple(io, 123)
+    if fc == "fc1":
+        for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"):
+            with pytest.raises(ValueError, match="disabled"):
+                tensor_adapter.build_bf16_launch_io(
+                    **new_inputs, **{name: torch.ones(2, dtype=torch.float32)}
+                )
     cache = (
         compile_cache._bf16_spec_runtime_config_cached
         if use_spec

@@ -193,3 +193,40 @@ def test_fc1_submission_defers_unused_outputs_and_preserves_cold_path(
         torch.testing.assert_close(result[0], torch.full_like(fc2_output, 4))
         assert result[1].data_ptr() == expert_weights.data_ptr()
         assert result[2].data_ptr() == expanded.data_ptr()
+
+
+def test_routing_capacity_cache_uses_all_layout_dimensions(monkeypatch):
+    from flashinfer.prims_ts.batched_gemm import batched_gemm_config
+    from unittest.mock import Mock
+
+    compute = Mock(wraps=batched_gemm_config.compute_max_num_ctas_in_token_dim_for_moe)
+    monkeypatch.setattr(
+        batched_gemm_config, "compute_max_num_ctas_in_token_dim_for_moe", compute
+    )
+    cache = module._routing_capacity_cached
+    cache.cache_clear()
+    try:
+        for tokens, experts, top_k, tile in (
+            (18026, 128, 8, 128),
+            (18027, 128, 8, 128),
+            (18026, 64, 8, 128),
+            (18026, 128, 4, 128),
+            (18026, 128, 8, 64),
+        ):
+            expected = (
+                compute._mock_wraps(
+                    num_tokens=tokens,
+                    num_experts=experts,
+                    top_k=top_k,
+                    token_tile_size=tile,
+                    cluster_dim_in_token=1,
+                )
+                * tile
+            )
+            assert cache(tokens, experts, top_k, tile) == expected
+            assert cache(tokens, experts, top_k, tile) == expected
+        assert compute.call_count == 5
+        assert cache.cache_info().hits == 5
+        assert cache.cache_info().maxsize == 1024
+    finally:
+        cache.cache_clear()
