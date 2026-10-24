@@ -96,9 +96,7 @@ def invocation(modules, monkeypatch):
     monkeypatch.setattr(cls, "_forward_prepared", execute)
 
     def pair(block_bytes, index):
-        cfg = SimpleNamespace(
-            build=lambda: SimpleNamespace(block_major_k_bytes=block_bytes)
-        )
+        cfg = SimpleNamespace(block_major_k_bytes=block_bytes)
         fc = SimpleNamespace(cfg=cfg)
         return SimpleNamespace(tile_n=128, moe_config_index=index, fc1=fc, fc2=fc)
 
@@ -166,9 +164,7 @@ def test_wrapper_rejects_selected_tactic_with_incompatible_storage(
 ):
     tuner = SimpleNamespace(choose_one=lambda *a, **kw: (None, [128, 1]))
     monkeypatch.setattr(modules.backend.AutoTuner, "get", lambda: tuner)
-    invocation.selected_pair.fc1.cfg.build = lambda: SimpleNamespace(
-        block_major_k_bytes=64
-    )
+    invocation.selected_pair.fc1.cfg.block_major_k_bytes = 64
     with pytest.raises(RuntimeError, match="expects 64 bytes"):
         modules.backend.prims_ts_bf16_moe_op(**invocation.args)
     invocation.execute.assert_not_called()

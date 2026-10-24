@@ -770,14 +770,10 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 kwargs,
             )
 
-        with torch.cuda.nvtx.range("prims_ts/config_build"):
-            fc1_cfg = pair.fc1.cfg.build()
-            fc2_cfg = pair.fc2.cfg.build()
-
         with torch.cuda.nvtx.range("prims_ts/fc1_prepare"):
             fc1_io = build_bf16_launch_io(
                 fc="fc1",
-                cfg=fc1_cfg,
+                cfg=pair.fc1.cfg,
                 hidden_states=hidden_states,
                 gemm1_weights=kwargs["gemm1_weights"],
                 gemm2_weights=kwargs["gemm2_weights"],
@@ -810,7 +806,7 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         with torch.cuda.nvtx.range("prims_ts/fc2_prepare"):
             fc2_io = build_bf16_launch_io(
                 fc="fc2",
-                cfg=fc2_cfg,
+                cfg=pair.fc2.cfg,
                 hidden_states=hidden_states,
                 gemm1_weights=kwargs["gemm1_weights"],
                 gemm2_weights=kwargs["gemm2_weights"],

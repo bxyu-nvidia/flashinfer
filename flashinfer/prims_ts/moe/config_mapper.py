@@ -100,6 +100,11 @@ class PrimsTsConfigSpec:
 
     kwargs: dict[str, int]
 
+    @property
+    def block_major_k_bytes(self) -> int:
+        """Storage size for validation, without materializing a mutable config."""
+        return _block_major_k_bytes_cached(tuple(sorted(self.kwargs.items())))
+
     def build(self) -> object:
         # Kernel assembly mutates warp layout fields. Never expose the cached
         # template; its fields are scalar integers, so a shallow copy suffices.
@@ -111,6 +116,11 @@ def _build_config_cached(config_items: tuple[tuple[str, int], ...]) -> object:
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config
 
     return make_config(**dict(config_items))
+
+
+@lru_cache(maxsize=1024)
+def _block_major_k_bytes_cached(config_items: tuple[tuple[str, int], ...]) -> int:
+    return int(_build_config_cached(config_items).block_major_k_bytes)
 
 
 @dataclass(frozen=True)

@@ -339,7 +339,7 @@ def _prepare_prims_ts_bf16_tactic(
         **_gemm1_oa_flags(kwargs),
     )
     ok, reason = _validate_block_major_k_storage_matches_config(
-        runner, kwargs, pair.fc1.cfg.build(), pair.fc2.cfg.build()
+        runner, kwargs, pair.fc1.cfg, pair.fc2.cfg
     )
     if not ok:
         raise ValueError(reason)

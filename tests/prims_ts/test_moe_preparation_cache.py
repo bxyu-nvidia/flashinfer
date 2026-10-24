@@ -27,6 +27,8 @@ def clear_caches():
     caches = (
         config_mapper._build_config_cached,
         config_mapper._bf16_config_pair_cached,
+        config_mapper._block_major_k_bytes_cached,
+        compile_cache._bf16_spec_runtime_config_cached,
         compile_cache._bf16_runtime_config_cached,
     )
     for cache in caches:
@@ -160,17 +162,19 @@ def test_runtime_config_failure_is_not_cached(config_module):
     assert compile_cache._bf16_runtime_config_cached.cache_info().currsize == 0
 
 
+@pytest.mark.parametrize("layout", [WeightLayout.MajorK, WeightLayout.BlockMajorK])
+@pytest.mark.parametrize("use_spec", [False, True])
 @pytest.mark.parametrize("fc", ["fc1", "fc2"])
 @pytest.mark.parametrize("swap_ab", [False, True])
 def test_launch_io_refreshes_tensor_pointers_and_shapes(
-    monkeypatch, config_module, fc, swap_ab
+    monkeypatch, config_module, fc, swap_ab, use_spec, layout
 ):
     import cutlass.cute.runtime
 
     # No GPU launches: use real CPU tensors and record each bound address.
     make_ptr = Mock(side_effect=lambda dtype, address, space, **kw: address)
     monkeypatch.setattr(cutlass.cute.runtime, "make_ptr", make_ptr)
-    cfg = config_module.make_config(
+    options = dict(
         dtype_a=3,
         dtype_b=3,
         dtype_c=3,
@@ -178,16 +182,24 @@ def test_launch_io_refreshes_tensor_pointers_and_shapes(
         tile_k=64,
         batch_mode=0 if swap_ab else 1,
         transpose_mma_output=int(swap_ab),
-        weight_layout=int(WeightLayout.MajorK),
+        weight_layout=int(layout),
     )
+
+    cfg = (
+        config_mapper.PrimsTsConfigSpec(options)
+        if use_spec
+        else config_module.make_config(**options)
+    )
+
+    weight_shape = (2, 128, 128) if layout == WeightLayout.MajorK else (2, 2, 128, 64)
 
     def inputs(tokens):
         return dict(
             fc=fc,
             cfg=cfg,
             hidden_states=torch.empty((tokens, 128), dtype=torch.bfloat16),
-            gemm1_weights=torch.empty((2, 128, 128), dtype=torch.bfloat16),
-            gemm2_weights=torch.empty((2, 128, 128), dtype=torch.bfloat16),
+            gemm1_weights=torch.empty(weight_shape, dtype=torch.bfloat16),
+            gemm2_weights=torch.empty(weight_shape, dtype=torch.bfloat16),
             gemm1_output=torch.empty((tokens, 128), dtype=torch.bfloat16),
             gemm2_output=torch.empty((tokens, 128), dtype=torch.bfloat16),
             tile_idx=torch.zeros(4, dtype=torch.int32),
@@ -236,10 +248,18 @@ def test_launch_io_refreshes_tensor_pointers_and_shapes(
     assert new["shape"] == ((128, 4, 128, 2, 4) if swap_ab else (4, 128, 128, 2, 4))
     assert old["shape"] == ((128, 2, 128, 2, 2) if swap_ab else (2, 128, 128, 2, 2))
     assert new["config_hash"] == old["config_hash"]
-    assert compile_cache._bf16_runtime_config_cached.cache_info().misses == 1
+    cache = (
+        compile_cache._bf16_spec_runtime_config_cached
+        if use_spec
+        else compile_cache._bf16_runtime_config_cached
+    )
+    assert cache.cache_info().misses == 1
     # A hit must still run input validation.
     new_inputs["gemm1_weights" if fc == "fc1" else "gemm2_weights"] = torch.empty(1)
-    with pytest.raises(ValueError, match="invalid MajorK shape"):
+    error = (
+        "invalid MajorK shape" if layout == WeightLayout.MajorK else "rank-4 storage"
+    )
+    with pytest.raises(ValueError, match=error):
         tensor_adapter.build_bf16_launch_io(**new_inputs)
 
 
@@ -274,3 +294,95 @@ def test_optional_activation_parameters_keep_live_pointers_and_validation(use_du
     args["gemm1_alpha"] = torch.ones(2, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="must be float32"):
         tensor_adapter._make_gemm1_oa_ptrs(**args)
+
+
+@pytest.mark.parametrize("layout", [WeightLayout.MajorK, WeightLayout.BlockMajorK])
+@pytest.mark.parametrize("activation", [0, 1, 3])
+def test_spec_runtime_matches_materialized_config_and_isolates_mutations(
+    monkeypatch, layout, activation
+):
+    from flashinfer.prims_ts.batched_gemm import batched_gemm_run
+
+    spec = config_mapper.PrimsTsConfigSpec(
+        dict(
+            dtype_a=3,
+            dtype_b=3,
+            dtype_c=3,
+            tile_k=64,
+            mma_k=16,
+            weight_layout=int(layout),
+            act_kind=activation,
+            use_unroll_loop_2x_for_mma=1,
+        )
+    )
+    normalize = Mock(wraps=batched_gemm_run._runtime_config)
+    monkeypatch.setattr(batched_gemm_run, "_runtime_config", normalize)
+    for k in (128, 192):
+        expected, expected_key = compile_cache.get_bf16_runtime_config(spec.build(), k)
+        first, key = compile_cache.get_bf16_runtime_config(spec, k)
+        assert asdict(first) == asdict(expected)
+        assert key == expected_key
+        first.tile_k = 512
+        first.num_mma_warps = 99  # Simulate kernel assembly modifying warp layout.
+        second, key = compile_cache.get_bf16_runtime_config(spec, k)
+        assert asdict(second) == asdict(expected)
+        assert key == expected_key
+    assert normalize.call_count == 4  # Once per K for each of the two paths.
+    spec.kwargs["tile_k"] = 128
+    changed, changed_key = compile_cache.get_bf16_runtime_config(spec, 128)
+    expected, expected_key = compile_cache.get_bf16_runtime_config(spec.build(), 128)
+    assert changed.tile_k == 128
+    assert asdict(changed) == asdict(expected)
+    assert changed_key == expected_key
+
+
+def test_spec_validation_and_launch_hit_skip_build_and_field_scan(monkeypatch):
+    spec = config_mapper.PrimsTsConfigSpec(
+        dict(
+            dtype_a=3,
+            dtype_b=3,
+            dtype_c=3,
+            mma_k=16,
+            tile_k=64,
+            weight_layout=int(WeightLayout.BlockMajorK),
+        )
+    )
+    block_bytes = spec.block_major_k_bytes
+    _, expected_key = compile_cache.get_bf16_runtime_config(spec, 128)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Warm spec path must not build or scan a materialized config")
+
+    monkeypatch.setattr(config_mapper.PrimsTsConfigSpec, "build", unexpected)
+    monkeypatch.setattr(config_mapper, "_build_config_cached", unexpected)
+    monkeypatch.setattr(compile_cache, "_build_config_cached", unexpected)
+    monkeypatch.setattr(compile_cache, "_config_field_names", unexpected)
+    for _ in range(2):
+        assert spec.block_major_k_bytes == block_bytes
+        _, key = compile_cache.get_bf16_runtime_config(spec, 128)
+        assert key == expected_key
+
+
+def test_spec_layout_metadata_tracks_mutated_options():
+    spec = config_mapper.PrimsTsConfigSpec(
+        dict(
+            dtype_a=3,
+            dtype_b=3,
+            mma_k=16,
+            tile_k=64,
+            weight_layout=int(WeightLayout.BlockMajorK),
+        )
+    )
+    before = spec.block_major_k_bytes
+    assert before == spec.build().block_major_k_bytes
+    spec.kwargs["tile_k"] = 128
+    assert spec.block_major_k_bytes == spec.build().block_major_k_bytes
+    assert config_mapper._block_major_k_bytes_cached.cache_info().misses == 2
+
+
+def test_spec_runtime_failure_is_not_cached():
+    spec = config_mapper.PrimsTsConfigSpec(dict(use_deepseek_fp8=1, tile_k=64))
+    for _ in range(2):
+        with pytest.raises(ValueError, match="requires tile_k=128"):
+            compile_cache.get_bf16_runtime_config(spec, 128)
+    assert compile_cache._bf16_spec_runtime_config_cached.cache_info().currsize == 0
