@@ -56,7 +56,7 @@ def get_bf16_runtime_config(
         template, config_hash = _bf16_spec_runtime_config_cached(
             cfg.config_items, in_hidden
         )
-        return copy(template), config_hash
+        return _copy_bf16_template(template), config_hash
 
     if isinstance(cfg, PrimsTsConfigSpec):
         # Use the original options directly: no build/copy followed by a scan
@@ -64,13 +64,22 @@ def get_bf16_runtime_config(
         template, config_hash = _bf16_spec_runtime_config_cached(
             tuple(sorted(cfg.kwargs.items())), in_hidden
         )
-        return copy(template), config_hash
+        return _copy_bf16_template(template), config_hash
 
     names = _config_field_names(type(cfg))
     template, config_hash = _bf16_runtime_config_cached(
         type(cfg), tuple(getattr(cfg, name) for name in names), in_hidden
     )
     return copy(template), config_hash
+
+
+def _copy_bf16_template(template: BatchedGemmConfig) -> BatchedGemmConfig:
+    # make_config returns a plain, dict-backed dataclass of scalar fields.
+    # Avoid copy.copy's pickle/reconstruction dispatch on every GEMM launch.
+    # Keep the instance and its field dictionary private to this invocation.
+    cfg = object.__new__(type(template))
+    cfg.__dict__ = template.__dict__.copy()
+    return cfg
 
 
 @functools.lru_cache(maxsize=1024)

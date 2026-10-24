@@ -476,3 +476,108 @@ def test_immutable_specs_match_runtime_config_hash_and_layout(layout, swap_ab, k
     assert spec.weight_dtype_tma_bits == original.weight_dtype_tma_bits
     assert spec.block_major_k_bytes == original.block_major_k_bytes
     assert actual.use_unroll_loop_2x_for_mma == (1 if k == 128 else 0)
+
+
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize(
+    "replacement", [None, "routing", "activation", "resize_routing"]
+)
+def test_fc2_reuses_only_matching_live_fc1_pointers(monkeypatch, swap_ab, replacement):
+    import cutlass.cute.runtime
+
+    # Distinct wrapper identities let this test detect real reuse, not just
+    # equality of addresses returned by independently constructed wrappers.
+    make_ptr = Mock(
+        side_effect=lambda dtype, address, space, **kw: (
+            dtype,
+            address,
+            kw["assumed_align"],
+        )
+    )
+    monkeypatch.setattr(cutlass.cute.runtime, "make_ptr", make_ptr)
+    options = dict(
+        dtype_a=3,
+        dtype_b=3,
+        dtype_c=3,
+        mma_k=16,
+        tile_k=64,
+        batch_mode=0 if swap_ab else 1,
+        transpose_mma_output=int(swap_ab),
+        weight_layout=int(WeightLayout.BlockMajorK),
+    )
+    spec = config_mapper._immutable_config_spec_cached(tuple(sorted(options.items())))
+    args = dict(
+        cfg=spec,
+        hidden_states=torch.empty(2, 128, dtype=torch.bfloat16),
+        gemm1_weights=torch.empty(2, 2, 128, 64, dtype=torch.bfloat16),
+        gemm2_weights=torch.empty(2, 2, 128, 64, dtype=torch.bfloat16),
+        gemm1_output=torch.empty(2, 128, dtype=torch.bfloat16),
+        gemm2_output=torch.empty(2, 128, dtype=torch.bfloat16),
+        tile_idx=torch.zeros(4, dtype=torch.int32),
+        mn_limit=torch.zeros(4, dtype=torch.int32),
+        route_map=torch.zeros(2, dtype=torch.int32),
+        num_non_exiting_ctas=torch.ones(1, dtype=torch.int32),
+        total_num_padded_tokens=torch.tensor([2], dtype=torch.int32),
+        routed_token_capacity=2,
+        activation_type=int(ActivationType.Identity),
+        num_experts=2,
+        num_tokens=2,
+        top_k=1,
+        intermediate_size=128,
+        hidden_size=128,
+    )
+    first = tensor_adapter.build_bf16_launch_io(fc="fc1", **args)
+    assert make_ptr.call_count == 8
+    if replacement == "routing":
+        args["route_map"] = torch.zeros(2, dtype=torch.int32)
+    elif replacement == "resize_routing":
+        args["route_map"].resize_(8192)
+        assert args["route_map"].data_ptr() != first["_routing_data_ptrs"][1]
+    elif replacement == "activation":
+        args["gemm1_output"] = torch.empty(2, 128, dtype=torch.bfloat16)
+    second = tensor_adapter.build_bf16_launch_io(fc="fc2", _reuse_fc1_io=first, **args)
+    assert make_ptr.call_count == 11 + (
+        4
+        if replacement in ("routing", "resize_routing")
+        else 1
+        if replacement == "activation"
+        else 0
+    )
+    activation_dp = second["b_dp" if swap_ab else "a_dp"]
+    assert activation_dp[1] == args["gemm1_output"].data_ptr()
+    assert (activation_dp is first["c0_dp"]) == (replacement != "activation")
+    for name in ("tile_idx", "route_map", "mn_limit", "num_non_exiting_ctas"):
+        assert second[name + "_dp"][1] == args[name].data_ptr()
+        assert (second[name + "_dp"] is first[name + "_dp"]) == (
+            replacement not in ("routing", "resize_routing")
+        )
+    assert second["c0_dp"][1] == args["gemm2_output"].data_ptr()
+    assert second["cfg"] is not first["cfg"]
+    # Reuse does not bypass checks on the current inputs, even if the address
+    # remains unchanged and would otherwise match the saved pointer.
+    args["route_map"] = args["route_map"].as_strided((2,), (0,))
+    assert args["route_map"].data_ptr() == second["route_map_dp"][1]
+    with pytest.raises(ValueError, match="route_map must be contiguous"):
+        tensor_adapter.build_bf16_launch_io(fc="fc2", _reuse_fc1_io=first, **args)
+
+
+def test_spec_runtime_copy_avoids_generic_copy_and_preserves_private_fields(
+    monkeypatch,
+):
+    spec = config_mapper._immutable_config_spec_cached((("tile_k", 64),))
+    first, first_key = compile_cache.get_bf16_runtime_config(spec, 128)
+    expected = asdict(first)
+
+    # Warm cache should only duplicate the already-normalized field dictionary.
+    def unexpected(*args, **kwargs):
+        pytest.fail("Warm spec launch must not use generic copy.copy")
+
+    monkeypatch.setattr(compile_cache, "copy", unexpected)
+    second, second_key = compile_cache.get_bf16_runtime_config(spec, 128)
+    assert first_key == second_key
+    assert asdict(second) == expected
+    assert first.__dict__ is not second.__dict__
+    first.tile_k = 512
+    first.num_mma_warps = 99
+    third, _ = compile_cache.get_bf16_runtime_config(spec, 128)
+    assert asdict(third) == expected

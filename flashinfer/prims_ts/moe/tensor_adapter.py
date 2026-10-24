@@ -374,6 +374,7 @@ def build_bf16_launch_io(
     top_k: int,
     intermediate_size: int,
     hidden_size: int,
+    _reuse_fc1_io: dict | None = None,
 ) -> dict:
     """Build Prims-TS launch IO from TRT-LLM routing/workspace tensors."""
     from cutlass.cute.runtime import make_ptr
@@ -413,7 +414,8 @@ def build_bf16_launch_io(
         total_num_padded_tokens=total_num_padded_tokens,
         routed_token_capacity=routed_token_capacity,
     )
-    if tile_idx.numel() != mn_limit.numel():
+    metadata_token_ctas = tile_idx.numel()
+    if metadata_token_ctas != mn_limit.numel():
         raise ValueError(
             f"tile_idx/mn_limit capacity mismatch: {tile_idx.numel()} vs {mn_limit.numel()}"
         )
@@ -435,14 +437,16 @@ def build_bf16_launch_io(
         num_tokens=num_tokens,
         num_routed_experts=int(weights.shape[0]),
         top_k=top_k,
-        metadata_token_ctas=tile_idx.numel(),
+        metadata_token_ctas=metadata_token_ctas,
     )
-    if cfg.is_swap_ab and out_hidden % cfg.tile_m != 0:
+    is_swap_ab = cfg.is_swap_ab
+    has_gated_epilogue = cfg.has_gated_epilogue
+    if is_swap_ab and out_hidden % cfg.tile_m != 0:
         raise ValueError(
             f"swapAB requires out_hidden to be a multiple of tile_m={cfg.tile_m}, "
             f"got {out_hidden}"
         )
-    if output_buf.shape[1] < out_hidden and not cfg.has_gated_epilogue:
+    if output_buf.shape[1] < out_hidden and not has_gated_epilogue:
         raise ValueError(
             f"{fc} output buffer hidden dim too small: need {out_hidden}, "
             f"got {output_buf.shape[1]}"
@@ -452,7 +456,7 @@ def build_bf16_launch_io(
     # offline; Prims-TS consumes MajorK or BlockMajorK storage directly.
     preprocessed_weights = weights
 
-    if cfg.is_swap_ab:
+    if is_swap_ab:
         m_val, n_val, k_val, l_val = (
             out_hidden,
             logical_token_capacity,
@@ -471,9 +475,7 @@ def build_bf16_launch_io(
         kernel_a = activation_compact
         kernel_b = preprocessed_weights
 
-    logical_output_m = (
-        m_val // 2 if cfg.is_swap_ab and cfg.has_gated_epilogue else m_val
-    )
+    logical_output_m = m_val // 2 if is_swap_ab and has_gated_epilogue else m_val
     if output_buf.numel() < logical_output_m * n_val:
         raise ValueError(
             f"{fc} output buffer too small: need {logical_output_m * n_val}, "
@@ -491,47 +493,79 @@ def build_bf16_launch_io(
         device=hidden_states.device,
     )
 
-    a_dp = make_ptr(
+    # Reuse only within FC1/FC2 of this invocation. Always read current
+    # addresses so tensor replacement or resize cannot reuse a stale pointer.
+    reuse = (
+        _reuse_fc1_io
+        if fc == "fc2"
+        and _reuse_fc1_io is not None
+        and _reuse_fc1_io["_device"] == hidden_states.device
+        else None
+    )
+    activation_address = activation_compact.data_ptr()
+    if reuse is not None and reuse["_output_data_ptr"] == activation_address:
+        activation_dp = reuse["c0_dp"]
+    else:
+        activation_dp = make_ptr(
+            cutlass.BFloat16,
+            activation_address,
+            cutlass.AddressSpace.gmem,
+            assumed_align=16,
+        )
+    weights_dp = make_ptr(
         cutlass.BFloat16,
-        kernel_a.data_ptr(),
+        weights.data_ptr(),
         cutlass.AddressSpace.gmem,
         assumed_align=16,
     )
-    b_dp = make_ptr(
-        cutlass.BFloat16,
-        kernel_b.data_ptr(),
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
-    )
-    c0_dp = make_ptr(
-        cutlass.BFloat16,
-        output_buf.data_ptr(),
-        cutlass.AddressSpace.gmem,
-        assumed_align=16,
+    a_dp, b_dp = (
+        (weights_dp, activation_dp) if is_swap_ab else (activation_dp, weights_dp)
     )
     dummy_data_ptr = output_buf.data_ptr()
-    # Pointer wrappers are immutable launch arguments. Reuse aliases within
-    # this invocation, while refreshing every address for the next invocation.
+    c0_dp = make_ptr(
+        cutlass.BFloat16, dummy_data_ptr, cutlass.AddressSpace.gmem, assumed_align=16
+    )
     sf_c_dp = c0_dp
     dummy_float_ptr = make_ptr(
         cutlass.Float32, dummy_data_ptr, cutlass.AddressSpace.gmem, assumed_align=16
     )
-    tile_idx_dp = make_ptr(
-        cutlass.Int32, tile_idx.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=16
-    )
-    route_map_dp = make_ptr(
-        cutlass.Int32, route_map.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=16
-    )
-    mn_limit_dp = make_ptr(
-        cutlass.Int32, mn_limit.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=16
-    )
-    num_non_exiting_ctas_dp = make_ptr(
-        cutlass.Int32,
+    routing_data_ptrs = (
+        tile_idx.data_ptr(),
+        route_map.data_ptr(),
+        mn_limit.data_ptr(),
         num_non_exiting_ctas.data_ptr(),
-        cutlass.AddressSpace.gmem,
-        assumed_align=4,
     )
-    act_dp = b_dp if cfg.is_swap_ab else a_dp
+    if reuse is not None and reuse["_routing_data_ptrs"] == routing_data_ptrs:
+        tile_idx_dp = reuse["tile_idx_dp"]
+        route_map_dp = reuse["route_map_dp"]
+        mn_limit_dp = reuse["mn_limit_dp"]
+        num_non_exiting_ctas_dp = reuse["num_non_exiting_ctas_dp"]
+    else:
+        tile_idx_dp = make_ptr(
+            cutlass.Int32,
+            routing_data_ptrs[0],
+            cutlass.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        route_map_dp = make_ptr(
+            cutlass.Int32,
+            routing_data_ptrs[1],
+            cutlass.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        mn_limit_dp = make_ptr(
+            cutlass.Int32,
+            routing_data_ptrs[2],
+            cutlass.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        num_non_exiting_ctas_dp = make_ptr(
+            cutlass.Int32,
+            routing_data_ptrs[3],
+            cutlass.AddressSpace.gmem,
+            assumed_align=4,
+        )
+    act_dp = b_dp if is_swap_ab else a_dp
     bias_dp = (
         dummy_float_ptr
         if bias_torch is None
@@ -617,6 +651,9 @@ def build_bf16_launch_io(
         "gemm1_beta_dp": gemm1_beta_dp,
         "gemm1_clamp_limit_dp": gemm1_clamp_limit_dp,
         "_keepalive": _keepalive,
+        "_device": hidden_states.device,
+        "_output_data_ptr": dummy_data_ptr,
+        "_routing_data_ptrs": routing_data_ptrs,
     }
 
 

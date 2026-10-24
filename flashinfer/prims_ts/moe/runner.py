@@ -813,6 +813,7 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             fc2_io = build_bf16_launch_io(
                 fc="fc2",
                 cfg=pair.fc2.cfg,
+                _reuse_fc1_io=fc1_io,
                 hidden_states=hidden_states,
                 gemm1_weights=kwargs["gemm1_weights"],
                 gemm2_weights=kwargs["gemm2_weights"],
