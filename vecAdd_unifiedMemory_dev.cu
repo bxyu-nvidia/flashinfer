@@ -136,7 +136,7 @@ void unifiedMemExample(int vectorLength)
     }
     timer.stop();
 
-    assert(vectorApproximatelyEqual(C, comparisonResult, vectorLength))
+    assert(vectorApproximatelyEqual(C, comparisonResult, vectorLength) && "GPU results must match CPU results");
 
     // Clean Up
     cudaFree(A);
