@@ -21,6 +21,11 @@ struct Timer {
         this->_milliseconds = 0.0;
     }
 
+    ~Timer() {
+        cudaEventDestroy(this->_start);
+        cudaEventDestroy(this->_stop);
+    }
+
     void start(const std::string& label) {
         this->_label = label;
         cudaEventRecord(this->_start);
