@@ -6,6 +6,7 @@
 #include <cuda/cmath>
 #include <cstdio>
 #include <cassert>
+#include <cuda_profiler_api.h>
 
 
 struct Timer {
@@ -118,11 +119,13 @@ void unifiedMemExample(int vectorLength)
         vecAdd<<<blocks, threads>>>(A, B, C, vectorLength);
     }
     cudaDeviceSynchronize();
+    cudaProfilerStart();
     timer.start("vecAdd", 1<<10);
     for (int i = 0; i < 1<<10 ; ++i) {
         vecAdd<<<blocks, threads>>>(A, B, C, vectorLength);
     }
     timer.stop();
+    cudaProfilerStop();
 
     // Perform computation serially on CPU for comparison
     // Warmup
