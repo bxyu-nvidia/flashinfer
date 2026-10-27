@@ -112,9 +112,11 @@ void unifiedMemExample(int vectorLength)
     int threads = 256;
     int blocks = cuda::ceil_div(vectorLength, threads);
     timer.start("vecAdd");
-    vecAdd<<<blocks, threads>>>(A, B, C, vectorLength);
-    // Wait for the kernel to complete execution
-    cudaDeviceSynchronize();
+    for (int counter = 0; counter < 32; counter++) {
+        vecAdd<<<blocks, threads>>>(A, B, C, vectorLength);
+        // Wait for the kernel to complete execution
+        cudaDeviceSynchronize();
+    }
     timer.stop();
 
     // Perform computation serially on CPU for comparison
