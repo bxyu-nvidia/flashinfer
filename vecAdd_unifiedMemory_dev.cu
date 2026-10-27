@@ -25,6 +25,10 @@ struct Timer {
         cudaEventDestroy(this->_start);
         cudaEventDestroy(this->_stop);
     }
+    
+    // @bxyu-nvidia: Copy and copy assignment guards. I don't fully appreciate these yet.
+    Timer(const Timer&) = delete;
+    Timer& operator=(const Timer&) = delete;
 
     void start(const std::string& label) {
         this->_label = label;
