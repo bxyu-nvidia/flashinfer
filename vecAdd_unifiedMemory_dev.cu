@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <cuda/cmath>
 #include <cstdio>
+#include <cassert>
 
 
 struct Timer {
@@ -135,22 +136,13 @@ void unifiedMemExample(int vectorLength)
     }
     timer.stop();
 
-    // Confirm that CPU and GPU got the same answer
-    if(vectorApproximatelyEqual(C, comparisonResult, vectorLength))
-    {
-        printf("Unified Memory: CPU and GPU answers match\n");
-    }
-    else
-    {
-        printf("Unified Memory: Error - CPU and GPU answers do not match\n");
-    }
+    assert(vectorApproximatelyEqual(C, comparisonResult, vectorLength))
 
     // Clean Up
     cudaFree(A);
     cudaFree(B);
     cudaFree(C);
     free(comparisonResult);
-
 }
 //unified-memory-end
 
