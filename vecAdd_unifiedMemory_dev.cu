@@ -12,13 +12,12 @@ struct Timer {
     cudaEvent_t _stop;
 
     std::string _label;
+    int _repeats;
     float _milliseconds;
 
     Timer() {
         cudaEventCreate(&this->_start);
         cudaEventCreate(&this->_stop);
-
-        this->_milliseconds = 0.0;
     }
 
     ~Timer() {
@@ -30,8 +29,10 @@ struct Timer {
     Timer(const Timer&) = delete;
     Timer& operator=(const Timer&) = delete;
 
-    void start(const std::string& label) {
+    void start(const std::string& label, const int repeats = 1) {
         this->_label = label;
+        this->_repeats = repeats;
+
         cudaEventRecord(this->_start);
     }
 
@@ -41,7 +42,7 @@ struct Timer {
         cudaEventSynchronize(this->_stop);
 
         cudaEventElapsedTime(&this->_milliseconds, this->_start, this->_stop);
-        printf("%s time: %.3f us\n", this->_label.c_str(), 1000 * this->_milliseconds);
+        printf("%s time (%d repeats): %.3f us\n", this->_label.c_str(), this->_repeats, (1000 * this->_milliseconds) / this->_repeats);
     }
 };
 
