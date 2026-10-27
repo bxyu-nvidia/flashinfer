@@ -89,36 +89,38 @@ bool vectorApproximatelyEqual(float* A, float* B, int length, float epsilon=0.00
 //unified-memory-begin
 void unifiedMemExample(int vectorLength)
 {
-    // Pointers to memory vectors
     float* A = nullptr;
     float* B = nullptr;
     float* C = nullptr;
     float* comparisonResult = (float*)malloc(vectorLength*sizeof(float));
 
-    // Initialize timer
     Timer timer;
 
-    // Use unified memory to allocate buffers
     timer.start("Unified memory buffer malloc");
     cudaMallocManaged(&A, vectorLength*sizeof(float));
     cudaMallocManaged(&B, vectorLength*sizeof(float));
     cudaMallocManaged(&C, vectorLength*sizeof(float));
     timer.stop();
 
-    // Initialize vectors on the host
+    timer.start("Initialize vectors on the host");
     initArray(A, vectorLength);
     initArray(B, vectorLength);
+    timer.stop();
 
     // Launch the kernel. Unified memory will make sure A, B, and C are
     // accessible to the GPU
     int threads = 256;
     int blocks = cuda::ceil_div(vectorLength, threads);
+    timer.start("vecAdd");
     vecAdd<<<blocks, threads>>>(A, B, C, vectorLength);
     // Wait for the kernel to complete execution
     cudaDeviceSynchronize();
+    timer.stop();
 
     // Perform computation serially on CPU for comparison
+    timer.start("serialVecAdd");
     serialVecAdd(A, B, comparisonResult, vectorLength);
+    timer.stop();
 
     // Confirm that CPU and GPU got the same answer
     if(vectorApproximatelyEqual(C, comparisonResult, vectorLength))
