@@ -206,3 +206,6 @@ docs/sg_execution_times.rst
 build_nvep/
 flashinfer/moe_ep/backends/split/comm/*/_libs/
 flashinfer/moe_ep/backends/split/comm/nixl_ep/_vendored/
+
+# Cuda dev
+*.o
