@@ -4,6 +4,38 @@
 #include <ctime>
 #include <stdio.h>
 #include <cuda/cmath>
+#include <cstdio>
+
+
+struct Timer {
+    cudaEvent_t _start;
+    cudaEvent_t _stop;
+
+    std::string _label;
+    float _milliseconds;
+
+    Timer() {
+        cudaEventCreate(&this->_start);
+        cudaEventCreate(&this->_stop);
+
+        this->_milliseconds = 0.0;
+    }
+
+    void start(const std::string& label) {
+        this->_label = label;
+        cudaEventRecord(this->_start);
+    }
+
+    void stop()
+    {
+        cudaEventRecord(this->_stop);
+        cudaEventSynchronize(this->_stop);
+
+        cudaEventElapsedTime(&this->_milliseconds, this->_start, this->_stop);
+        printf("%s time: %.3f us\n", this->_label.c_str(), 1000 * this->_milliseconds);
+    }
+};
+
 
 __global__ void vecAdd(float* A, float* B, float* C, int vectorLength)
 {
@@ -44,6 +76,7 @@ bool vectorApproximatelyEqual(float* A, float* B, int length, float epsilon=0.00
     return true;
 }
 
+
 //unified-memory-begin
 void unifiedMemExample(int vectorLength)
 {
@@ -53,10 +86,15 @@ void unifiedMemExample(int vectorLength)
     float* C = nullptr;
     float* comparisonResult = (float*)malloc(vectorLength*sizeof(float));
 
+    // Initialize timer
+    Timer timer;
+
     // Use unified memory to allocate buffers
+    timer.start("Unified memory buffer malloc");
     cudaMallocManaged(&A, vectorLength*sizeof(float));
     cudaMallocManaged(&B, vectorLength*sizeof(float));
     cudaMallocManaged(&C, vectorLength*sizeof(float));
+    timer.stop();
 
     // Initialize vectors on the host
     initArray(A, vectorLength);
