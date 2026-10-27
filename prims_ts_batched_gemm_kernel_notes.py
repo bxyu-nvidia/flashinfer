@@ -1,7 +1,19 @@
 from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import *
+from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import _pdl_wait_completed_before_tasks
 
 
+# - This function describes part of one MLP layer: C = act(A * B + bias) where C[M, N] = A[M, K] × B[K, N]
+# - This kernel function is called once for all tiles.
+# - Usually the input tensor is [B, L, D] where B: Batch size, L: max sequence Length, D: hidden Dimension
+#   but this is packed into [T, D] where T: Total tokens in this batch
+# - Within one MLP layer, we call this function twice: once for fc1 and once for fc2, where e.g. fc1 = ReLU(W_1 * x)^2 and fc2 = W_2 fc1
+#   - This translates to: fc1[D_upproj, T] = ReLU(W_1[D_upproj, D] * x[D, T])^2
+# - For precisions lower than BF16, we have additional scale factor (sf) logic.
 def _batched_gemm_kernel_bf16_body(
+    # **Tensor memory accelerator (tma)** loads objects from global memory (global memory is shared across streaming multiprocessors or SMs)
+    # into shared memory (memory shared by threads currently processed in an SM).
+    # Specifically, it will load these objects tile by tile for the kernel to process.
+    # `tma_a_desc` refers to the 
     tma_a_desc: cutlass.GridConstant[cuda.TensorMap],
     tma_b_desc: cutlass.GridConstant[cuda.TensorMap],
     tma_c_desc: cutlass.GridConstant[cuda.TensorMap],
