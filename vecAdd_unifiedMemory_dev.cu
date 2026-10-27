@@ -112,17 +112,27 @@ void unifiedMemExample(int vectorLength)
     // accessible to the GPU
     int threads = 256;
     int blocks = cuda::ceil_div(vectorLength, threads);
-    timer.start("vecAdd");
-    for (int counter = 0; counter < 32; counter++) {
+    // Warmup
+    for (int i = 0; i < 1<<7 ; ++i) {
         vecAdd<<<blocks, threads>>>(A, B, C, vectorLength);
-        // Wait for the kernel to complete execution
+        cudaDeviceSynchronize();
+    }
+    timer.start("vecAdd", 1<<10);
+    for (int i = 0; i < 1<<10 ; ++i) {
+        vecAdd<<<blocks, threads>>>(A, B, C, vectorLength);
         cudaDeviceSynchronize();
     }
     timer.stop();
 
     // Perform computation serially on CPU for comparison
-    timer.start("serialVecAdd");
-    serialVecAdd(A, B, comparisonResult, vectorLength);
+    // Warmup
+    for (int i = 0; i < 1<<7 ; ++i) {
+        serialVecAdd(A, B, comparisonResult, vectorLength);
+    }
+    timer.start("serialVecAdd", 1<<10);
+    for (int i = 0; i < 1<<10 ; ++i) {
+        serialVecAdd(A, B, comparisonResult, vectorLength);
+    }
     timer.stop();
 
     // Confirm that CPU and GPU got the same answer
