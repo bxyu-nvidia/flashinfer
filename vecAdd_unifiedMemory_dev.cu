@@ -116,12 +116,11 @@ void unifiedMemExample(int vectorLength)
     // Warmup
     for (int i = 0; i < 1<<7 ; ++i) {
         vecAdd<<<blocks, threads>>>(A, B, C, vectorLength);
-        cudaDeviceSynchronize();
     }
+    cudaDeviceSynchronize();
     timer.start("vecAdd", 1<<10);
     for (int i = 0; i < 1<<10 ; ++i) {
         vecAdd<<<blocks, threads>>>(A, B, C, vectorLength);
-        cudaDeviceSynchronize();
     }
     timer.stop();
 
