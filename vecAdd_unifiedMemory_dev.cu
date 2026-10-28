@@ -51,7 +51,7 @@ bool vectorApproximatelyEqual(float* A, float* B, int length, float epsilon=0.00
 }
 
 
-void unifiedMemExample(int vectorLength)
+void vecAddBenchmark(int vectorLength)
 {
     // ----------------------------------------
     // Setup
@@ -155,6 +155,6 @@ int main(int argc, char** argv)
     {
         vectorLength = std::atoi(argv[1]);
     }
-    unifiedMemExample(vectorLength);		
+    vecAddBenchmark(vectorLength);
     return 0;
 }
