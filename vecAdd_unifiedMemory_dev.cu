@@ -89,7 +89,6 @@ bool vectorApproximatelyEqual(float* A, float* B, int length, float epsilon=0.00
 }
 
 
-//unified-memory-begin
 void unifiedMemExample(int vectorLength)
 {
     float* A = nullptr;
@@ -146,7 +145,6 @@ void unifiedMemExample(int vectorLength)
     cudaFree(C);
     free(comparisonResult);
 }
-//unified-memory-end
 
 
 int main(int argc, char** argv)
