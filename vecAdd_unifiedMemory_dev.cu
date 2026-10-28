@@ -50,6 +50,16 @@ bool vectorApproximatelyEqual(float* A, float* B, int length, float epsilon=0.00
     return true;
 }
 
+bool scalarApproximatelyEqual(float A, floatb B, float epsilon=0.00001)
+{
+    if(fabs(A - B) > epsilon)
+    {
+        printf("Mismatch: %f != %f", A, B);
+        return false;
+    }
+    return true;
+}
+
 
 void vecAddBenchmark(int vectorLength)
 {
@@ -150,12 +160,11 @@ void vecAddBenchmark(int vectorLength)
 void vecSumBenchmark(int vectorLength) {
     float* A = nullptr;
     float* B = nullptr;
-    float* C = nullptr;
-    float* comparisonResult = (float*)malloc(vectorLength*sizeof(float));
+    float C;
+    float comparisonResult;
 
     cudaMallocManaged(&A, vectorLength*sizeof(float));
     cudaMallocManaged(&B, vectorLength*sizeof(float));
-    cudaMallocManaged(&C, vectorLength*sizeof(float));
 
     initArray(A, vectorLength);
     initArray(B, vectorLength);
@@ -164,7 +173,7 @@ void vecSumBenchmark(int vectorLength) {
 
     cudaProfilerStop();
 
-    assert(vectorApproximatelyEqual(C, comparisonResult, vectorLength) && "GPU results must match CPU results");
+    assert(scalarApproximatelyEqual(C, comparisonResult) && "GPU results must match CPU results");
 
     // Clean Up
     cudaFree(A);
