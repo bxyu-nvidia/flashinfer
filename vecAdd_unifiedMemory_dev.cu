@@ -1,5 +1,6 @@
 #include <cuda_runtime_api.h>
 #include <cuda_runtime.h>
+#include <nvtx3/nvToolsExt.h>
 #include <memory.h>
 #include <cstdlib>
 #include <ctime>
@@ -113,6 +114,8 @@ void unifiedMemExample(int vectorLength)
     initArray(B, vectorLength);
     timer.stop();
 
+    cudaProfilerStart();
+
     // ----------------------------------------
     // vecAdd
     // ----------------------------------------
@@ -126,13 +129,13 @@ void unifiedMemExample(int vectorLength)
         vecAdd<<<blocks, threads>>>(A, B, C, vectorLength);
     }
     cudaDeviceSynchronize();
-    cudaProfilerStart();
+    nvtxRangePushA("vecAdd");
     timer.start("vecAdd", 1<<10);
     for (int i = 0; i < 1<<10 ; ++i) {
         vecAdd<<<blocks, threads>>>(A, B, C, vectorLength);
     }
     timer.stop();
-    cudaProfilerStop();
+    nvtxRangePop();
 
     // ----------------------------------------
     // vecAdd with Cuda graphs
@@ -158,16 +161,18 @@ void unifiedMemExample(int vectorLength)
     cudaGraphExec_t executable;
     cudaGraphInstantiate(&executable, graph, 0);
 
-    cudaProfilerStart();
+    nvtxRangePushA("vecAdd with Cuda graphs");
     timer.start("vecAdd with Cuda graphs", 1<<10);
     cudaGraphLaunch(executable, stream);
     cudaStreamSynchronize(stream);
     timer.stop();
-    cudaProfilerStop();
+    nvtxRangePop();
 
     cudaGraphExecDestroy(executable);
     cudaGraphDestroy(graph);
     cudaStreamDestroy(stream);
+
+    cudaProfilerStop();
 
     // ----------------------------------------
     // serialVecAdd (CPU)
