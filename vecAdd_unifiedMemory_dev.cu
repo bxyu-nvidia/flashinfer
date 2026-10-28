@@ -11,46 +11,6 @@
 #include <cuda_profiler_api.h>
 
 
-struct Timer {
-    cudaEvent_t _start;
-    cudaEvent_t _stop;
-
-    std::string _label;
-    int _repeats;
-    float _milliseconds;
-
-    Timer() {
-        cudaEventCreate(&this->_start);
-        cudaEventCreate(&this->_stop);
-    }
-
-    ~Timer() {
-        cudaEventDestroy(this->_start);
-        cudaEventDestroy(this->_stop);
-    }
-    
-    // @bxyu-nvidia: Copy and copy assignment guards. I don't fully appreciate these yet.
-    Timer(const Timer&) = delete;
-    Timer& operator=(const Timer&) = delete;
-
-    void start(const std::string& label, const int repeats = 1) {
-        this->_label = label;
-        this->_repeats = repeats;
-
-        cudaEventRecord(this->_start);
-    }
-
-    void stop()
-    {
-        cudaEventRecord(this->_stop);
-        cudaEventSynchronize(this->_stop);
-
-        cudaEventElapsedTime(&this->_milliseconds, this->_start, this->_stop);
-        printf("%s time (%d repeats): %.3f us\n", this->_label.c_str(), this->_repeats, (1000 * this->_milliseconds) / this->_repeats);
-    }
-};
-
-
 __global__ void vecAdd(float* A, float* B, float* C, int vectorLength)
 {
     int workIndex = threadIdx.x + blockIdx.x*blockDim.x;
@@ -101,18 +61,12 @@ void unifiedMemExample(int vectorLength)
     float* C = nullptr;
     float* comparisonResult = (float*)malloc(vectorLength*sizeof(float));
 
-    Timer timer;
-
-    timer.start("Unified memory buffer malloc");
     cudaMallocManaged(&A, vectorLength*sizeof(float));
     cudaMallocManaged(&B, vectorLength*sizeof(float));
     cudaMallocManaged(&C, vectorLength*sizeof(float));
-    timer.stop();
 
-    timer.start("Initialize vectors on the host");
     initArray(A, vectorLength);
     initArray(B, vectorLength);
-    timer.stop();
 
     cudaProfilerStart();
 
@@ -130,11 +84,9 @@ void unifiedMemExample(int vectorLength)
     }
     cudaDeviceSynchronize();
     nvtxRangePushA("vecAdd");
-    timer.start("vecAdd", 1<<10);
     for (int i = 0; i < 1<<10 ; ++i) {
         vecAdd<<<blocks, threads>>>(A, B, C, vectorLength);
     }
-    timer.stop();
     nvtxRangePop();
 
     // ----------------------------------------
@@ -162,10 +114,8 @@ void unifiedMemExample(int vectorLength)
     cudaGraphInstantiate(&executable, graph, 0);
 
     nvtxRangePushA("vecAdd with Cuda graphs");
-    timer.start("vecAdd with Cuda graphs", 1<<10);
     cudaGraphLaunch(executable, stream);
     cudaStreamSynchronize(stream);
-    timer.stop();
     nvtxRangePop();
 
     cudaGraphExecDestroy(executable);
@@ -182,11 +132,11 @@ void unifiedMemExample(int vectorLength)
     for (int i = 0; i < 1<<7 ; ++i) {
         serialVecAdd(A, B, comparisonResult, vectorLength);
     }
-    timer.start("serialVecAdd", 1<<10);
+    nvtxRangePushA("serialVecAdd");
     for (int i = 0; i < 1<<10 ; ++i) {
         serialVecAdd(A, B, comparisonResult, vectorLength);
     }
-    timer.stop();
+    nvtxRangePop();
 
     assert(vectorApproximatelyEqual(C, comparisonResult, vectorLength) && "GPU results must match CPU results");
 
