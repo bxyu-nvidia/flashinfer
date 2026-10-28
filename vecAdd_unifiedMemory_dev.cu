@@ -147,6 +147,32 @@ void vecAddBenchmark(int vectorLength)
     free(comparisonResult);
 }
 
+void vecSumBenchmark(int vectorLength) {
+    float* A = nullptr;
+    float* B = nullptr;
+    float* C = nullptr;
+    float* comparisonResult = (float*)malloc(vectorLength*sizeof(float));
+
+    cudaMallocManaged(&A, vectorLength*sizeof(float));
+    cudaMallocManaged(&B, vectorLength*sizeof(float));
+    cudaMallocManaged(&C, vectorLength*sizeof(float));
+
+    initArray(A, vectorLength);
+    initArray(B, vectorLength);
+
+    cudaProfilerStart();
+
+    cudaProfilerStop();
+
+    assert(vectorApproximatelyEqual(C, comparisonResult, vectorLength) && "GPU results must match CPU results");
+
+    // Clean Up
+    cudaFree(A);
+    cudaFree(B);
+    cudaFree(C);
+    free(comparisonResult);
+}
+
 
 int main(int argc, char** argv)
 {
