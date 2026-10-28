@@ -1,4 +1,5 @@
 #include <cuda_runtime_api.h>
+#include <cuda_runtime.h>
 #include <memory.h>
 #include <cstdlib>
 #include <ctime>
@@ -91,6 +92,9 @@ bool vectorApproximatelyEqual(float* A, float* B, int length, float epsilon=0.00
 
 void unifiedMemExample(int vectorLength)
 {
+    // ----------------------------------------
+    // Setup
+    // ----------------------------------------
     float* A = nullptr;
     float* B = nullptr;
     float* C = nullptr;
@@ -109,6 +113,10 @@ void unifiedMemExample(int vectorLength)
     initArray(B, vectorLength);
     timer.stop();
 
+    // ----------------------------------------
+    // vecAdd
+    // ----------------------------------------
+
     // Launch the kernel. Unified memory will make sure A, B, and C are
     // accessible to the GPU
     int threads = 256;
@@ -126,6 +134,44 @@ void unifiedMemExample(int vectorLength)
     timer.stop();
     cudaProfilerStop();
 
+    // ----------------------------------------
+    // vecAdd with Cuda graphs
+    // ----------------------------------------
+
+    cudaStream_t stream;
+    cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+
+    // Warmup
+    for (int i = 0; i < 1<<7 ; ++i) {
+        vecAdd<<<blocks, threads, 0, stream>>>(A, B, C, vectorLength);
+    }
+    cudaStreamSynchronize(stream);
+
+    // Capture
+    cudaGraph_t graph;
+    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+    for (int i = 0; i < 1024; ++i) {
+        vecAdd<<<blocks, threads, 0, stream>>>(A, B, C, vectorLength);
+    }
+    cudaStreamEndCapture(stream, &graph);
+
+    cudaGraphExec_t executable;
+    cudaGraphInstantiate(&executable, graph, 0);
+
+    cudaProfilerStart();
+    timer.start("vecAdd with Cuda graphs", 1<<10);
+    cudaGraphLaunch(executable, stream);
+    cudaStreamSynchronize(stream);
+    timer.stop();
+    cudaProfilerStop();
+
+    cudaGraphExecDestroy(executable);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+
+    // ----------------------------------------
+    // serialVecAdd (CPU)
+    // ----------------------------------------
     // Perform computation serially on CPU for comparison
     // Warmup
     for (int i = 0; i < 1<<7 ; ++i) {
