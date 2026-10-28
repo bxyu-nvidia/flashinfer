@@ -122,8 +122,6 @@ void unifiedMemExample(int vectorLength)
     cudaGraphDestroy(graph);
     cudaStreamDestroy(stream);
 
-    cudaProfilerStop();
-
     // ----------------------------------------
     // serialVecAdd (CPU)
     // ----------------------------------------
@@ -137,6 +135,8 @@ void unifiedMemExample(int vectorLength)
         serialVecAdd(A, B, comparisonResult, vectorLength);
     }
     nvtxRangePop();
+
+    cudaProfilerStop();
 
     assert(vectorApproximatelyEqual(C, comparisonResult, vectorLength) && "GPU results must match CPU results");
 
