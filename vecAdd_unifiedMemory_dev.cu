@@ -167,11 +167,8 @@ void serialVecSum(const float* A, float* C, const int vectorLength) {
 __global__ void vecSum(const float* A, float* C, const int vectorLength) {
     extern __shared__ float partial[];
 
-    const int startIdx = (vectorLength / blockDim.x) * threadIdx.x;
-    const int endIdx = startIdx + (vectorLength / blockDim.x);
-
     float sum = 0.0f;
-    for (int i=startIdx; i < endIdx; ++i) {
+    for (int i=threadIdx.x; i < vectorLength; i += blockDim.x) {
         sum += A[i];
     }
 
