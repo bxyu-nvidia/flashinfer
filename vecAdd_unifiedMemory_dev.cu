@@ -177,10 +177,11 @@ __global__ void vecSum(const float* A, float* C, const int vectorLength) {
     __syncthreads();
 
     if (threadIdx.x == 0) {
-        *C = 0.0f;
+        float total = 0.0f;
         for (int i=0; i < blockDim.x; ++i) {
-            *C += partial[i];
+            total += partial[i];
         }
+        *C = total;
     }
 }
 
