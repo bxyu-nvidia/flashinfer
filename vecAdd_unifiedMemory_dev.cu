@@ -172,16 +172,18 @@ __global__ void vecSum(const float* A, float* C, const int vectorLength) {
         sum += A[i];
     }
 
-    // Store the result in shared memory
     partial[threadIdx.x] = sum;
     __syncthreads();
 
-    if (threadIdx.x == 0) {
-        float total = 0.0f;
-        for (int i=0; i < blockDim.x; ++i) {
-            total += partial[i];
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
         }
-        *C = total;
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        *C = partial[0];
     }
 }
 
