@@ -214,10 +214,12 @@ void vecSumReduceBenchmark(int vectorLength) {
     for (int i=0; i < 1<<7; ++i) {
         vecSum<<<blocks, threads, sharedBytes>>>(A, C, vectorLength);
     }
+    cudaDeviceSynchronize();
     nvtxRangePushA("vecSum");
     for (int i=0; i < 1<<10; ++i) {
         vecSum<<<blocks, threads, sharedBytes>>>(A, C, vectorLength);
     }
+    cudaDeviceSynchronize();
     nvtxRangePop();
 
     cudaProfilerStop();
