@@ -210,5 +210,6 @@ flashinfer/moe_ep/backends/split/comm/nixl_ep/_vendored/
 # Cuda dev
 *.o
 *.nsys-rep
+*.ncu-repz
 *.sqlite
 core.*
