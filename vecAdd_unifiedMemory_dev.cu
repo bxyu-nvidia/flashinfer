@@ -168,7 +168,11 @@ __global__ void vecSum(const float* A, float* C, const int vectorLength) {
     extern __shared__ float partial[];
 
     float sum = 0.0f;
-    for (int i=threadIdx.x; i < vectorLength; i += blockDim.x) {
+    int i;
+    for (i=threadIdx.x; i < vectorLength - 4 * blockDim.x; i += 4 * blockDim.x) {
+        sum += A[i] + A[i + blockDim.x] + A[i + 2 * blockDim.x] + A[i + 3 * blockDim.x];
+    }
+    for (; i < vectorLength; i += blockDim.x) {
         sum += A[i];
     }
 
