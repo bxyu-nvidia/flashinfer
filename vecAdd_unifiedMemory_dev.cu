@@ -195,10 +195,8 @@ __global__ void vecSum(const float* A, float* C, const int vectorLength) {
         sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
     }
 
-    const int lane = threadIdx.x % 32;
-    const int warp = threadIdx.x / 32;
-    if (lane == 0) {
-        warpSums[warp] = sum0;
+    if (threadIdx.x % 32 == 0) {
+        warpSums[threadIdx.x / 32] = sum0;
     }
     __syncthreads();
 
