@@ -50,11 +50,10 @@ bool vectorApproximatelyEqual(float* A, float* B, int length, float epsilon=0.00
     return true;
 }
 
-bool scalarApproximatelyEqual(float* A, float* B, float epsilon=0.00001)
-{
-    if(fabs(*A - *B) > epsilon)
+bool scalarApproximatelyEqual(const float* reference, const float* actual, const float rtol=1e-5f, const float atol=1e-6f) {
+    if(fabs(*reference - *actual) <= atol + rtol * fabs(*reference))
     {
-        printf("Mismatch: %f != %f", *A, *B);
+        printf("Mismatch: actual %f != reference %f", *actual, *reference);
         return false;
     }
     return true;
@@ -223,7 +222,7 @@ void vecSumReduceBenchmark(int vectorLength) {
 
     cudaProfilerStop();
 
-    assert(scalarApproximatelyEqual(C, comparisonResult) && "GPU results must match CPU results");
+    assert(scalarApproximatelyEqual(comparisonResult, C) && "GPU results must match CPU results");
 
     // Clean Up
     cudaFree(A);
