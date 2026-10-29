@@ -50,11 +50,11 @@ bool vectorApproximatelyEqual(float* A, float* B, int length, float epsilon=0.00
     return true;
 }
 
-bool scalarApproximatelyEqual(float A, float B, float epsilon=0.00001)
+bool scalarApproximatelyEqual(float* A, float* B, float epsilon=0.00001)
 {
-    if(fabs(A - B) > epsilon)
+    if(fabs(*A - *B) > epsilon)
     {
-        printf("Mismatch: %f != %f", A, B);
+        printf("Mismatch: %f != %f", *A, *B);
         return false;
     }
     return true;
@@ -157,10 +157,34 @@ void vecAddBenchmark(int vectorLength)
     free(comparisonResult);
 }
 
-void serialVecSum(float* A, float* C, int vectorLength) {
+void serialVecSum(const float* A, float* C, const int vectorLength) {
     *C = 0.0f;
     for (int i=0; i < vectorLength; ++i) {
         *C += A[i];
+    }
+}
+
+// Within a single block
+__global__ void vecSum(const float* A, float* C, const int vectorLength) {
+    extern __shared__ float partial[];
+
+    const int startIdx = (vectorLength / blockDim.x) * threadIdx.x;
+    const int endIdx = startIdx + (vectorLength / blockDim.x);
+
+    float sum = 0.0f;
+    for (int i=startIdx; i < startIdx + endIdx; ++i) {
+        sum += A[i];
+    }
+
+    // Store the result in shared memory
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        *C = 0.0f;
+        for (int i=0; i < blockDim.x; ++i) {
+            *C += partial[i];
+        }
     }
 }
 
@@ -177,7 +201,7 @@ void vecSumReduceBenchmark(int vectorLength) {
     cudaProfilerStart();
 
     for (int i=0; i < 1<<7; ++i) {
-        serialVecSum(A, C, vectorLength);
+        serialVecSum(A, comparisonResult, vectorLength);
     }
     nvtxRangePushA("serialVecSum");
     for (int i=0; i < 1<<10; ++i) {
@@ -185,9 +209,21 @@ void vecSumReduceBenchmark(int vectorLength) {
     }
     nvtxRangePop();
 
+    const int blocks = 1;  // vecSum is within block right now
+    const int threads = 256;
+    const int sharedBytes = threads * sizeof(float);
+    for (int i=0; i < 1<<7; ++i) {
+        vecSum<<<blocks, threads, sharedBytes>>>(A, C, vectorLength);
+    }
+    nvtxRangePushA("vecSum");
+    for (int i=0; i < 1<<10; ++i) {
+        vecSum<<<blocks, threads, sharedBytes>>>(A, C, vectorLength);
+    }
+    nvtxRangePop();
+
     cudaProfilerStop();
 
-    // assert(scalarApproximatelyEqual(C, comparisonResult) && "GPU results must match CPU results");
+    assert(scalarApproximatelyEqual(C, comparisonResult) && "GPU results must match CPU results");
 
     // Clean Up
     cudaFree(A);
