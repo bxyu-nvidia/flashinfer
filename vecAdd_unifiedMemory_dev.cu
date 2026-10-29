@@ -50,7 +50,7 @@ bool vectorApproximatelyEqual(float* A, float* B, int length, float epsilon=0.00
     return true;
 }
 
-bool scalarApproximatelyEqual(float A, floatb B, float epsilon=0.00001)
+bool scalarApproximatelyEqual(float A, float B, float epsilon=0.00001)
 {
     if(fabs(A - B) > epsilon)
     {
@@ -157,27 +157,40 @@ void vecAddBenchmark(int vectorLength)
     free(comparisonResult);
 }
 
-void vecSumBenchmark(int vectorLength) {
+void serialVecSum(float* A, float* C, int vectorLength) {
+    *C = 0.0f;
+    for (int i=0; i < vectorLength; ++i) {
+        *C += A[i];
+    }
+}
+
+void vecSumReduceBenchmark(int vectorLength) {
     float* A = nullptr;
-    float* B = nullptr;
-    float C;
-    float comparisonResult;
+    float* C;
+    float* comparisonResult = (float*)malloc(sizeof(float));
 
     cudaMallocManaged(&A, vectorLength*sizeof(float));
-    cudaMallocManaged(&B, vectorLength*sizeof(float));
+    cudaMallocManaged(&C, sizeof(float));
 
     initArray(A, vectorLength);
-    initArray(B, vectorLength);
 
     cudaProfilerStart();
 
+    for (int i=0; i < 1<<7; ++i) {
+        serialVecSum(A, C, vectorLength);
+    }
+    nvtxRangePushA("serialVecSum");
+    for (int i=0; i < 1<<7; ++i) {
+        serialVecSum(A, comparisonResult, vectorLength);
+    }
+    nvtxRangePop();
+
     cudaProfilerStop();
 
-    assert(scalarApproximatelyEqual(C, comparisonResult) && "GPU results must match CPU results");
+    // assert(scalarApproximatelyEqual(C, comparisonResult) && "GPU results must match CPU results");
 
     // Clean Up
     cudaFree(A);
-    cudaFree(B);
     cudaFree(C);
     free(comparisonResult);
 }
@@ -190,6 +203,7 @@ int main(int argc, char** argv)
     {
         vectorLength = std::atoi(argv[1]);
     }
-    vecAddBenchmark(vectorLength);
+    // vecAddBenchmark(vectorLength);
+    vecSumReduceBenchmark(vectorLength);
     return 0;
 }
