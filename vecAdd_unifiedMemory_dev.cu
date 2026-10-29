@@ -167,7 +167,8 @@ void validateVecSum(const int vectorLength) {
     assert(
         vectorLength > 0 &&
         (vectorLength & (vectorLength - 1)) == 0 &&
-        "vectorLength must be a power of two"
+        vectorLength >= 4096 && 
+        "vectorLength must be a power of two and >= 4096"
     );
 }
 
