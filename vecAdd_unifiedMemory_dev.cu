@@ -180,7 +180,7 @@ void vecSumReduceBenchmark(int vectorLength) {
         serialVecSum(A, C, vectorLength);
     }
     nvtxRangePushA("serialVecSum");
-    for (int i=0; i < 1<<7; ++i) {
+    for (int i=0; i < 1<<10; ++i) {
         serialVecSum(A, comparisonResult, vectorLength);
     }
     nvtxRangePop();
