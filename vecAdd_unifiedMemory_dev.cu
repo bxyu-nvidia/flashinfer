@@ -171,7 +171,7 @@ __global__ void vecSum(const float* A, float* C, const int vectorLength) {
     const int endIdx = startIdx + (vectorLength / blockDim.x);
 
     float sum = 0.0f;
-    for (int i=startIdx; i < startIdx + endIdx; ++i) {
+    for (int i=startIdx; i < endIdx; ++i) {
         sum += A[i];
     }
 
