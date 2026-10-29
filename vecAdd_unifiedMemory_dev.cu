@@ -51,7 +51,7 @@ bool vectorApproximatelyEqual(float* A, float* B, int length, float epsilon=0.00
 }
 
 bool scalarApproximatelyEqual(const float* reference, const float* actual, const float rtol=1e-5f, const float atol=1e-6f) {
-    if(fabs(*reference - *actual) <= atol + rtol * fabs(*reference))
+    if(fabs(*actual - *reference) >= atol + rtol * fabs(*reference))
     {
         printf("Mismatch: actual %f != reference %f", *actual, *reference);
         return false;
