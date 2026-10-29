@@ -174,7 +174,7 @@ void validateVecSum(const int vectorLength) {
 
 // Within a single block
 __global__ void vecSum(const float* A, float* C, const int vectorLength) {
-    extern __shared__ float partial[];
+    extern __shared__ float warpSums[];
 
     float sum0 = 0.0f;
     float sum1 = 0.0f;
@@ -188,18 +188,25 @@ __global__ void vecSum(const float* A, float* C, const int vectorLength) {
         sum3 += A[i + 12 * blockDim.x] + A[i + 13 * blockDim.x] + A[i + 14 * blockDim.x] + A[i + 15 * blockDim.x];
     }
 
-    partial[threadIdx.x] = (sum0 + sum1) + (sum2 + sum3);
-    __syncthreads();
+    sum0 += sum1 + (sum2 + sum3);
 
-    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
-        if (threadIdx.x < stride) {
-            partial[threadIdx.x] += partial[threadIdx.x + stride];
-        }
-        __syncthreads();
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
     }
 
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    if (lane == 0) {
+        warpSums[warp] = sum0;
+    }
+    __syncthreads();
+
     if (threadIdx.x == 0) {
-        *C = partial[0];
+        *C = 0.0f;
+        for (int i=0; i < blockDim.x / 32; ++i) {
+            *C += warpSums[i];
+        }
     }
 }
 
@@ -226,7 +233,7 @@ void vecSumReduceBenchmark(int vectorLength) {
 
     const int blocks = 1;  // vecSum is within block right now
     const int threads = 256;
-    const int sharedBytes = threads * sizeof(float);
+    const int sharedBytes = (threads / 32) * sizeof(float);
     validateVecSum(vectorLength);
     for (int i=0; i < 1<<7; ++i) {
         vecSum<<<blocks, threads, sharedBytes>>>(A, C, vectorLength);
