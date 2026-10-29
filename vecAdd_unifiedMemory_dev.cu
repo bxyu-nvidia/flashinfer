@@ -163,20 +163,31 @@ void serialVecSum(const float* A, float* C, const int vectorLength) {
     }
 }
 
+void validateVecSum(const int vectorLength) {
+    assert(
+        vectorLength > 0 &&
+        (vectorLength & (vectorLength - 1)) == 0 &&
+        "vectorLength must be a power of two"
+    );
+}
+
 // Within a single block
 __global__ void vecSum(const float* A, float* C, const int vectorLength) {
     extern __shared__ float partial[];
 
-    float sum = 0.0f;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    float sum3 = 0.0f;
     int i;
-    for (i=threadIdx.x; i < vectorLength - 4 * blockDim.x; i += 4 * blockDim.x) {
-        sum += A[i] + A[i + blockDim.x] + A[i + 2 * blockDim.x] + A[i + 3 * blockDim.x];
-    }
-    for (; i < vectorLength; i += blockDim.x) {
-        sum += A[i];
+    for (i=threadIdx.x; i < vectorLength; i += 16 * blockDim.x) {
+        sum0 += A[i] + A[i + blockDim.x] + A[i + 2 * blockDim.x] + A[i + 3 * blockDim.x];
+        sum1 += A[i + 4 * blockDim.x] + A[i + 5 * blockDim.x] + A[i + 6 * blockDim.x] + A[i + 7 * blockDim.x];
+        sum2 += A[i + 8 * blockDim.x] + A[i + 9 * blockDim.x] + A[i + 10 * blockDim.x] + A[i + 11 * blockDim.x];
+        sum3 += A[i + 12 * blockDim.x] + A[i + 13 * blockDim.x] + A[i + 14 * blockDim.x] + A[i + 15 * blockDim.x];
     }
 
-    partial[threadIdx.x] = sum;
+    partial[threadIdx.x] = (sum0 + sum1) + (sum2 + sum3);
     __syncthreads();
 
     for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
@@ -215,6 +226,7 @@ void vecSumReduceBenchmark(int vectorLength) {
     const int blocks = 1;  // vecSum is within block right now
     const int threads = 256;
     const int sharedBytes = threads * sizeof(float);
+    validateVecSum(vectorLength);
     for (int i=0; i < 1<<7; ++i) {
         vecSum<<<blocks, threads, sharedBytes>>>(A, C, vectorLength);
     }
