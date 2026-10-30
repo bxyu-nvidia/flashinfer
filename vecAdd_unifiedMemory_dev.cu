@@ -311,8 +311,8 @@ struct MatMulInput {
         assert(
             M > 0 && N > 0 && K > 0
             && (M & (M - 1)) == 0 && (N & (N - 1)) == 0 && (K & (K - 1)) == 0
-            // && M >= 4096 && N >= 4096 && K >= 4096
-            && "M, N, and K must be a power of two"
+            && N % 256 == 0 && K % 256 == 0
+            && "M, N, and K must be a power of two and N and K must be multiples of 256"
         );
     }
 
@@ -365,6 +365,20 @@ __global__ void matMul(const MatMulInput& input) {
     }
 }
 
+__global__ void matMulWithBlocks(const MatMulInput& input) {
+    for(int i=blockDim.x * blockIdx.x + threadIdx.x; i < input.M * input.K; i+= gridDim.x * blockDim.x) {
+        input.C[i] = 0.0f;
+    }
+
+    for (int m=0; m < input.M; ++m) {
+        for (int n=blockIdx.x; n < input.N; n+=gridDim.x) {
+            for (int k=threadIdx.x; k < input.K; k+=blockDim.x) {
+                input.C[m * input.K + k] += input.A[m * input.N + n] * input.B[n * input.K + k];
+            }
+        }
+    }
+}
+
 void matMulBenchmark(const int M, const int N, const int K) {
     MatMulInput input = MatMulInput{M, N, K};
 
@@ -395,9 +409,24 @@ void matMulBenchmark(const int M, const int N, const int K) {
     cudaDeviceSynchronize();
     nvtxRangePop();
 
+    assert(approximatelyEqual(comparisonResult, input.C, M * K) && "matMul results must match serialMatMul results");
+
+    const int blocks = 256;
+    const int threads = 256;
+    for (int i=0; i < 1<<2; ++i) {
+        matMulWithBlocks<<<blocks, threads>>>(input);
+    }
+    cudaDeviceSynchronize();
+    nvtxRangePushA("matMulWithBlocks");
+    for (int i=0; i < 1<<3; ++i) {
+        matMulWithBlocks<<<blocks, threads>>>(input);
+    }
+    cudaDeviceSynchronize();
+    nvtxRangePop();
+
     cudaProfilerStop();
 
-    assert(approximatelyEqual(comparisonResult, input.C, M * K) && "GPU results must match CPU results");
+    assert(approximatelyEqual(comparisonResult, input.C, M * K) && "matMulWithBlocks results must match serialMatMul results");
 
     // Clean Up
     free(comparisonResult);
