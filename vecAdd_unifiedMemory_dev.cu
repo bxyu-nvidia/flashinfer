@@ -348,7 +348,7 @@ void matMulBenchmark(const int M, const int N, const int K) {
     for (int i=0; i < 1<<7; ++i) {
         serialMatMul(comparisonResultInput);
     }
-    nvtxRangePushA("serialVecSum");
+    nvtxRangePushA("serialMatMul");
     for (int i=0; i < 1<<10; ++i) {
         serialMatMul(comparisonResultInput);
     }
@@ -379,12 +379,17 @@ void matMulBenchmark(const int M, const int N, const int K) {
 
 int main(int argc, char** argv)
 {
-    int vectorLength = 1024;
-    if(argc >=2)
-    {
-        vectorLength = std::atoi(argv[1]);
-    }
+    // int vectorLength = 1024;
+    // if(argc >=2)
+    // {
+    //     vectorLength = std::atoi(argv[1]);
+    // }
     // vecAddBenchmark(vectorLength);
-    vecSumReduceBenchmark(vectorLength);
+    // vecSumReduceBenchmark(vectorLength);
+
+    // Input batch: A[T, D1] x [D1, D2]
+    matMulBenchmark(16384, 1024, 2048);
+    // matMulBenchmark(16384, 2048, 1024);
+
     return 0;
 }
