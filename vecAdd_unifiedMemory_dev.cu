@@ -396,8 +396,8 @@ void matMulBenchmark(const int M, const int N, const int K) {
     }
     nvtxRangePop();
 
-    const int blocks = 1;
-    const int threads = 256;
+    int blocks = 1;
+    int threads = 256;
     for (int i=0; i < 1<<2; ++i) {
         matMul<<<blocks, threads>>>(input);
     }
@@ -411,8 +411,8 @@ void matMulBenchmark(const int M, const int N, const int K) {
 
     assert(approximatelyEqual(comparisonResult, input.C, M * K) && "matMul results must match serialMatMul results");
 
-    const int blocks = 256;
-    const int threads = 256;
+    blocks = 256;
+    threads = 256;
     for (int i=0; i < 1<<2; ++i) {
         matMulWithBlocks<<<blocks, threads>>>(input);
     }
