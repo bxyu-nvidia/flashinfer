@@ -308,12 +308,12 @@ struct MatMulInput {
 };
 
 
-void serialMatMul(const float* A, const float* B, float* C, const int M, const int N, const int K) {
-    for (int m=0; m < M; ++m) {
-        for (int k=0; k < K; ++k) {
-            C[m * K + k] = 0.0f;
-            for (int n=0; n < N; ++n) {
-                C[m * K + k] += A[m * N + n] * B[n * K + k];
+void serialMatMul(MatMulInput input) {
+    for (int m=0; m < input.M; ++m) {
+        for (int k=0; k < input.K; ++k) {
+            input.C[m * input.K + k] = 0.0f;
+            for (int n=0; n < input.N; ++n) {
+                input.C[m * input.K + k] += input.A[m * input.N + n] * input.B[n * input.K + k];
             }
         }
     }
