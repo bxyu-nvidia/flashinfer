@@ -364,15 +364,14 @@ __global__ void matMul(const MatMulInput& input) {
 }
 
 __global__ void matMulWithBlocks(const MatMulInput& input) {
-    for(int i=blockDim.x * blockIdx.x + threadIdx.x; i < input.M * input.K; i+= gridDim.x * blockDim.x) {
-        input.C[i] = 0.0f;
-    }
-
-    for (int n=0; n < input.N; ++n) {
-        for (int m=blockIdx.x; m < input.M; m+=gridDim.x) {
-            for (int k=threadIdx.x; k < input.K; k+=blockDim.x) {
-                input.C[m * input.K + k] += input.A[m * input.N + n] * input.B[n * input.K + k];
+    float currSum;
+    for (int m=blockIdx.x; m < input.M; m+=gridDim.x) {
+        for (int k=threadIdx.x; k < input.K; k+=blockDim.x) {
+            currSum = 0.0f;
+            for (int n=0; n < input.N; ++n) {
+                currSum += input.A[m * input.N + n] * input.B[n * input.K + k];
             }
+            input.C[m * input.K + k] = currSum;
         }
     }
 }
