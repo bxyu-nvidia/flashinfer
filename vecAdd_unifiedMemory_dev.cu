@@ -375,8 +375,7 @@ __global__ void matMulWithBlocks(const MatMulInput& input) {
         }
     }
 }
-
-__global__ void matMulWithNUnroll(const MatMulInput& input) {
+__global__ void matMulWithIndepAccum4(const MatMulInput& input) {
     float sum0;
     float sum1;
     float sum2;
@@ -387,11 +386,33 @@ __global__ void matMulWithNUnroll(const MatMulInput& input) {
             sum1 = 0.0f;
             sum2 = 0.0f;
             sum3 = 0.0f;
-            for (int n=0; n < input.N; n+=16) {
-                sum0 += input.A[m * input.N + n] * input.B[n * input.K + k] + input.A[m * input.N + n + 1] * input.B[(n + 1) * input.K + k] + input.A[m * input.N + n + 2] * input.B[(n + 2) * input.K + k] + input.A[m * input.N + n + 3] * input.B[(n + 3) * input.K + k];
-                sum1 += input.A[m * input.N + n + 4] * input.B[(n + 4) * input.K + k] + input.A[m * input.N + n + 5] * input.B[(n + 5) * input.K + k] + input.A[m * input.N + n + 6] * input.B[(n + 6) * input.K + k] + input.A[m * input.N + n + 7] * input.B[(n + 7) * input.K + k];
-                sum2 += input.A[m * input.N + n + 8] * input.B[(n + 8) * input.K + k] + input.A[m * input.N + n + 9] * input.B[(n + 9) * input.K + k] + input.A[m * input.N + n + 10] * input.B[(n + 10) * input.K + k] + input.A[m * input.N + n + 11] * input.B[(n + 11) * input.K + k];
-                sum3 += input.A[m * input.N + n + 12] * input.B[(n + 12) * input.K + k] + input.A[m * input.N + n + 13] * input.B[(n + 13) * input.K + k] + input.A[m * input.N + n + 14] * input.B[(n + 14) * input.K + k] + input.A[m * input.N + n + 15] * input.B[(n + 15) * input.K + k];
+            for (int n=0; n < input.N; n+=4) {
+                sum0 += input.A[m * input.N + n] * input.B[n * input.K + k];
+                sum1 += input.A[m * input.N + n + 1] * input.B[(n + 1) * input.K + k];
+                sum2 += input.A[m * input.N + n + 2] * input.B[(n + 2) * input.K + k];
+                sum3 += input.A[m * input.N + n + 3] * input.B[(n + 3) * input.K + k];
+            }
+            input.C[m * input.K + k] = (sum0 + sum1) + (sum2 + sum3);
+        }
+    }
+}
+
+__global__ void matMulWithFmaf(const MatMulInput& input) {
+    float sum0;
+    float sum1;
+    float sum2;
+    float sum3;
+    for (int m=blockIdx.x; m < input.M; m+=gridDim.x) {
+        for (int k=threadIdx.x; k < input.K; k+=blockDim.x) {
+            sum0 = 0.0f;
+            sum1 = 0.0f;
+            sum2 = 0.0f;
+            sum3 = 0.0f;
+            for (int n=0; n < input.N; n+=4) {
+                sum0 = fmaf(input.A[m * input.N + n], input.B[n * input.K + k], sum0);
+                sum1 = fmaf(input.A[m * input.N + n + 1], input.B[(n + 1) * input.K + k], sum1);
+                sum2 = fmaf(input.A[m * input.N + n + 2], input.B[(n + 2) * input.K + k], sum2);
+                sum3 = fmaf(input.A[m * input.N + n + 3], input.B[(n + 3) * input.K + k], sum3);
             }
             input.C[m * input.K + k] = (sum0 + sum1) + (sum2 + sum3);
         }
@@ -446,17 +467,30 @@ void matMulBenchmark(const int M, const int N, const int K) {
     assert(approximatelyEqual(comparisonResult, input.C, M * K) && "matMulWithBlocks results must match serialMatMul results");
 
     for (int i=0; i < 1<<2; ++i) {
-        matMulWithNUnroll<<<blocks, threads>>>(input);
+        matMulWithIndepAccum4<<<blocks, threads>>>(input);
     }
     cudaDeviceSynchronize();
-    nvtxRangePushA("matMulWithNUnroll");
+    nvtxRangePushA("matMulWithIndepAccum4");
     for (int i=0; i < 1<<3; ++i) {
-        matMulWithNUnroll<<<blocks, threads>>>(input);
+        matMulWithIndepAccum4<<<blocks, threads>>>(input);
     }
     cudaDeviceSynchronize();
     nvtxRangePop();
 
-    assert(approximatelyEqual(comparisonResult, input.C, M * K) && "matMulWithBlocks results must match serialMatMul results");
+    assert(approximatelyEqual(comparisonResult, input.C, M * K) && "matMulWithIndepAccum4 results must match serialMatMul results");
+
+    for (int i=0; i < 1<<2; ++i) {
+        matMulWithFmaf<<<blocks, threads>>>(input);
+    }
+    cudaDeviceSynchronize();
+    nvtxRangePushA("matMulWithFmaf");
+    for (int i=0; i < 1<<3; ++i) {
+        matMulWithFmaf<<<blocks, threads>>>(input);
+    }
+    cudaDeviceSynchronize();
+    nvtxRangePop();
+
+    assert(approximatelyEqual(comparisonResult, input.C, M * K) && "matMulWithFmaf results must match serialMatMul results");
 
     cudaProfilerStop();
 
