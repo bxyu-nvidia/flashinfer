@@ -12,5 +12,4 @@ ncu --version
 PATH="/opt/nvidia/nsight-systems/2026.3.2:$PATH" \
 nsys --version
 
-cd $1
 python -m pip install --no-build-isolation -e . -v
