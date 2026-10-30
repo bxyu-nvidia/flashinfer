@@ -269,6 +269,8 @@ struct MatMulInput {
     bool _ownsData;
 
     MatMulInput(const int M, const int N, const int K) : A(nullptr), B(nullptr), C(nullptr), M(M), N(N), K(K), _ownsData(true) {
+        validate(M, N, K);
+
         float* A = nullptr;
         float* B = nullptr;
 
@@ -291,7 +293,18 @@ struct MatMulInput {
         const int N,
         const int K
     ) : A(A), B(B), C(C), M(M), N(N), K(K), _ownsData(false)
-    {}
+    {
+        validate(M, N, K);
+    }
+
+    void validate(const int M, const int N, const int K) {
+        assert(
+            M > 0 && N > 0 && K > 0
+            && (M & (M - 1)) == 0 && (N & (N - 1)) == 0 && (K & (K - 1)) == 0
+            // && M >= 4096 && N >= 4096 && K >= 4096
+            && "M, N, and K must be a power of two"
+        );
+    }
 
     ~MatMulInput() {
         if (!this->_ownsData) {
@@ -319,14 +332,6 @@ void serialMatMul(MatMulInput input) {
     }
 }
 
-void validateMatMul(const int M, const int N, const int K) {
-    assert(
-        M > 0 && N > 0 && K > 0
-        && (M & (M - 1)) == 0 && (N & (N - 1)) == 0 && (K & (K - 1)) == 0
-        // && M >= 4096 && N >= 4096 && K >= 4096
-        && "M, N, and K must be a power of two"
-    );
-}
 
 // Within a single block
 __global__ void matMul(const float* A, const float* B, float* C, const int M, const int N, const int K) {
