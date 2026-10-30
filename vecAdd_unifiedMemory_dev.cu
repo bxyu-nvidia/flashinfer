@@ -511,14 +511,7 @@ void matMulBenchmark(const int M, const int N, const int K) {
 
     cudaProfilerStart();
 
-    for (int i=0; i < 1; ++i) {
-        serialMatMul(comparisonResultInput);
-    }
-    nvtxRangePushA("serialMatMul");
-    for (int i=0; i < 1<<1; ++i) {
-        serialMatMul(comparisonResultInput);
-    }
-    nvtxRangePop();
+    serialMatMul(comparisonResultInput);
 
     int blocks = 1;
     int threads = 256;
@@ -633,7 +626,7 @@ int main(int argc, char** argv)
     // vecSumReduceBenchmark(vectorLength);
 
     // Input batch: A[T, D1] x [D1, D2]
-    matMulBenchmark(16, 1024, 2048);
+    matMulBenchmark(32, 1024, 2048);
     // matMulBenchmark(16, 2048, 1024);
 
     return 0;
