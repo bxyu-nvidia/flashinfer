@@ -391,7 +391,7 @@ __global__ void matMulWithNUnroll(const MatMulInput& input) {
                 sum0 += input.A[m * input.N + n] * input.B[n * input.K + k] + input.A[m * input.N + n + 1] * input.B[(n + 1) * input.K + k] + input.A[m * input.N + n + 2] * input.B[(n + 2) * input.K + k] + input.A[m * input.N + n + 3] * input.B[(n + 3) * input.K + k];
                 sum1 += input.A[m * input.N + n + 4] * input.B[(n + 4) * input.K + k] + input.A[m * input.N + n + 5] * input.B[(n + 5) * input.K + k] + input.A[m * input.N + n + 6] * input.B[(n + 6) * input.K + k] + input.A[m * input.N + n + 7] * input.B[(n + 7) * input.K + k];
                 sum2 += input.A[m * input.N + n + 8] * input.B[(n + 8) * input.K + k] + input.A[m * input.N + n + 9] * input.B[(n + 9) * input.K + k] + input.A[m * input.N + n + 10] * input.B[(n + 10) * input.K + k] + input.A[m * input.N + n + 11] * input.B[(n + 11) * input.K + k];
-                sum2 += input.A[m * input.N + n + 12] * input.B[(n + 12) * input.K + k] + input.A[m * input.N + n + 13] * input.B[(n + 13) * input.K + k] + input.A[m * input.N + n + 14] * input.B[(n + 14) * input.K + k] + input.A[m * input.N + n + 15] * input.B[(n + 15) * input.K + k];
+                sum3 += input.A[m * input.N + n + 12] * input.B[(n + 12) * input.K + k] + input.A[m * input.N + n + 13] * input.B[(n + 13) * input.K + k] + input.A[m * input.N + n + 14] * input.B[(n + 14) * input.K + k] + input.A[m * input.N + n + 15] * input.B[(n + 15) * input.K + k];
             }
             input.C[m * input.K + k] = (sum0 + sum1) + (sum2 + sum3);
         }
