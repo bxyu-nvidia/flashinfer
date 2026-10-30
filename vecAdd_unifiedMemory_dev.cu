@@ -352,7 +352,7 @@ void serialMatMul(const MatMulInput& input) {
 // Access a1,1 ... a1,32 and b1,1 to write into c1,1 ... 
 __global__ void matMul(const MatMulInput& input) {
     // Init C to zeros
-    for(int i=0; i < input.M * input.K; ++i) {
+    for(int i=0; i < input.M * input.K; i+= blockDim.x) {
         input.C[i] = 0.0f;
     }
 
