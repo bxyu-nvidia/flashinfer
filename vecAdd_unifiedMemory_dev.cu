@@ -375,6 +375,7 @@ __global__ void matMulWithBlocks(const MatMulInput& input) {
         }
     }
 }
+
 __global__ void matMulWithIndepAccum4(const MatMulInput& input) {
     float sum0;
     float sum1;
