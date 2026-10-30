@@ -20,14 +20,19 @@ __global__ void vecAdd(float* A, float* B, float* C, int vectorLength)
     }
 }
 
-void initArray(float* A, int length)
-{
-     std::srand(std::time({}));
-    for(int i=0; i<length; i++)
-    {
+void initArray(float* A, int length) {
+    std::srand(std::time({}));
+    for(int i=0; i<length; i++) {
         A[i] = rand() / (float)RAND_MAX;
     }
 }
+
+void initArrayZeros(float* A, int length) {
+    for(int i=0; i<length; i++) {
+        A[i] = 0.0f;
+    }
+}
+
 
 void serialVecAdd(float* A, float* B, float* C,  int length)
 {
@@ -291,6 +296,7 @@ struct MatMulInput {
 
         initArray(A, this->M * this->N);
         initArray(B, this->N * this->K);
+        initArrayZeros(this->C, this->M * this->K);
 
         this->A = A;
         this->B = B;
@@ -335,7 +341,6 @@ struct MatMulInput {
 void serialMatMul(const MatMulInput& input) {
     for (int m=0; m < input.M; ++m) {
         for (int k=0; k < input.K; ++k) {
-            input.C[m * input.K + k] = 0.0f;
             for (int n=0; n < input.N; ++n) {
                 input.C[m * input.K + k] += input.A[m * input.N + n] * input.B[n * input.K + k];
             }
@@ -354,7 +359,6 @@ void serialMatMul(const MatMulInput& input) {
 __global__ void matMul(const MatMulInput& input) {
     for (int m=0; m < input.M; ++m) {
         for (int k=0; k < input.K; ++k) {
-            input.C[m * input.K + k] = 0.0f; // TODO @bxyu-nvidia: Maybe save one instruction here
             for (int n=threadIdx.x; n < input.N; n+=blockDim.x) {
                 input.C[m * input.K + k] += input.A[m * input.N + n] * input.B[n * input.K + k];
             }
@@ -366,6 +370,7 @@ void matMulBenchmark(const int M, const int N, const int K) {
     MatMulInput input = MatMulInput{M, N, K};
 
     float* comparisonResult = (float*)malloc(size_t(M) * K * sizeof(float));
+    initArrayZeros(comparisonResult, M * K);
     MatMulInput comparisonResultInput = MatMulInput{input.A, input.B, comparisonResult, M, N, K};
 
     cudaProfilerStart();
