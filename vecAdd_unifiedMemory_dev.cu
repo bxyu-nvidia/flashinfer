@@ -454,9 +454,7 @@ __global__ void matMulTiled(
         __syncthreads();
     }
 
-    if (m < M && k < K) {
-        C[size_t(m) * K + k] = sum;
-    }
+    C[size_t(m) * K + k] = sum;
 }
 
 void matMulBenchmark(const int M, const int N, const int K) {
