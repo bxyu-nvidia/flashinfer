@@ -346,32 +346,32 @@ void matMulBenchmark(const int M, const int N, const int K) {
     cudaProfilerStart();
 
     for (int i=0; i < 1<<7; ++i) {
-        serialVecSum(A, comparisonResult, vectorLength);
+        serialMatMul(comparisonResultInput);
     }
     nvtxRangePushA("serialVecSum");
     for (int i=0; i < 1<<10; ++i) {
-        serialVecSum(A, comparisonResult, vectorLength);
+        serialMatMul(comparisonResultInput);
     }
     nvtxRangePop();
 
-    const int blocks = 1;  // vecSum is within block right now
-    const int threads = 256;
-    const int sharedBytes = (threads / 32) * sizeof(float);
-    validateVecSum(vectorLength);
-    for (int i=0; i < 1<<7; ++i) {
-        vecSum<<<blocks, threads, sharedBytes>>>(A, C, vectorLength);
-    }
-    cudaDeviceSynchronize();
-    nvtxRangePushA("vecSum");
-    for (int i=0; i < 1<<10; ++i) {
-        vecSum<<<blocks, threads, sharedBytes>>>(A, C, vectorLength);
-    }
-    cudaDeviceSynchronize();
-    nvtxRangePop();
+    // const int blocks = 1;  // vecSum is within block right now
+    // const int threads = 256;
+    // const int sharedBytes = (threads / 32) * sizeof(float);
+    // validateVecSum(vectorLength);
+    // for (int i=0; i < 1<<7; ++i) {
+    //     vecSum<<<blocks, threads, sharedBytes>>>(A, C, vectorLength);
+    // }
+    // cudaDeviceSynchronize();
+    // nvtxRangePushA("vecSum");
+    // for (int i=0; i < 1<<10; ++i) {
+    //     vecSum<<<blocks, threads, sharedBytes>>>(A, C, vectorLength);
+    // }
+    // cudaDeviceSynchronize();
+    // nvtxRangePop();
 
     cudaProfilerStop();
 
-    assert(scalarApproximatelyEqual(comparisonResult, C) && "GPU results must match CPU results");
+    // assert(scalarApproximatelyEqual(comparisonResult, C) && "GPU results must match CPU results");
 
     // Clean Up
     free(comparisonResult);
