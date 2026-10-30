@@ -370,8 +370,8 @@ __global__ void matMulWithBlocks(const MatMulInput& input) {
         input.C[i] = 0.0f;
     }
 
-    for (int m=0; m < input.M; ++m) {
-        for (int n=blockIdx.x; n < input.N; n+=gridDim.x) {
+    for (int n=0; n < input.N; ++n) {
+        for (int m=blockIdx.x; m < input.M; m+=gridDim.x) {
             for (int k=threadIdx.x; k < input.K; k+=blockDim.x) {
                 input.C[m * input.K + k] += input.A[m * input.N + n] * input.B[n * input.K + k];
             }
