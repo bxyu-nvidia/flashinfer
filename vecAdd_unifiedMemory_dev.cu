@@ -344,8 +344,22 @@ void serialMatMul(const MatMulInput& input) {
 }
 
 
-// Within a single block
-__global__ void matMul(const float* A, const float* B, float* C, const int M, const int N, const int K) {
+// Naive implementation: Within a single block, each thread calculates one output block in the C matrix
+// For row-major layout, the memory looks like:
+// A: a1,1 a1,2 ... a1,N a2,1 ... a2,N ... aM,N
+// B: b1,1 b1,2 ... b1,K b2,1 ... b2,K ... bN,K
+// C: c1,1 = a1,1 * b1,1 + a1,2 * b2,1 + ... + a1,N * bN,1
+// For single warps of 32 threads:
+// Access a1,1 ... a1,32 and b1,1 to write into c1,1 ... 
+__global__ void matMul(const MatMulInput& input) {
+    for (int m=0; m < input.M; ++m) {
+        for (int k=0; k < input.K; ++k) {
+            input.C[m * input.K + k] = 0.0f; // TODO @bxyu-nvidia: Maybe save one instruction here
+            for (int n=threadIdx.x; n < input.N; n+=blockDim.x) {
+                input.C[m * input.K + k] += input.A[m * input.N + n] * input.B[n * input.K + k];
+            }
+        }
+    }
 }
 
 void matMulBenchmark(const int M, const int N, const int K) {
@@ -365,24 +379,22 @@ void matMulBenchmark(const int M, const int N, const int K) {
     }
     nvtxRangePop();
 
-    // const int blocks = 1;  // vecSum is within block right now
-    // const int threads = 256;
-    // const int sharedBytes = (threads / 32) * sizeof(float);
-    // validateVecSum(vectorLength);
-    // for (int i=0; i < 1<<7; ++i) {
-    //     vecSum<<<blocks, threads, sharedBytes>>>(A, C, vectorLength);
-    // }
-    // cudaDeviceSynchronize();
-    // nvtxRangePushA("vecSum");
-    // for (int i=0; i < 1<<10; ++i) {
-    //     vecSum<<<blocks, threads, sharedBytes>>>(A, C, vectorLength);
-    // }
-    // cudaDeviceSynchronize();
-    // nvtxRangePop();
+    const int blocks = 1;
+    const int threads = 256;
+    for (int i=0; i < 1<<2; ++i) {
+        matMul<<<blocks, threads>>>(input);
+    }
+    cudaDeviceSynchronize();
+    nvtxRangePushA("matMul");
+    for (int i=0; i < 1<<3; ++i) {
+        matMul<<<blocks, threads>>>(input);
+    }
+    cudaDeviceSynchronize();
+    nvtxRangePop();
 
     cudaProfilerStop();
 
-    // assert(scalarApproximatelyEqual(comparisonResult, C) && "GPU results must match CPU results");
+    assert(approximatelyEqual(comparisonResult, input.C, M * K) && "GPU results must match CPU results");
 
     // Clean Up
     free(comparisonResult);
