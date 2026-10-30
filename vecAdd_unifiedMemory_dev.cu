@@ -349,7 +349,7 @@ void serialMatMul(const MatMulInput& input) {
 // B: b1,1 b1,2 ... b1,K b2,1 ... b2,K ... bN,K
 // C: c1,1 = a1,1 * b1,1 + a1,2 * b2,1 + ... + a1,N * bN,1
 // For single warps of 32 threads:
-// Access a1,1 ... a1,32 and b1,1 to write into c1,1 ... 
+// Access a1,1 and b1,1 ... b1,32 to write into c1,1 ... c1,32
 __global__ void matMul(const MatMulInput& input) {
     // Init C to zeros
     for(int i=threadIdx.x; i < input.M * input.K; i+= blockDim.x) {
