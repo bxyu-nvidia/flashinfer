@@ -351,16 +351,14 @@ void serialMatMul(const MatMulInput& input) {
 // For single warps of 32 threads:
 // Access a1,1 and b1,1 ... b1,32 to write into c1,1 ... c1,32
 __global__ void matMul(const MatMulInput& input) {
-    // Init C to zeros
-    for(int i=threadIdx.x; i < input.M * input.K; i+= blockDim.x) {
-        input.C[i] = 0.0f;
-    }
-
+    float currSum;
     for (int m=0; m < input.M; ++m) {
-        for (int n=0; n < input.N; ++n) {
-            for (int k=threadIdx.x; k < input.K; k+=blockDim.x) {
-                input.C[m * input.K + k] += input.A[m * input.N + n] * input.B[n * input.K + k];
+        for (int k=threadIdx.x; k < input.K; k+=blockDim.x) {
+            currSum = 0.0f;
+            for (int n=0; n < input.N; ++n) {
+                currSum += input.A[m * input.N + n] * input.B[n * input.K + k];
             }
+            input.C[m * input.K + k] = currSum;
         }
     }
 }
