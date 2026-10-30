@@ -483,15 +483,8 @@ __global__ void matMulTiled(
 
     for (int base = 0; base < N; base += TILE) {
         // Each thread loads one element of each input tile.
-        tileA[ty][tx] =
-            (m < M && base + tx < N)
-                ? A[size_t(m) * N + base + tx]
-                : 0.0f;
-
-        tileB[ty][tx] =
-            (base + ty < N && k < K)
-                ? B[size_t(base + ty) * K + k]
-                : 0.0f;
+        tileA[ty][tx] = A[m * N + base + tx];
+        tileB[ty][tx] = B[(base + ty) * K + k];
 
         // All tile elements must be ready before using them.
         __syncthreads();
@@ -518,11 +511,11 @@ void matMulBenchmark(const int M, const int N, const int K) {
 
     cudaProfilerStart();
 
-    for (int i=0; i < 1<<2; ++i) {
+    for (int i=0; i < 1; ++i) {
         serialMatMul(comparisonResultInput);
     }
     nvtxRangePushA("serialMatMul");
-    for (int i=0; i < 1<<3; ++i) {
+    for (int i=0; i < 1<<1; ++i) {
         serialMatMul(comparisonResultInput);
     }
     nvtxRangePop();
@@ -584,10 +577,7 @@ void matMulBenchmark(const int M, const int N, const int K) {
     assert(approximatelyEqual(comparisonResult, input.C, M * K) && "matMulWithFmaf results must match serialMatMul results");
 
     dim3 threadsTiled(TILE, TILE);
-    dim3 blocksTiled(
-        (input.K + TILE - 1) / TILE,
-        (input.M + TILE - 1) / TILE
-    );
+    dim3 blocksTiled(input.K / TILE, input.M / TILE);
     for (int i=0; i < 1<<2; ++i) {
         matMulTiledReference<<<blocksTiled, threadsTiled>>>(
             input.A, input.B, input.C,
@@ -606,6 +596,25 @@ void matMulBenchmark(const int M, const int N, const int K) {
     nvtxRangePop();
 
     assert(approximatelyEqual(comparisonResult, input.C, M * K) && "matMulTiledReference results must match serialMatMul results");
+
+    for (int i=0; i < 1<<2; ++i) {
+        matMulTiled<<<blocksTiled, threadsTiled>>>(
+            input.A, input.B, input.C,
+            input.M, input.N, input.K
+        );
+    }
+    cudaDeviceSynchronize();
+    nvtxRangePushA("matMulTiled");
+    for (int i=0; i < 1<<3; ++i) {
+        matMulTiled<<<blocksTiled, threadsTiled>>>(
+            input.A, input.B, input.C,
+            input.M, input.N, input.K
+        );
+    }
+    cudaDeviceSynchronize();
+    nvtxRangePop();
+
+    assert(approximatelyEqual(comparisonResult, input.C, M * K) && "matMulTiled results must match serialMatMul results");
 
     cudaProfilerStop();
 
