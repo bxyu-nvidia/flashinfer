@@ -59,6 +59,17 @@ bool scalarApproximatelyEqual(const float* reference, const float* actual, const
     return true;
 }
 
+// TODO @bxyu-nvidia: Refactor the scalar and vector approximately equal functions to leverage this shared implementation
+bool approximatelyEqual(const float* reference, const float* actual, const int length, const float rtol=1e-5f, const float atol=1e-6f) {
+    for (int i=0; i < length; ++i) {
+        if(fabs(actual[i] - reference[i]) >= atol + rtol * fabs(reference[i])) {
+            printf("Mismatch at %d: actual %f != reference %f", i, actual[i], reference[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
 
 void vecAddBenchmark(int vectorLength)
 {
