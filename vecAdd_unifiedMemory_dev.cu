@@ -466,6 +466,50 @@ __global__ void matMulTiledReference(
     }
 }
 
+__global__ void matMulTiled(
+    const float* A, const float* B, float* C,
+    int M, int N, int K)
+{
+    __shared__ float tileA[TILE][TILE];
+    __shared__ float tileB[TILE][TILE];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const int m = blockIdx.y * TILE + ty;
+    const int k = blockIdx.x * TILE + tx;
+
+    float sum = 0.0f;
+
+    for (int base = 0; base < N; base += TILE) {
+        // Each thread loads one element of each input tile.
+        tileA[ty][tx] =
+            (m < M && base + tx < N)
+                ? A[size_t(m) * N + base + tx]
+                : 0.0f;
+
+        tileB[ty][tx] =
+            (base + ty < N && k < K)
+                ? B[size_t(base + ty) * K + k]
+                : 0.0f;
+
+        // All tile elements must be ready before using them.
+        __syncthreads();
+
+        #pragma unroll
+        for (int n = 0; n < TILE; ++n) {
+            sum = fmaf(tileA[ty][n], tileB[n][tx], sum);
+        }
+
+        // All threads must finish reading before tiles are overwritten.
+        __syncthreads();
+    }
+
+    if (m < M && k < K) {
+        C[size_t(m) * K + k] = sum;
+    }
+}
+
 void matMulBenchmark(const int M, const int N, const int K) {
     MatMulInput input = MatMulInput{M, N, K};
 
