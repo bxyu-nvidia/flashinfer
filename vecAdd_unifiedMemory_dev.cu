@@ -337,15 +337,11 @@ void serialMatMul(MatMulInput input) {
 __global__ void matMul(const float* A, const float* B, float* C, const int M, const int N, const int K) {
 }
 
-void vecSumReduceBenchmark(int vectorLength) {
-    float* A = nullptr;
-    float* C;
+void matMulBenchmark(const int M, const int N, const int K) {
+    MatMulInput input = MatMulInput{M, N, K};
+
     float* comparisonResult = (float*)malloc(sizeof(float));
-
-    cudaMallocManaged(&A, vectorLength*sizeof(float));
-    cudaMallocManaged(&C, sizeof(float));
-
-    initArray(A, vectorLength);
+    MatMulInput comparisonResultInput = MatMulInput{input.A, input.B, comparisonResult, M, N, K}
 
     cudaProfilerStart();
 
@@ -378,8 +374,6 @@ void vecSumReduceBenchmark(int vectorLength) {
     assert(scalarApproximatelyEqual(comparisonResult, C) && "GPU results must match CPU results");
 
     // Clean Up
-    cudaFree(A);
-    cudaFree(C);
     free(comparisonResult);
 }
 
