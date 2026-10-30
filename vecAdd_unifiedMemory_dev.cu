@@ -255,6 +255,129 @@ void vecSumReduceBenchmark(int vectorLength) {
 }
 
 
+struct MatMulInput {
+    // For matmuls below, we consider A[M, N] x B[N, K] = C[M, K]
+    // Matrices are held in row-major format i.e. A[m, n] = m * N + n
+    const float* A;
+    const float* B;
+    float* C;
+
+    const int M;
+    const int N;
+    const int K;
+
+    bool _ownsData;
+
+    MatMulInput(const int M, const int N, const int K) : A(nullptr), B(nullptr), C(nullptr), M(M), N(N), K(K), _ownsData(true) {
+        float* A = nullptr;
+        float* B = nullptr;
+
+        cudaMallocManaged(&A, size_t(this->M) * this->N * sizeof(float));
+        cudaMallocManaged(&B, size_t(this->N) * this->K * sizeof(float));
+        cudaMallocManaged(&this->C, size_t(this->M) * this->K * sizeof(float));
+
+        initArray(A, this->M * this->N);
+        initArray(B, this->N * this->K);
+
+        this->A = A;
+        this->B = B;
+    }
+
+    MatMulInput(
+        const float* A,
+        const float* B,
+        float* C,
+        const int M,
+        const int N,
+        const int K
+    ) : A(A), B(B), C(C), M(M), N(N), K(K), _ownsData(false)
+    {}
+
+    ~MatMulInput() {
+        if (!this->_ownsData) {
+            return;
+        }
+
+        cudaFree(const_cast<float*>(this->A));
+        cudaFree(const_cast<float*>(this->B));
+        cudaFree(this->C);
+    }
+
+    MatMulInput(const MatMulInput&) = delete;
+    MatMulInput& operator=(const MatMulInput&) = delete;
+};
+
+
+void serialMatMul(const float* A, const float* B, float* C, const int M, const int N, const int K) {
+    for (int m=0; m < M; ++m) {
+        for (int k=0; k < K; ++k) {
+            C[m * K + k] = 0.0f;
+            for (int n=0; n < N; ++n) {
+                C[m * K + k] += A[m * N + n] * B[n * K + k];
+            }
+        }
+    }
+}
+
+void validateMatMul(const int M, const int N, const int K) {
+    assert(
+        M > 0 && N > 0 && K > 0
+        && (M & (M - 1)) == 0 && (N & (N - 1)) == 0 && (K & (K - 1)) == 0
+        // && M >= 4096 && N >= 4096 && K >= 4096
+        && "M, N, and K must be a power of two"
+    );
+}
+
+// Within a single block
+__global__ void matMul(const float* A, const float* B, float* C, const int M, const int N, const int K) {
+}
+
+void vecSumReduceBenchmark(int vectorLength) {
+    float* A = nullptr;
+    float* C;
+    float* comparisonResult = (float*)malloc(sizeof(float));
+
+    cudaMallocManaged(&A, vectorLength*sizeof(float));
+    cudaMallocManaged(&C, sizeof(float));
+
+    initArray(A, vectorLength);
+
+    cudaProfilerStart();
+
+    for (int i=0; i < 1<<7; ++i) {
+        serialVecSum(A, comparisonResult, vectorLength);
+    }
+    nvtxRangePushA("serialVecSum");
+    for (int i=0; i < 1<<10; ++i) {
+        serialVecSum(A, comparisonResult, vectorLength);
+    }
+    nvtxRangePop();
+
+    const int blocks = 1;  // vecSum is within block right now
+    const int threads = 256;
+    const int sharedBytes = (threads / 32) * sizeof(float);
+    validateVecSum(vectorLength);
+    for (int i=0; i < 1<<7; ++i) {
+        vecSum<<<blocks, threads, sharedBytes>>>(A, C, vectorLength);
+    }
+    cudaDeviceSynchronize();
+    nvtxRangePushA("vecSum");
+    for (int i=0; i < 1<<10; ++i) {
+        vecSum<<<blocks, threads, sharedBytes>>>(A, C, vectorLength);
+    }
+    cudaDeviceSynchronize();
+    nvtxRangePop();
+
+    cudaProfilerStop();
+
+    assert(scalarApproximatelyEqual(comparisonResult, C) && "GPU results must match CPU results");
+
+    // Clean Up
+    cudaFree(A);
+    cudaFree(C);
+    free(comparisonResult);
+}
+
 int main(int argc, char** argv)
 {
     int vectorLength = 1024;
