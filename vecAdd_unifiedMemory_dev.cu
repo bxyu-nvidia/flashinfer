@@ -340,16 +340,16 @@ __global__ void matMul(const float* A, const float* B, float* C, const int M, co
 void matMulBenchmark(const int M, const int N, const int K) {
     MatMulInput input = MatMulInput{M, N, K};
 
-    float* comparisonResult = (float*)malloc(sizeof(float));
+    float* comparisonResult = (float*)malloc(size_t(M) * K * sizeof(float));
     MatMulInput comparisonResultInput = MatMulInput{input.A, input.B, comparisonResult, M, N, K};
 
     cudaProfilerStart();
 
-    for (int i=0; i < 1<<7; ++i) {
+    for (int i=0; i < 1<<2; ++i) {
         serialMatMul(comparisonResultInput);
     }
     nvtxRangePushA("serialMatMul");
-    for (int i=0; i < 1<<10; ++i) {
+    for (int i=0; i < 1<<3; ++i) {
         serialMatMul(comparisonResultInput);
     }
     nvtxRangePop();
@@ -388,8 +388,8 @@ int main(int argc, char** argv)
     // vecSumReduceBenchmark(vectorLength);
 
     // Input batch: A[T, D1] x [D1, D2]
-    matMulBenchmark(16384, 1024, 2048);
-    // matMulBenchmark(16384, 2048, 1024);
+    matMulBenchmark(16, 1024, 2048);
+    // matMulBenchmark(16, 2048, 1024);
 
     return 0;
 }
