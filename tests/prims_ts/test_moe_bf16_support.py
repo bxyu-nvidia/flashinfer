@@ -95,6 +95,31 @@ def test_config_mapper_loads_local_prims_ts_json():
     assert _expanded_trtllm_gen_json_configs()
 
 
+@pytest.mark.parametrize(
+    "weight_layout", [WeightLayout.MajorK, WeightLayout.BlockMajorK]
+)
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_default_relu2_tactic_falls_back_when_fc1_exceeds_smem(
+    weight_layout, enable_pdl
+):
+    """CUDA-graph warmup must survive the oversized 64-token FC1 schedule."""
+    kwargs = dict(
+        activation_type=ActivationType.Relu2,
+        num_tokens=1024,
+        top_k=8,
+        num_local_experts=64,
+        weight_layout=weight_layout,
+        enable_pdl=enable_pdl,
+    )
+    # Validate real schedules on the CPU, including their SMEM allocations.
+    with pytest.raises(ValueError, match="SMEM usage.*exceeds hardware capacity"):
+        map_trtllm_bf16_moe_tactic([64, 0], **kwargs)
+    pair = map_trtllm_bf16_moe_tactic(-1, **kwargs)
+    assert pair.tile_n == 128
+    assert pair.fc1.cfg.build().use_pdl == int(enable_pdl)
+    assert pair.fc2.cfg.build().use_pdl == int(enable_pdl)
+
+
 def test_config_mapper_json_uses_prims_ts_option_names():
     stale_keys = {
         "cluster_dim_z",

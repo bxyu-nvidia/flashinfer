@@ -1391,29 +1391,51 @@ def _make_default_json_moe_config_pair(
     )
     if not fc1_indices or not fc2_indices:
         return None
-    return _make_json_moe_config_pair(
-        tile_n=tile_n,
-        moe_config_index=0,
-        activation_type=activation_type,
-        dtype_a=dtype_a,
-        dtype_b=dtype_b,
-        fc1_dtype_c=fc1_dtype_c,
-        fc2_dtype_c=fc2_dtype_c,
-        dtype_label=dtype_label,
-        fc1_has_bias=fc1_has_bias,
-        fc2_has_bias=fc2_has_bias,
-        use_deepseek_fp8=use_deepseek_fp8,
-        fc1_use_per_token_sf_a=fc1_use_per_token_sf_a,
-        fc2_use_per_token_sf_a=fc2_use_per_token_sf_a,
-        fc1_use_per_token_sf_b=fc1_use_per_token_sf_b,
-        fc2_use_per_token_sf_b=fc2_use_per_token_sf_b,
-        per_token_sf_dtype=per_token_sf_dtype,
-        weight_layout=weight_layout,
-        has_gemm1_alpha=has_gemm1_alpha,
-        has_gemm1_beta=has_gemm1_beta,
-        has_gemm1_clamp_limit=has_gemm1_clamp_limit,
-        enable_pdl=enable_pdl,
-    )
+    # JSON matching alone does not establish that a schedule fits in SMEM.
+    # Preserve tactic indices and try each pair before moving to another tile.
+    last_error = None
+    for config_index in range(len(fc1_indices) * len(fc2_indices)):
+        try:
+            pair = _make_json_moe_config_pair(
+                tile_n=tile_n,
+                moe_config_index=config_index,
+                activation_type=activation_type,
+                dtype_a=dtype_a,
+                dtype_b=dtype_b,
+                fc1_dtype_c=fc1_dtype_c,
+                fc2_dtype_c=fc2_dtype_c,
+                dtype_label=dtype_label,
+                fc1_has_bias=fc1_has_bias,
+                fc2_has_bias=fc2_has_bias,
+                use_deepseek_fp8=use_deepseek_fp8,
+                fc1_use_per_token_sf_a=fc1_use_per_token_sf_a,
+                fc2_use_per_token_sf_a=fc2_use_per_token_sf_a,
+                fc1_use_per_token_sf_b=fc1_use_per_token_sf_b,
+                fc2_use_per_token_sf_b=fc2_use_per_token_sf_b,
+                per_token_sf_dtype=per_token_sf_dtype,
+                weight_layout=weight_layout,
+                has_gemm1_alpha=has_gemm1_alpha,
+                has_gemm1_beta=has_gemm1_beta,
+                has_gemm1_clamp_limit=has_gemm1_clamp_limit,
+                enable_pdl=enable_pdl,
+            )
+            if pair is None:
+                continue
+            _ensure_pair_buildable(
+                pair,
+                dtype_label=dtype_label,
+                num_tokens=num_tokens,
+                top_k=top_k,
+                num_experts=num_experts,
+            )
+        except ValueError as exc:
+            last_error = exc
+            continue
+        return pair
+    raise ValueError(
+        f"No buildable local Prims-TS MoE config for {dtype_label} tile_N={tile_n}: "
+        f"{last_error}"
+    ) from last_error
 
 
 def _required_json_moe_config_pair(
@@ -1428,20 +1450,25 @@ def _required_json_moe_config_pair(
     **kwargs,
 ) -> PrimsTsGemmPair:
     pair = None
+    last_error = None
     if moe_config_index == -1:
         for candidate_tile_n in fallback_tile_ns or _fallback_tile_ns_for_label(
             dtype_label, tile_n
         ):
-            pair = _make_default_json_moe_config_pair(
-                tile_n=candidate_tile_n,
-                dtype_label=dtype_label,
-                num_tokens=num_tokens,
-                top_k=top_k,
-                num_experts=num_experts,
-                **kwargs,
-            )
+            try:
+                pair = _make_default_json_moe_config_pair(
+                    tile_n=candidate_tile_n,
+                    dtype_label=dtype_label,
+                    num_tokens=num_tokens,
+                    top_k=top_k,
+                    num_experts=num_experts,
+                    **kwargs,
+                )
+            except ValueError as exc:
+                last_error = exc
+                continue
             if pair is not None:
-                break
+                return pair
     else:
         pair = _make_json_moe_config_pair(
             tile_n=tile_n,
@@ -1453,7 +1480,8 @@ def _required_json_moe_config_pair(
         raise ValueError(
             "No buildable local Prims-TS MoE config found for "
             f"{dtype_label} tile_N={tile_n}, config_index={moe_config_index}"
-        )
+            + (f": {last_error}" if last_error is not None else "")
+        ) from last_error
     _ensure_pair_buildable(
         pair,
         dtype_label=dtype_label,

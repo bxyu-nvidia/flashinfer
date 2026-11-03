@@ -19,6 +19,7 @@ import sys
 import pytest
 
 from flashinfer.prims_ts.moe import config_mapper
+from flashinfer.tllm_enums import ActivationType
 
 
 @pytest.fixture
@@ -32,8 +33,10 @@ def builder(monkeypatch):
     monkeypatch.setitem(sys.modules, module_name, module)
     monkeypatch.delenv("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", raising=False)
     config_mapper._validate_task_schedule_cached.cache_clear()
+    config_mapper._bf16_config_pair_cached.cache_clear()
     yield build
     config_mapper._validate_task_schedule_cached.cache_clear()
+    config_mapper._bf16_config_pair_cached.cache_clear()
 
 
 def validate(kwargs=None, **dimensions):
@@ -103,3 +106,67 @@ def test_cache_evicts_old_successes(builder):
     assert cache.cache_info().currsize == capacity
     validate(num_tokens=1)
     assert builder.call_count == capacity + 2
+
+
+def test_default_tactic_skips_unbuildable_tile(builder):
+    def build(**kwargs):
+        if kwargs["tile_n"] == 64:
+            raise ValueError("SMEM usage exceeds hardware capacity")
+        return SimpleNamespace()
+
+    builder.side_effect = build
+    pair = config_mapper.map_trtllm_bf16_moe_tactic(
+        -1,
+        num_tokens=1024,
+        top_k=8,
+        num_local_experts=64,
+        activation_type=ActivationType.Relu2,
+    )
+    assert pair.tile_n == 128
+    assert {call.kwargs["tile_n"] for call in builder.call_args_list} == {64, 128}
+
+
+def test_default_tactic_tries_other_configs_at_same_tile(builder):
+    def build(**kwargs):
+        if kwargs["num_stages_a"] == 6:
+            raise ValueError("SMEM usage exceeds hardware capacity")
+        return SimpleNamespace()
+
+    builder.side_effect = build
+    pair = config_mapper.map_trtllm_bf16_moe_tactic(
+        -1,
+        num_tokens=1,
+        top_k=8,
+        num_local_experts=64,
+        activation_type=ActivationType.Relu2,
+    )
+    assert pair.tile_n == 8
+    assert pair.moe_config_index > 0
+    assert pair.fc1.cfg.kwargs["num_stages_a"] == 5
+    assert pair.fc2.cfg.kwargs["num_stages_a"] == 5
+
+
+def test_explicit_tactic_is_rejected_without_fallback(builder):
+    builder.side_effect = ValueError("SMEM usage exceeds hardware capacity")
+    with pytest.raises(ValueError, match="SMEM usage exceeds hardware capacity"):
+        config_mapper.map_trtllm_bf16_moe_tactic(
+            [64, 0], activation_type=ActivationType.Relu2
+        )
+    assert builder.call_count == 1
+
+
+def test_default_tactic_reports_exhausted_candidates(builder):
+    builder.side_effect = ValueError("SMEM usage exceeds hardware capacity")
+    with pytest.raises(ValueError, match="No buildable.*SMEM usage"):
+        config_mapper.map_trtllm_bf16_moe_tactic(
+            -1, activation_type=ActivationType.Relu2
+        )
+
+
+def test_default_tactic_does_not_swallow_unexpected_errors(builder):
+    builder.side_effect = RuntimeError("runtime unavailable")
+    with pytest.raises(RuntimeError, match="runtime unavailable"):
+        config_mapper.map_trtllm_bf16_moe_tactic(
+            -1, activation_type=ActivationType.Relu2
+        )
+    assert builder.call_count == 1
