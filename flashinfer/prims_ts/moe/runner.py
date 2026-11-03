@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import sys
 from functools import lru_cache
 from typing import Any, List, Optional
 
@@ -920,6 +921,33 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             fc2_fn = get_compiled_gemm(fc2_hash, "fc2", fc2_io, stream)
 
         with torch.cuda.nvtx.range("prims_ts/fc2_launch"):
+            if os.environ.get("FLASHINFER_DEBUG_FC2") == "1":
+                # Flush metadata before entering native code, which may abort
+                # during TMA encoding. Never read tensor contents here.
+                prefix = f"[FC2 pid={os.getpid()} device={hidden_states.device}]"
+
+                def emit(message: str) -> None:
+                    print(f"{prefix} {message}", file=sys.stderr, flush=True)
+
+                emit(f"config={fc2_io['cfg']}")
+                emit(f"M={fc2_io['M']} N={fc2_io['N']} K={fc2_io['K']} L={fc2_io['L']}")
+                for name, tensor in (
+                    ("gemm1_output", gemm1_output),
+                    ("gemm2_weights", kwargs["gemm2_weights"]),
+                    ("gemm2_output", gemm2_output),
+                ):
+                    ptr = tensor.data_ptr()
+                    byte_strides = tuple(
+                        stride * tensor.element_size() for stride in tensor.stride()
+                    )
+                    emit(
+                        f"{name}: shape={tuple(tensor.shape)} "
+                        f"stride_elements={tensor.stride()} "
+                        f"stride_bytes={byte_strides} dtype={tensor.dtype} "
+                        f"ptr={ptr:#x} ptr_mod_16={ptr % 16} "
+                        f"ptr_mod_128={ptr % 128} "
+                        f"storage_offset={tensor.storage_offset()}"
+                    )
             fc2_fn(*self._launch_args(fc2_io, stream))
 
         if kwargs["do_finalize"]:
