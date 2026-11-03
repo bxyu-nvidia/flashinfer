@@ -143,6 +143,34 @@ class TestBf16Fc1TmaRoute:
     def test_tma_route_swap(self):
         self._run(swap_ab=True)
 
+    @pytest.mark.parametrize("swap_ab", [False, True])
+    @pytest.mark.timeout(120)
+    def test_tma_route_nonpersistent_early_exit(self, swap_ab):
+        """Compile runtime early exit and check results with excess inactive CTAs."""
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
+
+        # One routed token uses at most one tile, but launch eight token CTAs.
+        # This exercises both axes of the runtime guard with the PyIR compiler.
+        assert reference_check(
+            num_experts=2,
+            num_tokens=1,
+            top_k=1,
+            problem_n=256,
+            problem_k=128,
+            tile_n=16,
+            tile_k=128,
+            mma_n=16,
+            epi_tile_n=16,
+            early_exit_max_token_ctas=8,
+            **uniform_pipeline_stage_overrides(4),
+            **{
+                **self.TMA_CFG,
+                "batch_mode": int(BatchMode.BATCH_N if swap_ab else BatchMode.BATCH_M),
+                "transpose_mma_output": int(swap_ab),
+                "use_early_exit": 1,
+            },
+        )
+
     def test_tma_route_swiglu_noswap(self):
         self._run(swap_ab=False, act_kind=1)
 
