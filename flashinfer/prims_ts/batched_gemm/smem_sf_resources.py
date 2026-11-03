@@ -1073,7 +1073,9 @@ class SmemSfLdgstsResource(MemoryResource):
             routed_row = Int32(0)
             if is_valid:
                 routed_row = self.routed_rows[li]
-            gmem_offset = routed_row * self.sf_gmem_stride + k_sf_offset + col_in_tile
+            gmem_offset = (
+                Int64(routed_row) * self.sf_gmem_stride + k_sf_offset + col_in_tile
+            )
             gmem_src = self.sf_gmem_ptr.data_ptr() + gmem_offset
 
             if cutlass.const_expr(use_r128c4):
