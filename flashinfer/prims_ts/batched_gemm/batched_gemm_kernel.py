@@ -1364,6 +1364,7 @@ def _batched_gemm_kernel_bf16_body(
     tma_c_desc: cutlass.GridConstant[cuda.TensorMap],
     tma_sfa_desc: cutlass.GridConstant[cuda.TensorMap],
     tma_sfb_desc: cutlass.GridConstant[cuda.TensorMap],
+    tma_local_weight_desc: cutlass.GridConstant[cuda.TensorMap],
     c_tensor: cute.Tensor,
     sf_c_tensor: cute.Tensor,
     bias_tensor: cute.Tensor,
@@ -1425,6 +1426,10 @@ def _batched_gemm_kernel_bf16_body(
         prims.prefetch_tensormap(tma_sfa_desc.get_ptr())
         prims.prefetch_tensormap(tma_sfb_desc.get_ptr())
     prims.prefetch_tensormap(tma_c_ptr)
+    tma_local_weight_ptr = None
+    if cutlass.const_expr(cfg.local_expert_count > 0):
+        tma_local_weight_ptr = tma_local_weight_desc.get_ptr()
+        prims.prefetch_tensormap(tma_local_weight_ptr)
 
     # tile_idx_tensor: maps token tiles to expert indices.
     # mn_limit_tensor: maps token tiles to TRT-LLM Gen absolute end-row limits.
@@ -1460,6 +1465,7 @@ def _batched_gemm_kernel_bf16_body(
         smem_a = SmemAResource(
             cfg=cfg,
             tma_a_desc=tma_a_ptr,
+            tma_local_weight_desc=tma_local_weight_ptr,
             pipeline_config=pcfgs["smem_a"],
             name="SmemA",
         )
@@ -1491,6 +1497,7 @@ def _batched_gemm_kernel_bf16_body(
         smem_b = SmemBResource(
             cfg=cfg,
             tma_b_desc=tma_b_ptr,
+            tma_local_weight_desc=tma_local_weight_ptr,
             pipeline_config=pcfgs["smem_b"],
             name="SmemB",
         )
@@ -1500,6 +1507,7 @@ def _batched_gemm_kernel_bf16_body(
         smem_a = SmemAResource(
             cfg=cfg,
             tma_a_desc=tma_a_ptr,
+            tma_local_weight_desc=tma_local_weight_ptr,
             pipeline_config=pcfgs["smem_a"],
             name="SmemA",
         )
@@ -1527,6 +1535,7 @@ def _batched_gemm_kernel_bf16_body(
         smem_b = SmemBResource(
             cfg=cfg,
             tma_b_desc=tma_b_ptr,
+            tma_local_weight_desc=tma_local_weight_ptr,
             pipeline_config=pcfgs["smem_b"],
             name="SmemB",
         )
@@ -1534,12 +1543,14 @@ def _batched_gemm_kernel_bf16_body(
         smem_a = SmemAResource(
             cfg=cfg,
             tma_a_desc=tma_a_ptr,
+            tma_local_weight_desc=tma_local_weight_ptr,
             pipeline_config=pcfgs["smem_a"],
             name="SmemA",
         )
         smem_b = SmemBResource(
             cfg=cfg,
             tma_b_desc=tma_b_ptr,
+            tma_local_weight_desc=tma_local_weight_ptr,
             pipeline_config=pcfgs["smem_b"],
             name="SmemB",
         )
@@ -2387,6 +2398,7 @@ def batched_gemm_kernel_bf16(
     tma_c_desc: cutlass.GridConstant[cuda.TensorMap],
     tma_sfa_desc: cutlass.GridConstant[cuda.TensorMap],
     tma_sfb_desc: cutlass.GridConstant[cuda.TensorMap],
+    tma_local_weight_desc: cutlass.GridConstant[cuda.TensorMap],
     c_tensor: cute.Tensor,
     sf_c_tensor: cute.Tensor,
     bias_tensor: cute.Tensor,
@@ -2436,6 +2448,7 @@ def batched_gemm_kernel_bf16(
                 tma_c_desc,
                 tma_sfa_desc,
                 tma_sfb_desc,
+                tma_local_weight_desc,
                 c_tensor,
                 sf_c_tensor,
                 bias_tensor,
@@ -2470,6 +2483,7 @@ def batched_gemm_kernel_bf16(
             tma_c_desc,
             tma_sfa_desc,
             tma_sfb_desc,
+            tma_local_weight_desc,
             c_tensor,
             sf_c_tensor,
             bias_tensor,
@@ -2526,6 +2540,7 @@ def gemm(
     gemm1_alpha_raw_ptr,
     gemm1_beta_raw_ptr,
     gemm1_clamp_limit_raw_ptr,
+    local_weight_raw_ptr,
     problem_size: tuple,
     early_exit_max_token_ctas: cutlass.Int32,
     cfg: cutlass.Constexpr[BatchedGemmConfig],
@@ -2558,7 +2573,7 @@ def gemm(
                 1,
                 a_block_k,
                 cute.assume(m * a_block_k, 32),
-                cute.assume(m * k, 32),
+                cute.assume(cutlass.Int64(m) * k, 32),
             ),
         )
         a_tensor = cute.make_tensor(a_ptr, a_layout)
@@ -2570,7 +2585,7 @@ def gemm(
     elif cutlass.const_expr(cfg.use_bf16_kbox_tma_a):
         a_layout = cute.make_layout(
             (64, m, cute.assume(k // 64, 1), num_experts_dim),
-            stride=(1, cute.assume(k, 32), 64, cute.assume(m * k, 32)),
+            stride=(1, cute.assume(k, 32), 64, cute.assume(cutlass.Int64(m) * k, 32)),
         )
         a_tensor = cute.make_tensor(a_ptr, a_layout)
     elif cutlass.const_expr(cfg.use_tma_oob_opt_a):
@@ -2582,7 +2597,7 @@ def gemm(
     else:
         a_layout = cute.make_layout(
             (cute.assume(k, 32), m, num_experts_dim),
-            stride=(1, cute.assume(k, 32), cute.assume(m * k, 32)),
+            stride=(1, cute.assume(k, 32), cute.assume(cutlass.Int64(m) * k, 32)),
         )
         a_tensor = cute.make_tensor(a_ptr, a_layout)
 
@@ -2594,7 +2609,7 @@ def gemm(
                 1,
                 b_block_k,
                 cute.assume(n * b_block_k, 32),
-                cute.assume(n * k, 32),
+                cute.assume(cutlass.Int64(n) * k, 32),
             ),
         )
     elif cutlass.const_expr(cfg.has_tma_route and cfg.is_swap_ab):
@@ -2609,7 +2624,7 @@ def gemm(
     else:
         b_layout = cute.make_layout(
             (cute.assume(k, 32), n, num_experts_dim),
-            stride=(1, cute.assume(k, 32), cute.assume(n * k, 32)),
+            stride=(1, cute.assume(k, 32), cute.assume(cutlass.Int64(n) * k, 32)),
         )
     b_tensor = cute.make_tensor(b_ptr, b_layout)
 
@@ -2741,6 +2756,38 @@ def gemm(
                 swizzle=tma_swizzle,
                 tma_format=tma_format_b,
             )
+
+    tma_local_weight_desc = None
+    if cutlass.const_expr(cfg.local_expert_count > 0):
+        local_rows = m if cutlass.const_expr(cfg.is_swap_ab) else n
+        local_block_k = cfg.block_major_k_elems
+        local_weight = cute.make_tensor(
+            local_weight_raw_ptr,
+            cute.make_layout(
+                (local_block_k, local_rows, k // local_block_k, cfg.local_expert_count),
+                stride=(
+                    1,
+                    local_block_k,
+                    local_rows * local_block_k,
+                    cutlass.Int64(local_rows) * k,
+                ),
+            ),
+        )
+        local_box_rows = (
+            cfg.tile_m if cutlass.const_expr(cfg.is_swap_ab) else b_box_rows
+        )
+        tma_local_weight_desc = cuda.create_tensor_map_tiled_from_tensor(
+            tensor=local_weight,
+            box_dims=(
+                cfg.block_major_k_tile_block_elems,
+                local_box_rows,
+                cfg.block_major_k_tile_slices,
+                1,
+            ),
+            stride_order=(0, 1, 2, 3),
+            swizzle=tma_swizzle,
+            tma_format=TensorMapDataFormat.DEFAULT,
+        )
 
     # SF TMA descriptors (only for FP4/FP8/CastA with scale factors).
     # E8M0 scale factors are packed 2 per uint16 for TMA transport.
@@ -3292,6 +3339,7 @@ def gemm(
         tma_c_desc,
         tma_sfa_desc,
         tma_sfb_desc,
+        tma_local_weight_desc,
         c_tensor,
         sf_c_tensor,
         bias_tensor,

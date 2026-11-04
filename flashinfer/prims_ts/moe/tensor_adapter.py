@@ -342,6 +342,8 @@ def build_bf16_launch_io(
     hidden_states: torch.Tensor,
     gemm1_weights: torch.Tensor,
     gemm2_weights: torch.Tensor,
+    resident_weights: torch.Tensor | None = None,
+    resident_expert_offset: int = 0,
     gemm1_bias: torch.Tensor | None = None,
     gemm2_bias: torch.Tensor | None = None,
     gemm1_alpha: torch.Tensor | None = None,
@@ -384,6 +386,14 @@ def build_bf16_launch_io(
         output_buf = gemm2_output
 
     cfg = _runtime_config(cfg, in_hidden)
+    if resident_weights is not None:
+        from dataclasses import replace
+
+        cfg = replace(
+            cfg,
+            local_expert_start=int(resident_expert_offset),
+            local_expert_count=int(resident_weights.shape[0]),
+        )
     _validate_weight_storage(
         name="gemm1_weights" if fc == "fc1" else "gemm2_weights",
         tensor=weights,
@@ -569,7 +579,16 @@ def build_bf16_launch_io(
         assumed_align=16,
     )
 
+    local_weight_dp = b_dp
+    if resident_weights is not None:
+        local_weight_dp = make_ptr(
+            cutlass.BFloat16,
+            resident_weights.data_ptr(),
+            cutlass.AddressSpace.gmem,
+            assumed_align=16,
+        )
     _keepalive = [
+        resident_weights,
         kernel_a,
         kernel_b,
         output_buf,
@@ -598,6 +617,7 @@ def build_bf16_launch_io(
         "in_hidden": in_hidden,
         "logical_output_m": logical_output_m,
         "shape": (m_val, n_val, k_val, l_val, num_tokens),
+        "local_weight_dp": local_weight_dp,
         "a_dp": a_dp,
         "b_dp": b_dp,
         "sfa_dp": a_dp,

@@ -107,6 +107,74 @@ def test_config_mapper_json_uses_prims_ts_option_names():
         assert all(key == key.lower() for key in cfg.options)
 
 
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"num_tokens": 33},
+        {"top_k": 2},
+        {"num_local_experts": 9},
+        {"activation_type": int(ActivationType.Relu2)},
+        {"weight_layout": int(WeightLayout.BlockMajorK)},
+        {"debug_checks": "1"},
+    ],
+)
+def test_config_mapper_reuses_validation_only_for_the_same_configuration(
+    monkeypatch, changed
+):
+    from flashinfer.prims_ts.moe import config_mapper
+    from flashinfer.prims_ts.batched_gemm import batched_gemm_kernel
+
+    cache = config_mapper._validate_task_manager_buildable
+    cache.cache_clear()
+    calls = []
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "0")
+    monkeypatch.setattr(
+        batched_gemm_kernel,
+        "build_batched_gemm_task_manager",
+        lambda **kwargs: calls.append(kwargs),
+    )
+    options = dict(num_tokens=31, top_k=3, num_local_experts=7)
+    try:
+        map_trtllm_bf16_moe_tactic([8, 0], **options)
+        validated = len(calls)
+        assert validated > 0
+        map_trtllm_bf16_moe_tactic([8, 0], **options)
+        assert len(calls) == validated
+        changed = dict(changed)
+        if debug_checks := changed.pop("debug_checks", None):
+            monkeypatch.setenv("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", debug_checks)
+        map_trtllm_bf16_moe_tactic([8, 0], **(options | changed))
+        assert len(calls) > validated
+    finally:
+        cache.cache_clear()
+
+
+def test_config_mapper_retries_failed_validation(monkeypatch):
+    from flashinfer.prims_ts.moe import config_mapper
+    from flashinfer.prims_ts.batched_gemm import batched_gemm_kernel
+
+    cache = config_mapper._validate_task_manager_buildable
+    cache.cache_clear()
+    calls = []
+
+    def fail_validation(**kwargs):
+        calls.append(kwargs)
+        raise ValueError("invalid schedule")
+
+    monkeypatch.setattr(
+        batched_gemm_kernel, "build_batched_gemm_task_manager", fail_validation
+    )
+    try:
+        for _ in range(2):
+            with pytest.raises(ValueError, match="invalid schedule"):
+                map_trtllm_bf16_moe_tactic(
+                    [8, 0], num_tokens=31, top_k=3, num_local_experts=7
+                )
+        assert len(calls) == 2
+    finally:
+        cache.cache_clear()
+
+
 def test_config_mapper_uses_local_json_for_bf16_tactic():
     num_configs = len(_expanded_prims_ts_json_configs())
     pair = _first_buildable_pair(

@@ -86,6 +86,9 @@ def prims_ts_bf16_moe_op(
     gemm1_beta: Optional[torch.Tensor] = None,
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    resident_gemm1_weights: Optional[torch.Tensor] = None,
+    resident_gemm2_weights: Optional[torch.Tensor] = None,
+    resident_expert_offset: int = 0,
 ) -> List[torch.Tensor]:
     assert routing_logits is not None or topk_ids is not None, (
         "either routing_logits or topk_ids must be provided"
@@ -145,6 +148,31 @@ def prims_ts_bf16_moe_op(
         )
     )
 
+    resident_count = 0
+    if (resident_gemm1_weights is None) != (resident_gemm2_weights is None):
+        raise ValueError("Both resident expert projections must be supplied")
+    if resident_gemm1_weights is not None:
+        if int(weight_layout) != int(WeightLayout.BlockMajorK):
+            raise ValueError("Resident expert weights require BlockMajorK storage")
+        resident_count = resident_gemm1_weights.shape[0]
+        if (
+            resident_expert_offset < 0
+            or resident_count <= 0
+            or resident_expert_offset + resident_count > local_num_experts
+        ):
+            raise ValueError("Resident expert range is outside the execution weights")
+        for resident, full in (
+            (resident_gemm1_weights, gemm1_weights),
+            (resident_gemm2_weights, gemm2_weights),
+        ):
+            if (
+                resident.dtype != full.dtype
+                or resident.device != full.device
+                or not resident.is_contiguous()
+                or tuple(resident.shape) != (resident_count, *full.shape[1:])
+            ):
+                raise ValueError("Resident weights must match the packed expert layout")
+
     moe_op = _get_moe_op()
     moe_runner = PrimsTsBf16MoERunner(
         moe_op,
@@ -176,6 +204,10 @@ def prims_ts_bf16_moe_op(
     )
 
     common_kwargs = dict(
+        resident_gemm1_weights=resident_gemm1_weights,
+        resident_gemm2_weights=resident_gemm2_weights,
+        resident_expert_offset=resident_expert_offset,
+        resident_expert_count=resident_count,
         routing_bias=routing_bias,
         gemm1_weights=gemm1_weights,
         gemm2_weights=gemm2_weights,
@@ -263,8 +295,14 @@ def _fake_prims_ts_bf16_moe(
     gemm1_beta: Optional[torch.Tensor] = None,
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    resident_gemm1_weights: Optional[torch.Tensor] = None,
+    resident_gemm2_weights: Optional[torch.Tensor] = None,
+    resident_expert_offset: int = 0,
 ) -> List[torch.Tensor]:
     del (
+        resident_gemm1_weights,
+        resident_gemm2_weights,
+        resident_expert_offset,
         routing_bias,
         topk_ids,
         expert_weights,
@@ -329,6 +367,9 @@ def prims_ts_bf16_moe(
     gemm1_beta: Optional[torch.Tensor] = None,
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    resident_gemm1_weights: Optional[torch.Tensor] = None,
+    resident_gemm2_weights: Optional[torch.Tensor] = None,
+    resident_expert_offset: int = 0,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     r"""BF16 MoE using the Prims-TS batched GEMM backend on SM100.
 
@@ -388,6 +429,11 @@ def prims_ts_bf16_moe(
         Optional per-expert clamp limit.
     output : Optional[torch.Tensor]
         Optional in-place ``[seq_len, hidden_size]`` output.
+    resident_gemm1_weights, resident_gemm2_weights : Optional[torch.Tensor]
+        Packed resident expert shards. When supplied, their expert range is read
+        directly; the corresponding full-weight buffer regions are not accessed.
+    resident_expert_offset : int
+        Start of the resident shard relative to the execution weight tensors.
 
     Returns
     -------
@@ -425,6 +471,9 @@ def prims_ts_bf16_moe(
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
         output=output,
+        resident_gemm1_weights=resident_gemm1_weights,
+        resident_gemm2_weights=resident_gemm2_weights,
+        resident_expert_offset=resident_expert_offset,
     )
     return result[0] if do_finalize and len(result) == 1 else result
 
@@ -456,6 +505,9 @@ def prims_ts_bf16_routed_moe(
     gemm1_beta: Optional[torch.Tensor] = None,
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    resident_gemm1_weights: Optional[torch.Tensor] = None,
+    resident_gemm2_weights: Optional[torch.Tensor] = None,
+    resident_expert_offset: int = 0,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     r"""BF16 Prims-TS MoE with precomputed packed or unpacked routing.
 
@@ -515,6 +567,11 @@ def prims_ts_bf16_routed_moe(
         Optional per-expert clamp limit.
     output : Optional[torch.Tensor]
         Optional in-place ``[seq_len, hidden_size]`` output.
+    resident_gemm1_weights, resident_gemm2_weights : Optional[torch.Tensor]
+        Packed resident expert shards. When supplied, their expert range is read
+        directly; the corresponding full-weight buffer regions are not accessed.
+    resident_expert_offset : int
+        Start of the resident shard relative to the execution weight tensors.
 
     Returns
     -------
@@ -559,5 +616,8 @@ def prims_ts_bf16_routed_moe(
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
         output=output,
+        resident_gemm1_weights=resident_gemm1_weights,
+        resident_gemm2_weights=resident_gemm2_weights,
+        resident_expert_offset=resident_expert_offset,
     )
     return result[0] if do_finalize and gemm1_lora_delta is None else result

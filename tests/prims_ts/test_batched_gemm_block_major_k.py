@@ -183,3 +183,49 @@ def test_fp8_swap_uses_block_major_k_weight_a():
         use_global_scales=1,
         use_unroll_loop_2x_for_mma=0,
     )
+
+
+@_requires_non_sm107_prims_ts
+def test_bf16_resident_weights_bypass_nan_staging_regions():
+    """Both GEMMs must select resident tensors and remap their expert offset."""
+    from flashinfer.fused_moe import prims_ts_bf16_routed_moe
+    from flashinfer.tllm_enums import ActivationType
+
+    torch.manual_seed(42)
+    weights = [
+        torch.randn(8, k // 64, n, 64, dtype=torch.bfloat16, device="cuda") * 0.01
+        for n, k in [(256, 128), (128, 256)]
+    ]
+    x = torch.randn(127, 128, dtype=torch.bfloat16, device="cuda")
+    ids = (torch.arange(254, device="cuda").view(127, 2) % 8).int()
+    scores = torch.full((127, 2), 0.5, dtype=torch.bfloat16, device="cuda")
+
+    def launch(weights, **kwargs):
+        return prims_ts_bf16_routed_moe(
+            (ids, scores),
+            x,
+            *weights,
+            num_experts=8,
+            top_k=2,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=256,
+            local_expert_offset=0,
+            local_num_experts=8,
+            weight_layout=WeightLayout.BlockMajorK,
+            activation_type=ActivationType.Relu2,
+            **kwargs,
+        )
+
+    expected = launch(weights)
+    resident = [weight[3:6].clone() for weight in weights]
+    staged = [weight.clone() for weight in weights]
+    for weight in staged:
+        weight[3:6].fill_(float("nan"))
+    actual = launch(
+        staged,
+        resident_gemm1_weights=resident[0],
+        resident_gemm2_weights=resident[1],
+        resident_expert_offset=3,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

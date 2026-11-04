@@ -19,6 +19,7 @@ Map Prims-TS MoE autotuner tactics to local Prims-TS GEMM configs.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from enum import IntEnum
 from functools import lru_cache
@@ -1192,6 +1193,29 @@ def _task_manager_smem_bytes(manager: object) -> int | None:
     )
 
 
+@lru_cache(maxsize=1024)
+def _validate_task_manager_buildable(
+    config_items: tuple[tuple[str, int], ...],
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+    debug_checks: str,
+) -> None:
+    """Cache successful validation without retaining TaskManagers or MLIR state."""
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
+        build_batched_gemm_task_manager,
+    )
+
+    manager = build_batched_gemm_task_manager(
+        num_experts=num_experts,
+        num_tokens=num_tokens,
+        top_k=top_k,
+        verbose=False,
+        **dict(config_items),
+    )
+    _task_manager_smem_bytes(manager)
+
+
 def _ensure_config_task_manager_buildable(
     spec: PrimsTsConfigSpec,
     *,
@@ -1203,20 +1227,14 @@ def _ensure_config_task_manager_buildable(
     top_k: int | None = None,
     num_experts: int | None = None,
 ) -> None:
-    from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
-        build_batched_gemm_task_manager,
-    )
-
     validation_top_k = max(1, int(top_k or 1))
-    validation_num_experts = max(validation_top_k, int(num_experts or 2))
-    manager = build_batched_gemm_task_manager(
-        num_experts=validation_num_experts,
-        num_tokens=max(1, int(num_tokens or 128)),
-        top_k=validation_top_k,
-        verbose=False,
-        **spec.kwargs,
+    _validate_task_manager_buildable(
+        tuple(sorted(spec.kwargs.items())),
+        max(1, int(num_tokens or 128)),
+        validation_top_k,
+        max(validation_top_k, int(num_experts or 2)),
+        os.environ.get("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "0"),
     )
-    _task_manager_smem_bytes(manager)
 
 
 def _ensure_pair_buildable(

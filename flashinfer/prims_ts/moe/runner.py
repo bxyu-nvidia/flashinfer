@@ -423,6 +423,8 @@ class _PrimsTsMoERunnerMixin:
         )
         self._cache_key_static_extras = (
             ("enable_pdl", bool(kwargs.get("enable_pdl", False))),
+            ("resident_expert_offset", int(kwargs.get("resident_expert_offset", 0))),
+            ("resident_expert_count", int(kwargs.get("resident_expert_count", 0))),
             ("gemm1_bias", kwargs.get("gemm1_bias") is not None),
             ("gemm2_bias", kwargs.get("gemm2_bias") is not None),
             ("gemm1_alpha", kwargs.get("gemm1_alpha") is not None),
@@ -694,6 +696,8 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         fc1_io = build_bf16_launch_io(
             fc="fc1",
             cfg=fc1_cfg,
+            resident_weights=kwargs.get("resident_gemm1_weights"),
+            resident_expert_offset=kwargs.get("resident_expert_offset", 0),
             hidden_states=hidden_states,
             gemm1_weights=kwargs["gemm1_weights"],
             gemm2_weights=kwargs["gemm2_weights"],
@@ -722,6 +726,8 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         fc2_io = build_bf16_launch_io(
             fc="fc2",
             cfg=fc2_cfg,
+            resident_weights=kwargs.get("resident_gemm2_weights"),
+            resident_expert_offset=kwargs.get("resident_expert_offset", 0),
             hidden_states=hidden_states,
             gemm1_weights=kwargs["gemm1_weights"],
             gemm2_weights=kwargs["gemm2_weights"],
