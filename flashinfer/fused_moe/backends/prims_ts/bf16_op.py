@@ -110,9 +110,9 @@ def _get_bf16_tuning_config(
 
 
 def _get_moe_op():
-    from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
+    from flashinfer.fused_moe.trtllm_gen_routing import get_trtllm_gen_routing_module
 
-    return get_trtllm_moe_sm100_module().moe_op
+    return get_trtllm_gen_routing_module().moe_op
 
 
 @register_custom_op(
