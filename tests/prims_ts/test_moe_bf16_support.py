@@ -1146,3 +1146,54 @@ def test_support_rejects_unshuffled_major_k(monkeypatch):
 
     assert not ok
     assert "shuffled weights" in reason
+
+
+@pytest.mark.parametrize(
+    "weight_layout", [WeightLayout.MajorK, WeightLayout.BlockMajorK]
+)
+def test_bf16_relu2_pipeline_preserves_persisted_tactics(weight_layout):
+    """Existing pairs retain their pipelines and scheduler policies."""
+    expected_schedulers = [(0, 0), (0, 1), (1, 0), (1, 1)]
+    for index in range(8):
+        pair = map_trtllm_bf16_moe_tactic(
+            [128, index],
+            activation_type=int(ActivationType.Relu2),
+            weight_layout=int(weight_layout),
+        )
+        fc1, fc2 = pair.fc1.cfg.build(), pair.fc2.cfg.build()
+        assert (fc1.use_clc_fast_drain, fc2.use_clc_fast_drain) == (
+            expected_schedulers[index % 4]
+        )
+        assert (fc1.num_stages_a, fc1.num_stages_b, fc1.epi_tile_n) == (
+            (6, 6, 128) if index < 4 else (8, 9, 32)
+        )
+        assert (fc2.num_stages_a, fc2.num_stages_b, fc2.epi_tile_n) == (8, 8, 64)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and not is_sm100a_supported(torch.device("cuda")),
+    reason="PrimsTS kernels require Blackwell SM100A+",
+)
+@pytest.mark.parametrize(
+    "weight_layout", [WeightLayout.MajorK, WeightLayout.BlockMajorK]
+)
+@pytest.mark.parametrize("problem_k", [1024, 1152])
+def test_bf16_relu2_asymmetric_pipeline_wrap_and_tails(weight_layout, problem_k):
+    """Exercise pipeline wraparound, a partial expert tile, and routed row tails."""
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
+
+    pair = map_trtllm_bf16_moe_tactic(
+        [128, 6],
+        activation_type=int(ActivationType.Relu2),
+        weight_layout=int(weight_layout),
+    )
+    assert reference_check(
+        num_experts=4,
+        num_tokens=257,
+        top_k=3,
+        problem_n=2688,
+        problem_k=problem_k,
+        seed=123,
+        **pair.fc1.cfg.kwargs,
+    )

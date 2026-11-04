@@ -200,7 +200,7 @@ def get_trtllm_gen_routing_module():
             enable_pdl,
         )
 
-    return SimpleNamespace(trtllm_gen_routing=trtllm_gen_routing)
+    return SimpleNamespace(trtllm_gen_routing=trtllm_gen_routing, moe_op=module)
 
 
 @backend_requirement({}, common_check=_check_trtllm_gen_routing_supported)

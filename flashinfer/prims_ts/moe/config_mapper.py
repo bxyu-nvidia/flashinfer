@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import IntEnum
 from functools import lru_cache
 from importlib import resources
@@ -184,6 +184,7 @@ class _JsonBatchedGemmConfig:
     combo_index: int
     options: dict[str, object]
     is_scheduler_union_variant: bool = False
+    is_pipeline_union_variant: bool = False
 
 
 _SUPPORTED_JSON_OPTION_KEYS = frozenset(
@@ -664,6 +665,36 @@ def _expanded_prims_ts_json_configs() -> tuple[_JsonBatchedGemmConfig, ...]:
         )
         _validate_json_options(variant, options)
         expanded.append(variant)
+    # A quarter-width BF16 ReLU2 epilogue frees SMEM for deeper input pipelines.
+    # Append after scheduler variants to preserve every existing global index.
+    for cfg in tuple(expanded):
+        options = cfg.options
+        if not (
+            all(options.get(key) == "bf16" for key in ("dtype_a", "dtype_b", "dtype_c"))
+            and options.get("eltwise_act_type") == "relu2"
+            and options.get("tile_scheduler") == "persistent"
+            and options.get("tile_n") == 128
+            and options.get("tile_k") == 64
+            and options.get("epi_tile_n") == 128
+            and options.get("cluster_m") == 2
+            and options.get("num_stages_a") == 6
+            and options.get("num_stages_b") == 6
+        ):
+            continue
+        expanded.append(
+            replace(
+                cfg,
+                global_index=len(expanded),
+                comment=f"{cfg.comment} [8/9-stage, epilogue32]",
+                options={
+                    **options,
+                    "epi_tile_n": 32,
+                    "num_stages_a": 8,
+                    "num_stages_b": 9,
+                },
+                is_pipeline_union_variant=True,
+            )
+        )
     return tuple(expanded)
 
 
@@ -904,13 +935,18 @@ def _resolve_moe_json_config_pair(
             )
         )
     else:
-        # Appended union variants must not reinterpret any persisted baseline
-        # pair index. Keep the complete original FC1 x FC2 product first and
-        # place every pair involving a new scheduler variant afterward.
+        # Preserve the original product, then its scheduler union, before
+        # appending pairs using the new input/epilogue pipeline.
         config_pairs.sort(
-            key=lambda pair: int(
-                _json_config_by_global_index(pair[0]).is_scheduler_union_variant
-                or _json_config_by_global_index(pair[1]).is_scheduler_union_variant
+            key=lambda pair: (
+                int(
+                    _json_config_by_global_index(pair[0]).is_pipeline_union_variant
+                    or _json_config_by_global_index(pair[1]).is_pipeline_union_variant
+                ),
+                int(
+                    _json_config_by_global_index(pair[0]).is_scheduler_union_variant
+                    or _json_config_by_global_index(pair[1]).is_scheduler_union_variant
+                ),
             )
         )
     total = len(config_pairs)

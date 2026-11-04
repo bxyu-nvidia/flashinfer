@@ -1109,13 +1109,11 @@ class GmemCResource(MemoryResource):
 
     @cute.jit
     def _bf16_tma_smem_element_offset(self, m_local_row, n_local_col):
-        tma_store_cols = Int32(self.cfg.epi_tile_n)
-        row_block = m_local_row // Int32(64)
-        row_in_block = m_local_row % Int32(64)
-        smem_row_idx = row_block * tma_store_cols + n_local_col
-        smem_offset_bytes = smem_row_idx * Int32(128) + row_in_block * Int32(2)
-        swizzle_mask = (smem_row_idx % Int32(8)) * Int32(16)
-        return (smem_offset_bytes ^ swizzle_mask) // Int32(2)
+        # Tile-local coordinates are nonnegative; avoid signed division/modulo.
+        row_idx = (m_local_row >> Int32(6)) * Int32(self.cfg.epi_tile_n) + n_local_col
+        row_offset = m_local_row & Int32(63)
+        swizzle = (row_idx & Int32(7)) << Int32(3)
+        return (row_idx << Int32(6)) | (row_offset ^ swizzle)
 
     @cute.jit
     def _bf16_gated_tma_smem_element_offset(self, m_local_row, n_local_col):

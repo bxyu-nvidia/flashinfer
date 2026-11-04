@@ -367,9 +367,8 @@ def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec
 def gen_trtllm_gen_routing_module() -> JitSpec:
     """JitSpec for the standalone trtllm-gen MoE routing stage.
 
-    Compiles only the routing kernels plus the Routing::Runner dispatcher
-    (trtllm_fused_moe_routing_runner.cu), so the routing stage can be built and
-    tested without the batched-GEMM stack of fused_moe_trtllm_sm100. Only the
+    Compiles routing, Prims BF16 workspace bindings, and finalization without
+    the batched-GEMM stack of fused_moe_trtllm_sm100. Only the
     BMM export headers are needed (for btg::Dtype et al.), not the GEMM cubins.
     """
     checksum = get_artifact(
@@ -404,6 +403,9 @@ def gen_trtllm_gen_routing_module() -> JitSpec:
         "trtllm_gen_routing",
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_routing_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_moe_staged_routing_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_runner.cu",
             jit_env.FLASHINFER_CSRC_DIR

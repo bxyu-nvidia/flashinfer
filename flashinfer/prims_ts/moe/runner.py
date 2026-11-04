@@ -792,7 +792,7 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         if prepare_routing is None:
             logger.warning_once(
                 "Prims-TS prepared routing is unavailable in the loaded MoE binary; "
-                "using eager routing. Rebuild the TRTLLM MoE module from current "
+                "using eager routing. Rebuild the trtllm_gen_routing module from current "
                 "FlashInfer sources to enable preparation before routing submission."
             )
         route = prepare_routing or self.moe_op.trtllm_moe_run_routing
