@@ -31,12 +31,19 @@ def test_compiled_gemm_cache_is_partitioned_by_device_and_arch(monkeypatch, requ
     request.addfinalizer(compile_cache._COMPILED_GEMM_CACHE.clear)
 
     io = {"cfg": object()}
+    assert compile_cache.find_compiled_gemm("cfg", "fc1", io) is None
+    assert not compiled
     first = compile_cache.get_compiled_gemm("cfg", "fc1", io, "stream")
     assert compile_cache.get_compiled_gemm("cfg", "fc1", io, "stream") is first
 
+    assert compile_cache.find_compiled_gemm("cfg", "fc1", io) is first
+    assert compile_cache.find_compiled_gemm("other", "fc1", io) is None
+    assert compile_cache.find_compiled_gemm("cfg", "fc2", io) is None
     target[0] = (1, "sm100a")
+    assert compile_cache.find_compiled_gemm("cfg", "fc1", io) is None
     second = compile_cache.get_compiled_gemm("cfg", "fc1", io, "stream")
     target[0] = (1, "sm103a")
+    assert compile_cache.find_compiled_gemm("cfg", "fc1", io) is None
     third = compile_cache.get_compiled_gemm("cfg", "fc1", io, "stream")
 
     assert first is not second

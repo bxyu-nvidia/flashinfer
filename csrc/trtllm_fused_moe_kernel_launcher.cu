@@ -29,6 +29,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <tvm/ffi/function.h>
+
 #include "flashinfer/fused_moe/da_moe.cuh"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/GemmGatedActOptions.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
@@ -3046,6 +3048,77 @@ Array<Tensor> trtllm_moe_run_routing(
   launcher->prepare_external_gemm_buffers();
 
   return launcher->collect_routing_outputs();
+}
+
+// Allocate and expose routing/GEMM buffers without submitting routing kernels.
+Array<tvm::ffi::Any> trtllm_moe_prepare_routing(
+    Optional<Tensor> const& routing_logits, Optional<Tensor> const& routing_bias,
+    Tensor const& expert_indices, Tensor const& expert_weights, Tensor const& hidden_states,
+    Tensor const& gemm1_weights, Tensor const& gemm2_weights, int64_t num_experts, int64_t top_k,
+    Optional<int64_t> n_group,
+    Optional<int64_t> topk_group, int64_t intermediate_size, int64_t local_expert_offset,
+    int64_t local_num_experts, Optional<double> routed_scaling_factor, int64_t routing_method_type,
+    bool use_shuffled_weight, int64_t weight_layout, bool enable_pdl, Array<int64_t> moe_tactic,
+    int64_t activation_type, bool norm_topk_prob, Optional<Tensor> routing_replay_out) {
+  TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_bfloat16)
+      << "Staged MoE routing (BF16): hidden_states must be bfloat16.";
+  TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_bfloat16)
+      << "Staged MoE routing (BF16): gemm1_weights must be bfloat16.";
+  TVM_FFI_ICHECK_EQ(gemm2_weights.dtype(), dl_bfloat16)
+      << "Staged MoE routing (BF16): gemm2_weights must be bfloat16.";
+
+  if (routing_replay_out.has_value()) {
+    auto const replay = routing_replay_out.value();
+    validate_routing_replay_out(replay, hidden_states, top_k);
+  }
+
+  auto const num_tokens = hidden_states.size(0);
+  std::vector<int32_t> supported_tile_nums{8, 16, 32, 64, 128, 256};
+  auto const [tile_N, config] = resolveMoeTileAndConfig(moe_tactic, supported_tile_nums, num_tokens,
+                                                        top_k, local_num_experts);
+  (void)config;
+
+  auto as_view = [](Optional<Tensor> const& tensor) -> Optional<TensorView> {
+    if (tensor.has_value()) {
+      auto const owner = tensor.value();
+      return TensorView(owner);
+    }
+    return Optional<TensorView>();
+  };
+  std::shared_ptr<StagedMoeLauncher> launcher = make_bf16_staged_launcher(
+      as_view(routing_logits), as_view(routing_bias), expert_indices, expert_weights,
+      hidden_states, gemm1_weights, gemm2_weights, num_experts, top_k, n_group, topk_group,
+      intermediate_size,
+      local_expert_offset, local_num_experts, routed_scaling_factor, routing_method_type,
+      use_shuffled_weight, weight_layout, tile_N, activation_type, norm_topk_prob,
+      as_view(routing_replay_out));
+
+  launcher->check_routing();
+  launcher->prepare_routing();
+  launcher->check_moe();
+  launcher->prepare_external_gemm_buffers();
+
+  // TensorView only borrows shape/stride metadata. Keep owning Tensor handles
+  // for every input until the deferred callable and workspace are released.
+  Array<Tensor> inputs{expert_indices, expert_weights, hidden_states, gemm1_weights,
+                       gemm2_weights};
+  if (routing_logits.has_value()) inputs.push_back(routing_logits.value());
+  if (routing_bias.has_value()) inputs.push_back(routing_bias.value());
+  if (routing_replay_out.has_value()) inputs.push_back(routing_replay_out.value());
+  auto const device = hidden_states.device();
+  auto const stream = get_stream(device);
+  auto submit = tvm::ffi::Function::FromTyped(
+      [launcher, inputs, device, stream, enable_pdl](TensorView stream_anchor) {
+        (void)inputs;
+        // A tensor argument installs the caller's framework stream in TVM-FFI.
+        TVM_FFI_ICHECK(stream_anchor.device().device_type == device.device_type &&
+                       stream_anchor.device().device_id == device.device_id)
+            << "Prepared MoE routing must be submitted on the preparation device.";
+        TVM_FFI_ICHECK(get_stream(device) == stream)
+            << "Prepared MoE routing must be submitted on the preparation stream.";
+        launcher->run_routing_kernel(enable_pdl);
+      });
+  return {launcher->collect_routing_outputs(), submit};
 }
 
 void trtllm_moe_run_finalize(TensorView gemm2_output, TensorView output, TensorView expert_weights,
@@ -6614,6 +6687,7 @@ namespace trtllm_cubin_loader {
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_bf16_moe, trtllm_bf16_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_run_routing, trtllm_moe_run_routing);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_prepare_routing, trtllm_moe_prepare_routing);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_run_routing_fp4_nvfp4, trtllm_moe_run_routing_fp4_nvfp4);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_run_routing_fp4_mxfp4_mxfp8,
                               trtllm_moe_run_routing_fp4_mxfp4_mxfp8);

@@ -803,7 +803,9 @@ class SmemGatherResource(MemoryResource):
                     gmem_col_bytes = nonnegative_div(
                         gmem_col_bits, 8
                     ) + col_chunk * Int32(copy_bytes)
-                    gmem_byte_off = phys_row * self.act_stride_bytes + gmem_col_bytes
+                    gmem_byte_off = (
+                        Int64(phys_row) * self.act_stride_bytes + gmem_col_bytes
+                    )
                     gmem_ptr = self.act_gmem_ptr + gmem_byte_off
                     prims.inline_ptx_hl(
                         "cp.async.cg.shared.global.L2::128B [{$r0}], [{$r1}], 16;",
