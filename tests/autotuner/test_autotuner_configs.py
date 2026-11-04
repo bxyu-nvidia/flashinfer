@@ -1256,3 +1256,149 @@ class TestCudnnVersionDetection:
         monkeypatch.setitem(sys.modules, "cudnn", None)
         meta = autotuner_module._collect_metadata()
         assert meta["cudnn_version"] == "unknown"
+
+
+class TestPersistedProfilingPolicy:
+    @pytest.fixture(autouse=True)
+    def setup_tuner(self, monkeypatch):
+        AutoTuner._instance = None
+        monkeypatch.setattr(autotuner_module, "_collect_metadata", lambda: {})
+        yield
+        AutoTuner._instance = None
+
+    @pytest.mark.parametrize("cold_l2,replays", [(False, 1), (True, 1), (True, 20)])
+    def test_warm_tuning_uses_saved_policy(
+        self, tmp_path, monkeypatch, cold_l2, replays
+    ):
+        runner = FakeRunnerA()
+        inputs = [torch.empty((8, 16))]
+        config = TuningConfig(
+            use_cuda_graph=True,
+            use_cold_l2_cache=cold_l2,
+            cuda_graph_profile_replays=replays,
+        )
+        tuner = AutoTuner.get()
+        key = tuner._get_cache_key("test::policy", runner, ((8, 16),), config)
+        tuner.profiling_cache[key] = (2, None)
+        tuner._profiling_cache_policies[key] = tuner._profiling_policy(config)
+        path = str(tmp_path / "cache.json")
+        tuner.save_configs(path)
+
+        def unexpected_profile(*args, **kwargs):
+            pytest.fail("Matching persisted policy must skip input synthesis/profiling")
+
+        monkeypatch.setattr(AutoTuner, "_prepare_input_tensors", unexpected_profile)
+        # Exercise a fresh process equivalent, including a load/save-only cycle.
+        for _ in range(2):
+            AutoTuner._instance = None
+            tuner = AutoTuner.get()
+            with autotune(True, cache=path):
+                assert tuner.choose_one("test::policy", [runner], config, inputs) == (
+                    runner,
+                    2,
+                )
+            assert not tuner._dirty
+            tuner.save_configs(path)
+
+    @pytest.mark.parametrize("changed", ["l2", "replays", "shape"])
+    def test_changed_policy_or_shape_remains_a_miss(self, tmp_path, changed):
+        runner = FakeRunnerA()
+        config = TuningConfig(use_cuda_graph=True, use_cold_l2_cache=True)
+        tuner = AutoTuner.get()
+        shapes = ((8, 16),)
+        key = tuner._get_cache_key("test::policy", runner, shapes, config)
+        tuner.profiling_cache[key] = (2, None)
+        tuner._profiling_cache_policies[key] = tuner._profiling_policy(config)
+        path = str(tmp_path / "cache.json")
+        tuner.save_configs(path)
+        AutoTuner._instance = None
+        tuner = AutoTuner.get()
+        assert tuner.load_configs(path)
+        requested = TuningConfig(
+            use_cuda_graph=True,
+            use_cold_l2_cache=changed != "l2",
+            cuda_graph_profile_replays=20 if changed == "replays" else 1,
+        )
+        if changed == "shape":
+            shapes = ((16, 16),)
+        with autotune(True):
+            assert not tuner.search_cache("test::policy", [runner], shapes, requested)[
+                0
+            ]
+        if changed != "shape":
+            # Measurement policy must not prevent inference using the winner.
+            assert tuner.search_cache("test::policy", [runner], shapes, requested)[
+                :3
+            ] == (
+                True,
+                0,
+                2,
+            )
+
+    def test_legacy_cold_entry_retunes_only_once(self, tmp_path, monkeypatch):
+        runner = FakeRunnerA()
+        inputs = [torch.empty((8, 16))]
+        config = TuningConfig(use_cuda_graph=True, use_cold_l2_cache=True)
+        tuner = AutoTuner.get()
+        key = tuner._get_cache_key("test::policy", runner, ((8, 16),), config)
+        path = tmp_path / "legacy.json"
+        path.write_text(json.dumps({key.file_key: ["FakeRunnerA", 0]}))
+        profiled = []
+
+        def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
+            profiled.append(tactic)
+            return float(3 - tactic)
+
+        monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+        monkeypatch.setattr(
+            AutoTuner, "_prepare_input_tensors_with_batches", lambda *args: None
+        )
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+        for _ in range(2):
+            AutoTuner._instance = None
+            with autotune(True, cache=str(path)):
+                assert AutoTuner.get().choose_one(
+                    "test::policy", [runner], config, inputs
+                ) == (runner, 2)
+        assert profiled == [0, 1, 2]
+        assert json.loads(path.read_text())[key.file_key][2] == list(
+            tuner._profiling_policy(config)
+        )
+
+    def test_disk_merge_keeps_policy_with_winning_entry(self, tmp_path):
+        runner = FakeRunnerA()
+        config = TuningConfig(use_cuda_graph=True, use_cold_l2_cache=True)
+        key = AutoTuner._get_cache_key("test::policy", runner, ((8, 16),), config)
+        policy = AutoTuner._profiling_policy(config)
+        path = str(tmp_path / "cache.json")
+        writer = AutoTuner()
+        writer.profiling_cache[key] = (2, None)
+        writer._profiling_cache_policies[key] = policy
+        writer.save_configs(path)
+        other = AutoTuner()
+        _populate_cache(other, runner, "test::other", ((8, 16),), 1)
+        other.save_configs(path)
+        assert json.loads((tmp_path / "cache.json").read_text())[key.file_key] == [
+            "FakeRunnerA",
+            2,
+            list(policy),
+        ]
+        # Replacing that entry with a legacy result must remove its old policy.
+        other.profiling_cache[key] = (0, None)
+        other.save_configs(path)
+        assert json.loads((tmp_path / "cache.json").read_text())[key.file_key] == [
+            "FakeRunnerA",
+            0,
+        ]
+        assert writer.load_configs(path)
+        assert key.file_key not in writer._file_config_policies
+
+    def test_clear_and_cache_context_remove_loaded_policies(self, tmp_path):
+        tuner = AutoTuner.get()
+        key = "unused-key"
+        tuner._file_config_policies[key] = ("old-policy",)
+        tuner.clear_cache()
+        assert not tuner._file_config_policies
+        tuner._file_config_policies[key] = ("old-policy",)
+        with autotune(False, cache=str(tmp_path / "missing.json")):
+            assert not tuner._file_config_policies
