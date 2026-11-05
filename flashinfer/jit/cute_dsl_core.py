@@ -258,14 +258,15 @@ class JitSpecCuteDsl(JitSpec):
         module = cute.runtime.load_module(str(self.object_path), enable_tvm_ffi=True)
         return getattr(module, self.symbol)
 
+    def _export_compiled_kernel(self, object_path: Path) -> None:
+        self._compiled_kernel.export_to_c(str(object_path), function_name=self.symbol)
+
     def _export(self) -> None:
         self.module_dir.mkdir(parents=True, exist_ok=True)
         tmp_object_path = self.object_path.with_suffix(f".o.tmp.{os.getpid()}")
         tmp_meta_path = self.meta_path.with_suffix(f".json.tmp.{os.getpid()}")
         try:
-            self._compiled_kernel.export_to_c(
-                str(tmp_object_path), function_name=self.symbol
-            )
+            self._export_compiled_kernel(tmp_object_path)
             os.replace(tmp_object_path, self.object_path)
             # meta.json is the module's commit marker: written after the
             # object file is in place so a crash never leaves a loadable

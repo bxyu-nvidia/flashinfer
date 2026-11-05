@@ -23,6 +23,8 @@ Entry points:
 import os
 from typing import Any
 
+from cuda.bindings.driver import CUstream
+
 from ..cutlass_dsl import require_cutlass_dsl_experimental, task_scheduling_scope
 
 require_cutlass_dsl_experimental()
@@ -2571,7 +2573,7 @@ def gemm(
     problem_size: tuple,
     early_exit_max_token_ctas: cutlass.Int32,
     cfg: cutlass.Constexpr[BatchedGemmConfig],
-    stream,
+    stream: CUstream,
 ):
     """Host-side: create TMA descs and launch kernel."""
     m, n, k, num_experts_dim, num_tokens = problem_size
