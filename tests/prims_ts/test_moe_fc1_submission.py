@@ -1,0 +1,286 @@
+# Copyright (c) 2026 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from contextlib import nullcontext
+import sys
+from types import ModuleType, SimpleNamespace
+
+import pytest
+import torch
+import tvm_ffi
+
+from flashinfer.prims_ts.moe import runner as module
+from flashinfer.prims_ts.moe import compile_cache, config_mapper
+from flashinfer.tllm_enums import ActivationType, WeightLayout
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("immutable", [False, True])
+@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize("finalize", [False, True])
+def test_fc1_submission_defers_unused_outputs_and_preserves_cold_path(
+    monkeypatch, warm, finalize, immutable, deferred
+):
+    import cutlass.cute.runtime
+
+    # Run the real orchestration and launch adapter with CPU tensors, replacing
+    # only CUDA stream/launch operations and native routing/finalize.
+    driver = ModuleType("cuda.bindings.driver")
+    driver.CUstream = lambda stream: stream
+    bindings = ModuleType("cuda.bindings")
+    bindings.driver = driver
+    cuda = ModuleType("cuda")
+    cuda.bindings = bindings
+    for name, obj in (
+        ("cuda", cuda),
+        ("cuda.bindings", bindings),
+        ("cuda.bindings.driver", driver),
+    ):
+        monkeypatch.setitem(sys.modules, name, obj)
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda **kw: SimpleNamespace(cuda_stream=0)
+    )
+    monkeypatch.setattr(torch.cuda.nvtx, "range", lambda name: nullcontext())
+    monkeypatch.setattr(
+        cutlass.cute.runtime, "make_ptr", lambda dtype, address, space, **kw: address
+    )
+    events = []
+    hidden = torch.ones(2, 128, dtype=torch.bfloat16)
+    output = torch.empty_like(hidden)
+    fc1_output, fc2_output = torch.zeros_like(hidden), torch.zeros_like(hidden)
+    expert_weights = torch.ones(2, dtype=torch.float32)
+    expanded = torch.arange(2, dtype=torch.int32)
+    routing_values = [
+        expert_weights,
+        expanded,
+        torch.arange(2, dtype=torch.int32),
+        torch.zeros(4, dtype=torch.int32),
+        torch.zeros(4, dtype=torch.int32),
+        torch.ones(1, dtype=torch.int32),
+        torch.tensor([2], dtype=torch.int32),
+        fc1_output,
+        fc2_output,
+    ]
+    routing_array = tvm_ffi.Array(routing_values)
+    original_getitem = tvm_ffi.Array.__getitem__
+
+    def getitem(self, index):
+        events.append(("extract", index))
+        return original_getitem(self, index)
+
+    monkeypatch.setattr(tvm_ffi.Array, "__getitem__", getitem)
+
+    original_config = compile_cache.get_bf16_runtime_config
+
+    def runtime_config(*args):
+        events.append("runtime_config")
+        return original_config(*args)
+
+    monkeypatch.setattr(module, "get_bf16_runtime_config", runtime_config)
+    monkeypatch.setattr(compile_cache, "get_bf16_runtime_config", runtime_config)
+
+    def launch_fc1(*args):
+        events.append("fc1")
+        assert args[4] == fc1_output.data_ptr()
+        assert args[11] == hidden.data_ptr()
+        fc1_output.copy_(hidden + 1)
+
+    def launch_fc2(*args):
+        events.append("fc2")
+        assert args[4] == fc2_output.data_ptr()
+        assert args[11] == fc1_output.data_ptr()
+        fc2_output.copy_(fc1_output * 2)
+
+    def find(*args):
+        events.append("find")
+        return launch_fc1 if warm else None
+
+    def compile_kernel(key, fc, io, stream):
+        events.append("compile_" + fc)
+        assert "cfg" in io and "config_hash" in io
+        assert not isinstance(io["cfg"], compile_cache.Bf16LaunchMetadata)
+        return launch_fc1 if fc == "fc1" else launch_fc2
+
+    original_prepare = module.prepare_bf16_fc1_inputs
+    original_build = module.build_bf16_launch_io
+
+    def prepare_inputs(**kwargs):
+        events.append("pre_route_inputs")
+        return original_prepare(**kwargs)
+
+    def build_io(**kwargs):
+        events.append("build_" + kwargs["fc"])
+        io = original_build(**kwargs)
+        if kwargs["fc"] == "fc1":
+            assert ("cfg" not in io) == (warm and immutable)
+            assert ("config_hash" not in io) == (warm and immutable)
+        return io
+
+    monkeypatch.setattr(module, "prepare_bf16_fc1_inputs", prepare_inputs)
+    monkeypatch.setattr(module, "build_bf16_launch_io", build_io)
+
+    def submit_routing(*args):
+        events.append("routing")
+
+    def route(*args):
+        submit_routing()
+        return routing_array
+
+    def prepare_routing(*args):
+        events.append("routing_prepare")
+        return [routing_array, submit_routing]
+
+    def launch_args(io, stream):
+        events.append("launch_args")
+        return (*io["_launch_args"], stream)
+
+    def finish(gemm2, result, weights, indices, *args):
+        events.append("finalize")
+        assert weights.data_ptr() == expert_weights.data_ptr()
+        assert indices.data_ptr() == expanded.data_ptr()
+        result.copy_(gemm2)
+
+    monkeypatch.setattr(module, "find_compiled_gemm", find)
+    monkeypatch.setattr(module, "get_compiled_gemm", compile_kernel)
+    monkeypatch.setattr(module, "_routed_token_capacity", lambda *args: 2)
+    model = SimpleNamespace(
+        hidden_size=128,
+        intermediate_size=128,
+        top_k=1,
+        num_local_experts=2,
+        activation_type=ActivationType.Identity,
+        moe_op=SimpleNamespace(
+            trtllm_moe_run_routing=route, trtllm_moe_run_finalize=finish
+        ),
+        _launch_args=launch_args,
+    )
+    if deferred:
+        model.moe_op.trtllm_moe_prepare_routing = prepare_routing
+
+    inputs = SimpleNamespace(
+        hidden_states=hidden,
+        output=output,
+        routing_logits=None,
+        topk_ids=None,
+        expert_weights=None,
+    )
+    spec = config_mapper._immutable_config_spec_cached(
+        tuple(
+            sorted(
+                dict(
+                    dtype_a=3,
+                    dtype_b=3,
+                    dtype_c=3,
+                    mma_k=16,
+                    tile_k=64,
+                    weight_layout=int(WeightLayout.MajorK),
+                ).items()
+            )
+        )
+    )
+    fc = config_mapper.PrimsTsMoeGemmConfig(spec if immutable else spec.build(), 0)
+    pair = config_mapper.PrimsTsGemmPair(128, 0, fc, fc)
+    result = module.PrimsTsBf16MoERunner._forward_prepared(
+        model,
+        inputs,
+        pair,
+        routing_bias=None,
+        gemm1_weights=torch.empty(2, 128, 128, dtype=torch.bfloat16),
+        gemm2_weights=torch.empty(2, 128, 128, dtype=torch.bfloat16),
+        num_experts=2,
+        n_group=1,
+        topk_group=1,
+        local_expert_offset=0,
+        routed_scaling_factor=1.0,
+        routing_method_type=0,
+        use_shuffled_weight=True,
+        weight_layout=int(WeightLayout.MajorK),
+        enable_pdl=False,
+        do_finalize=finalize,
+    )
+    route_event = "routing_prepare" if deferred else "routing"
+    assert events[:3] == (
+        (
+            ["find", "pre_route_inputs", route_event]
+            if warm
+            else ["find", "runtime_config", route_event]
+        )
+        if immutable
+        else ["runtime_config", "find", route_event]
+    )
+    assert events.count("routing") == 1
+    if deferred:
+        assert events.index("build_fc1") < events.index("routing")
+        assert events.index("launch_args") < events.index("routing")
+        assert events[events.index("routing") + 1] == "fc1"
+        if not warm:
+            assert events.index("compile_fc1") < events.index("routing")
+    else:
+        assert events.index("routing") < events.index("build_fc1")
+    split = events.index("fc1")
+    assert [e for e in events[:split] if isinstance(e, tuple)] == [
+        ("extract", slice(2, 8))
+    ]
+    assert [e for e in events[split:] if isinstance(e, tuple)] == [
+        ("extract", slice(None, 2)),
+        ("extract", slice(8, 9)),
+    ]
+    assert events.index("fc2") > split
+    assert events.count("runtime_config") == (1 if warm and immutable else 2)
+    assert ("compile_fc1" in events) == (not warm)
+    if finalize:
+        assert result == []
+        torch.testing.assert_close(output, torch.full_like(output, 4))
+    else:
+        assert len(result) == 3
+        torch.testing.assert_close(result[0], torch.full_like(fc2_output, 4))
+        assert result[1].data_ptr() == expert_weights.data_ptr()
+        assert result[2].data_ptr() == expanded.data_ptr()
+
+
+def test_routing_capacity_cache_uses_all_layout_dimensions(monkeypatch):
+    from flashinfer.prims_ts.batched_gemm import batched_gemm_config
+    from unittest.mock import Mock
+
+    compute = Mock(wraps=batched_gemm_config.compute_max_num_ctas_in_token_dim_for_moe)
+    monkeypatch.setattr(
+        batched_gemm_config, "compute_max_num_ctas_in_token_dim_for_moe", compute
+    )
+    cache = module._routing_capacity_cached
+    cache.cache_clear()
+    try:
+        for tokens, experts, top_k, tile in (
+            (18026, 128, 8, 128),
+            (18027, 128, 8, 128),
+            (18026, 64, 8, 128),
+            (18026, 128, 4, 128),
+            (18026, 128, 8, 64),
+        ):
+            expected = (
+                compute._mock_wraps(
+                    num_tokens=tokens,
+                    num_experts=experts,
+                    top_k=top_k,
+                    token_tile_size=tile,
+                    cluster_dim_in_token=1,
+                )
+                * tile
+            )
+            assert cache(tokens, experts, top_k, tile) == expected
+            assert cache(tokens, experts, top_k, tile) == expected
+        assert compute.call_count == 5
+        assert cache.cache_info().hits == 5
+        assert cache.cache_info().maxsize == 1024
+    finally:
+        cache.cache_clear()

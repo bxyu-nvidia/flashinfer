@@ -591,7 +591,7 @@ class GmemCResource(MemoryResource):
                 return self.sBias.subview(local_m_row).load()
             bias_row = self._bias_storage_row(m_row)
             return self.gBias.load(
-                idx=expert_idx * self.problem_m + bias_row,
+                idx=cutlass.Int64(expert_idx) * self.problem_m + bias_row,
                 vector_size=1,
             )[0]
         return Float32(0.0)
@@ -839,7 +839,7 @@ class GmemCResource(MemoryResource):
                     if m_row < self.problem_m:
                         bias_row = self._bias_storage_row(m_row)
                         bias_val = self.gBias.load(
-                            idx=expert_idx * self.problem_m + bias_row,
+                            idx=cutlass.Int64(expert_idx) * self.problem_m + bias_row,
                             vector_size=1,
                         )[0]
                 self.sBias.subview(local_m_row).store(bias_val)
@@ -1109,13 +1109,11 @@ class GmemCResource(MemoryResource):
 
     @cute.jit
     def _bf16_tma_smem_element_offset(self, m_local_row, n_local_col):
-        tma_store_cols = Int32(self.cfg.epi_tile_n)
-        row_block = m_local_row // Int32(64)
-        row_in_block = m_local_row % Int32(64)
-        smem_row_idx = row_block * tma_store_cols + n_local_col
-        smem_offset_bytes = smem_row_idx * Int32(128) + row_in_block * Int32(2)
-        swizzle_mask = (smem_row_idx % Int32(8)) * Int32(16)
-        return (smem_offset_bytes ^ swizzle_mask) // Int32(2)
+        # Tile-local coordinates are nonnegative; avoid signed division/modulo.
+        row_idx = (m_local_row >> Int32(6)) * Int32(self.cfg.epi_tile_n) + n_local_col
+        row_offset = m_local_row & Int32(63)
+        swizzle = (row_idx & Int32(7)) << Int32(3)
+        return (row_idx << Int32(6)) | (row_offset ^ swizzle)
 
     @cute.jit
     def _bf16_gated_tma_smem_element_offset(self, m_local_row, n_local_col):
@@ -1665,8 +1663,10 @@ class GmemCResource(MemoryResource):
     @cute.jit
     def _dsfp8_c_scale_idx(self, m_row, n_col, output_m):
         if cutlass.const_expr(self.cfg.is_swap_ab):
-            return (m_row // Int32(128)) * self.dsfp8_c_scale_stride + n_col
-        return (n_col // Int32(128)) * output_m + m_row
+            return (
+                cutlass.Int64(m_row // Int32(128)) * self.dsfp8_c_scale_stride + n_col
+            )
+        return cutlass.Int64(n_col // Int32(128)) * output_m + m_row
 
     @cute.jit
     def _store_dsfp8_c_scale(
@@ -1728,6 +1728,8 @@ class GmemCResource(MemoryResource):
 
     @cute.jit
     def _sf_c_index(self, m_row, n_col, output_m):
+        n_col = cutlass.Int64(n_col)
+        output_m = cutlass.Int64(output_m)
         block_m = Int32(self.cfg.output_sf_block_size_c)
         group_m = block_m * Int32(4)
         if cutlass.const_expr(self.cfg.output_sf_block_size_c in (16, 32)):
@@ -2101,10 +2103,10 @@ class GmemCResource(MemoryResource):
         elif output_in_bounds:
             if cutlass.const_expr(self.cfg.use_tma_oob_opt):
                 if token_in_bounds:
-                    flat_idx0 = n_col * output_m + m_row0
+                    flat_idx0 = cutlass.Int64(n_col) * output_m + m_row0
                     self.gCBytes.subview(flat_idx0 >> Int32(1)).store(packed)
             else:
-                flat_idx0 = n_col * output_m + m_row0
+                flat_idx0 = cutlass.Int64(n_col) * output_m + m_row0
                 self.gCBytes.subview(flat_idx0 >> Int32(1)).store(packed)
 
         sf_packed = sf.to(cutlass.Float8E4M3FN).bitcast(cutlass.Int8)
@@ -2415,7 +2417,7 @@ class GmemCResource(MemoryResource):
                 ) + warpgroup_idx * Int32(self.cfg.num_bytes_c_tma_store_per_group)
                 self.sCInt16.subview(smem_offset0 >> Int32(1)).store(packed)
         elif output_in_bounds:
-            flat_idx0 = n_col * output_m + m_row0
+            flat_idx0 = cutlass.Int64(n_col) * output_m + m_row0
             if cutlass.const_expr(self.cfg.uses_mxfp4_output_quant):
                 packed = _convert_f32x2_to_e2m1x2(scaled1, scaled0)
                 if cutlass.const_expr(self.cfg.use_tma_oob_opt):
@@ -2938,7 +2940,7 @@ class GmemCResource(MemoryResource):
                                     output_in_bounds,
                                 )
                             else:
-                                flat_idx0 = n_col * output_m + m_row0
+                                flat_idx0 = cutlass.Int64(n_col) * output_m + m_row0
                                 flat_idx1 = flat_idx0 + Int32(1)
                                 if cutlass.const_expr(self.cfg.use_tma_oob_opt):
                                     if token_in_bounds & output_in_bounds:
@@ -3209,7 +3211,7 @@ class GmemCResource(MemoryResource):
 
                                 m_row = m_tile_base // Int32(2) + m_local_row
                                 n_col = n_tile_base + tmem_col_even
-                                flat_idx = n_col * output_m + m_row
+                                flat_idx = cutlass.Int64(n_col) * output_m + m_row
                                 token_in_bounds = (
                                     n_subtile_offset + tmem_col_even
                                 ) < token_limit
@@ -3320,7 +3322,7 @@ class GmemCResource(MemoryResource):
                             warpgroup_idx,
                         )
                         m_row1 = m_row0 + Int32(1)
-                        flat_idx0 = n_col * output_m + m_row0
+                        flat_idx0 = cutlass.Int64(n_col) * output_m + m_row0
                         output_pair_in_bounds = (m_row1 < output_m) & (
                             n_col < self.problem_n
                         )
@@ -3486,7 +3488,7 @@ class GmemCResource(MemoryResource):
                             elif row_sub == 3:
                                 val_f32 = val3_vals[pair_idx]
                             val_out = self._to_output_value(val_f32 * q_scale)
-                            flat_idx = n_col * output_m + m_row
+                            flat_idx = cutlass.Int64(n_col) * output_m + m_row
                             output_in_bounds = (m_row < output_m) & (
                                 n_col < self.problem_n
                             )
@@ -3630,7 +3632,7 @@ class GmemCResource(MemoryResource):
                                 val_f32 = val_f32 * val_f32
                             val_f32 = self._maybe_apply_scale_c(val_f32, scale_c)
                             val_out = self._to_output_value(val_f32)
-                            flat_idx = n_col * output_m + m_row
+                            flat_idx = cutlass.Int64(n_col) * output_m + m_row
                             token_in_bounds = (
                                 n_subtile_offset + tmem_col
                             ) < token_limit
