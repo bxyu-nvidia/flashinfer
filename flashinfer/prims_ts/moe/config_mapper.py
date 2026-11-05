@@ -1288,12 +1288,16 @@ def _ensure_config_task_manager_buildable(
     top_k: int | None = None,
     num_experts: int | None = None,
 ) -> None:
+    # Task-manager validation builds a synthetic schedule from the config, not
+    # the runtime token extent. The builder computes (then discards) that extent;
+    # actual launch bounds are resolved separately with the real token count.
+    # Reuse validation across batch sizes without changing tactic selection.
+    del num_tokens
     validation_top_k = max(1, int(top_k or 1))
     validation_num_experts = max(validation_top_k, int(num_experts or 2))
     _validate_task_schedule_cached(
         tuple(sorted(spec.kwargs.items())),
         num_experts=validation_num_experts,
-        num_tokens=max(1, int(num_tokens or 128)),
         top_k=validation_top_k,
         debug_checks=os.environ.get("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "0").lower(),
     )
@@ -1304,7 +1308,6 @@ def _validate_task_schedule_cached(
     config_items: tuple[tuple[str, int], ...],
     *,
     num_experts: int,
-    num_tokens: int,
     top_k: int,
     debug_checks: str,
 ) -> None:
@@ -1318,7 +1321,7 @@ def _validate_task_schedule_cached(
     del debug_checks
     manager = build_batched_gemm_task_manager(
         num_experts=num_experts,
-        num_tokens=num_tokens,
+        num_tokens=128,
         top_k=top_k,
         verbose=False,
         **dict(config_items),
@@ -1919,11 +1922,13 @@ def _resolve_bf16_moe_tactic(
     if moe_config_index < -1:
         raise ValueError(f"Unsupported MoE config index={moe_config_index}")
 
+    # _parse_tactic above still uses the actual token count to select tile_n.
+    # Once the tile is resolved, config construction and schedule validation do
+    # not depend on the exact batch size. Keep it out of the shared-pair key.
     return _bf16_config_pair_cached(
         debug_checks=os.environ.get("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "0").lower(),
         tile_n=tile_n,
         moe_config_index=moe_config_index,
-        num_tokens=num_tokens,
         top_k=top_k,
         num_experts=num_local_experts,
         activation_type=activation_type,

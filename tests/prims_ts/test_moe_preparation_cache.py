@@ -93,7 +93,6 @@ def test_mapping_reuses_work_without_sharing_option_dicts(map_pair):
     "change",
     [
         {"activation_type": int(ActivationType.Relu2)},
-        {"num_tokens": 64},
         {"top_k": 2},
         {"num_local_experts": 4},
         {"fc1_has_bias": True},
@@ -109,6 +108,15 @@ def test_mapping_revalidates_changed_options(map_pair, change):
     config_mapper.map_trtllm_bf16_moe_tactic([128, 0])
     config_mapper.map_trtllm_bf16_moe_tactic([128, 0], **change)
     assert map_pair.call_count == 2
+
+
+def test_mapping_reuses_explicit_tactic_across_token_counts(map_pair):
+    first = config_mapper.map_trtllm_bf16_moe_tactic([128, 0], num_tokens=64)
+    second = config_mapper.map_trtllm_bf16_moe_tactic([128, 0], num_tokens=16914)
+    assert map_pair.call_count == 1
+    assert first.fc1.cfg.kwargs == second.fc1.cfg.kwargs
+    first.fc1.cfg.kwargs["tile_n"] = 256
+    assert second.fc1.cfg.kwargs["tile_n"] == 128
 
 
 def test_mapping_revalidates_debug_mode_and_tactic(map_pair, monkeypatch):

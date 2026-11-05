@@ -69,10 +69,8 @@ def test_mutated_config_is_revalidated(builder):
     assert builder.call_args.kwargs["tile_k"] == 128
 
 
-@pytest.mark.parametrize(
-    "changed", [{"num_tokens": 256}, {"top_k": 2}, {"num_experts": 4}]
-)
-def test_dimensions_are_revalidated(builder, changed):
+@pytest.mark.parametrize("changed", [{"top_k": 2}, {"num_experts": 4}])
+def test_expert_dimensions_are_revalidated(builder, changed):
     validate()
     validate(**changed)
     assert builder.call_count == 2
@@ -101,10 +99,10 @@ def test_failed_validation_is_retried(builder):
 def test_cache_evicts_old_successes(builder):
     cache = config_mapper._validate_task_schedule_cached
     capacity = cache.cache_info().maxsize
-    for num_tokens in range(1, capacity + 2):
-        validate(num_tokens=num_tokens)
+    for tile_k in range(1, capacity + 2):
+        validate({"tile_n": 128, "tile_k": tile_k})
     assert cache.cache_info().currsize == capacity
-    validate(num_tokens=1)
+    validate({"tile_n": 128, "tile_k": 1})
     assert builder.call_count == capacity + 2
 
 
@@ -170,3 +168,92 @@ def test_default_tactic_does_not_swallow_unexpected_errors(builder):
             -1, activation_type=ActivationType.Relu2
         )
     assert builder.call_count == 1
+
+
+@pytest.mark.parametrize("use_early_exit", [0, 1])
+def test_token_counts_reuse_schedule_validation(builder, use_early_exit):
+    for num_tokens in (1, 127, 128, 129, 4495, 16736, 16914, 16926, 32768):
+        validate(
+            {"tile_n": 128, "tile_k": 64, "use_early_exit": use_early_exit},
+            num_tokens=num_tokens,
+            num_experts=512,
+            top_k=22,
+        )
+    assert builder.call_count == 1
+
+
+@pytest.mark.parametrize("tactic", [-1, [128, 0]])
+def test_bf16_pairs_reused_for_varying_prefill_batches(builder, tactic):
+    # These recorded batch sizes all resolve to the same default token tile.
+    pairs = [
+        config_mapper._resolve_bf16_moe_tactic(
+            tactic,
+            num_tokens=num_tokens,
+            top_k=22,
+            num_local_experts=512,
+            activation_type=ActivationType.Relu2,
+        )
+        for num_tokens in (16914, 16926, 4495, 16736, 16905, 16867, 16874, 16946)
+    ]
+    assert all(pair is pairs[0] for pair in pairs)
+    assert pairs[0].tile_n == 128
+    assert builder.call_count == 2  # FC1 and FC2 once, rather than per batch.
+
+
+def test_bf16_default_tile_still_tracks_actual_token_count(builder):
+    def resolve(num_tokens):
+        return config_mapper._resolve_bf16_moe_tactic(
+            -1,
+            num_tokens=num_tokens,
+            top_k=22,
+            num_local_experts=512,
+            activation_type=ActivationType.Relu2,
+        )
+
+    small = resolve(1)
+    large = resolve(16914)
+    assert small.tile_n == 8
+    assert large.tile_n == 128
+    assert small is not large
+    assert resolve(2) is small
+    assert resolve(16926) is large
+    assert builder.call_count == 4
+
+
+def test_default_and_selected_tactics_share_schedule_validation(builder):
+    for num_tokens in (16914, 16926, 16736):
+        for tactic in (-1, [128, 0]):
+            config_mapper._resolve_bf16_moe_tactic(
+                tactic,
+                num_tokens=num_tokens,
+                top_k=22,
+                num_local_experts=512,
+                activation_type=ActivationType.Relu2,
+            )
+    assert builder.call_count == 2
+
+
+def test_reused_pair_keeps_runtime_early_exit_bounds_shape_dependent(builder):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        resolve_early_exit_max_token_ctas,
+    )
+
+    pair = config_mapper._resolve_bf16_moe_tactic(
+        [128, 0],
+        num_tokens=16914,
+        top_k=22,
+        num_local_experts=512,
+        activation_type=ActivationType.Relu2,
+    )
+    config = dict(pair.fc1.cfg.config_items, use_early_exit=1)
+    small, large = (
+        resolve_early_exit_max_token_ctas(
+            num_tokens=num_tokens,
+            num_experts=512,
+            top_k=22,
+            cfg_overrides=config,
+        )
+        for num_tokens in (1, 16914)
+    )
+    assert small == 22
+    assert large > small
