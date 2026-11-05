@@ -19,13 +19,25 @@ Compile cache helpers for Prims-TS batched GEMM launches.
 from __future__ import annotations
 
 import functools
+import hashlib
+import os
+from pathlib import Path
+import tempfile
 import json
 from copy import copy
 from dataclasses import asdict, dataclass, fields, is_dataclass
 from typing import TYPE_CHECKING, Any
 
-from flashinfer.jit.cute_dsl_core import _get_compile_arch
-from flashinfer.prims_ts.utils import get_prims_ts_compile_options
+from flashinfer.jit.cute_dsl_core import (
+    JitSpecCuteDsl,
+    _get_compile_arch,
+    _hash_source_files,
+    cute_dsl_cache_disabled,
+)
+from flashinfer.prims_ts.utils import (
+    configure_cute_dsl_cache_dir,
+    get_prims_ts_compile_options,
+)
 
 from .config_mapper import (
     PrimsTsConfigSpec,
@@ -206,6 +218,73 @@ def find_compiled_gemm(cfg_hash: str, fc1_or_fc2: str, io: dict) -> Any | None:
     return _COMPILED_GEMM_CACHE.get(_compiled_gemm_key(cfg_hash, fc1_or_fc2, io))
 
 
+class _PrimsGemmJitSpec(JitSpecCuteDsl):
+    """Persist the native pointer/shape ABI without changing hot-path launches."""
+
+    def __init__(self, kernel_name: str, compile_fn: Any, source_sha256: str):
+        super().__init__(
+            "prims_ts_batched_gemm", kernel_name, compile_fn, source_sha256
+        )
+        # Image warmup already collects CUTE_DSL_CACHE_DIR, including objects.
+        self.module_dir = Path(configure_cute_dsl_cache_dir()) / self.module_dir_name
+        self.object_path = self.module_dir / f"{self.kernel_name}.o"
+
+    def _export_compiled_kernel(self, object_path: Path) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="tmp.", dir=self.module_dir
+        ) as directory:
+            self._compiled_kernel.export_to_c(directory, self.symbol)
+            os.replace(Path(directory) / f"{self.symbol}.o", object_path)
+
+    def _load_from_disk(self) -> Any:
+        import cutlass.cute as cute
+
+        module = cute.runtime.load_module(str(self.object_path))
+        return getattr(module, self.symbol)
+
+
+@functools.cache
+def _prims_gemm_source_hash() -> str:
+    from flashinfer.jit import cute_dsl_core
+
+    sources = tuple(Path(__file__).resolve().parents[1].rglob("*.py"))
+    return _hash_source_files((*sources, cute_dsl_core.__file__))
+
+
+def _gemm_argument_type(value: Any) -> Any:
+    if isinstance(value, (tuple, list)):
+        return [type(value).__name__, [_gemm_argument_type(v) for v in value]]
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int32" if -(1 << 31) <= value < (1 << 31) else "int64"
+    if isinstance(value, float):
+        return "float32"
+    if hasattr(value, "__get_mlir_types__"):
+        return [str(t) for t in value.__get_mlir_types__()]
+    raise TypeError(f"Unsupported Prims GEMM cache argument type: {type(value)}")
+
+
+def _gemm_disk_key(cfg_hash: str, fc: str, io: dict) -> str:
+    from cutlass._mlir import ir
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+        _compile_arg_tuple,
+        _generate_line_info_enabled,
+    )
+
+    # cfg is covered by cfg_hash; stream addresses and runtime values are not
+    # specializations. Pointer dtype/address space/alignment remain part of the ABI.
+    with ir.Context(), ir.Location.unknown():
+        arguments = [_gemm_argument_type(v) for v in _compile_arg_tuple(io, None)[:-2]]
+    key = json.dumps(
+        (cfg_hash, fc, get_compile_options(), _generate_line_info_enabled(), arguments),
+        sort_keys=True,
+    )
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
 def get_compiled_gemm(cfg_hash: str, fc1_or_fc2: str, io: dict, stream: Any) -> Any:
     """Compile and cache a TS GEMM for the supplied launch IO.
 
@@ -220,6 +299,14 @@ def get_compiled_gemm(cfg_hash: str, fc1_or_fc2: str, io: dict, stream: Any) -> 
         return _COMPILED_GEMM_CACHE[key]
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import _compile_for_launch
 
-    compiled = _compile_for_launch(io, stream)
+    if cute_dsl_cache_disabled():
+        compiled = _compile_for_launch(io, stream)
+    else:
+        spec = _PrimsGemmJitSpec(
+            _gemm_disk_key(cfg_hash, fc1_or_fc2, io),
+            lambda: _compile_for_launch(io, stream),
+            _prims_gemm_source_hash(),
+        )
+        compiled = spec.build_and_load()
     _COMPILED_GEMM_CACHE[key] = compiled
     return compiled
