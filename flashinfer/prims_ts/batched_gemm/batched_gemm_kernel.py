@@ -23,6 +23,8 @@ Entry points:
 import os
 from typing import Any
 
+from cuda.bindings.driver import CUstream
+
 from ..cutlass_dsl import require_cutlass_dsl_experimental, task_scheduling_scope
 
 require_cutlass_dsl_experimental()
@@ -1364,6 +1366,7 @@ def _batched_gemm_kernel_bf16_body(
     tma_c_desc: cutlass.GridConstant[cuda.TensorMap],
     tma_sfa_desc: cutlass.GridConstant[cuda.TensorMap],
     tma_sfb_desc: cutlass.GridConstant[cuda.TensorMap],
+    tma_local_weight_desc: cutlass.GridConstant[cuda.TensorMap],
     c_tensor: cute.Tensor,
     sf_c_tensor: cute.Tensor,
     bias_tensor: cute.Tensor,
@@ -1425,6 +1428,10 @@ def _batched_gemm_kernel_bf16_body(
         prims.prefetch_tensormap(tma_sfa_desc.get_ptr())
         prims.prefetch_tensormap(tma_sfb_desc.get_ptr())
     prims.prefetch_tensormap(tma_c_ptr)
+    tma_local_weight_ptr = None
+    if cutlass.const_expr(cfg.local_expert_count > 0):
+        tma_local_weight_ptr = tma_local_weight_desc.get_ptr()
+        prims.prefetch_tensormap(tma_local_weight_ptr)
 
     # tile_idx_tensor: maps token tiles to expert indices.
     # mn_limit_tensor: maps token tiles to TRT-LLM Gen absolute end-row limits.
@@ -1460,6 +1467,7 @@ def _batched_gemm_kernel_bf16_body(
         smem_a = SmemAResource(
             cfg=cfg,
             tma_a_desc=tma_a_ptr,
+            tma_local_weight_desc=tma_local_weight_ptr,
             pipeline_config=pcfgs["smem_a"],
             name="SmemA",
         )
@@ -1491,6 +1499,7 @@ def _batched_gemm_kernel_bf16_body(
         smem_b = SmemBResource(
             cfg=cfg,
             tma_b_desc=tma_b_ptr,
+            tma_local_weight_desc=tma_local_weight_ptr,
             pipeline_config=pcfgs["smem_b"],
             name="SmemB",
         )
@@ -1500,6 +1509,7 @@ def _batched_gemm_kernel_bf16_body(
         smem_a = SmemAResource(
             cfg=cfg,
             tma_a_desc=tma_a_ptr,
+            tma_local_weight_desc=tma_local_weight_ptr,
             pipeline_config=pcfgs["smem_a"],
             name="SmemA",
         )
@@ -1527,6 +1537,7 @@ def _batched_gemm_kernel_bf16_body(
         smem_b = SmemBResource(
             cfg=cfg,
             tma_b_desc=tma_b_ptr,
+            tma_local_weight_desc=tma_local_weight_ptr,
             pipeline_config=pcfgs["smem_b"],
             name="SmemB",
         )
@@ -1534,12 +1545,14 @@ def _batched_gemm_kernel_bf16_body(
         smem_a = SmemAResource(
             cfg=cfg,
             tma_a_desc=tma_a_ptr,
+            tma_local_weight_desc=tma_local_weight_ptr,
             pipeline_config=pcfgs["smem_a"],
             name="SmemA",
         )
         smem_b = SmemBResource(
             cfg=cfg,
             tma_b_desc=tma_b_ptr,
+            tma_local_weight_desc=tma_local_weight_ptr,
             pipeline_config=pcfgs["smem_b"],
             name="SmemB",
         )
@@ -2387,6 +2400,7 @@ def batched_gemm_kernel_bf16(
     tma_c_desc: cutlass.GridConstant[cuda.TensorMap],
     tma_sfa_desc: cutlass.GridConstant[cuda.TensorMap],
     tma_sfb_desc: cutlass.GridConstant[cuda.TensorMap],
+    tma_local_weight_desc: cutlass.GridConstant[cuda.TensorMap],
     c_tensor: cute.Tensor,
     sf_c_tensor: cute.Tensor,
     bias_tensor: cute.Tensor,
@@ -2417,91 +2431,120 @@ def batched_gemm_kernel_bf16(
     if cutlass.const_expr(cfg.do_pdl_wait_for_num_non_exiting_ctas):
         prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
-    if cutlass.const_expr(cfg.use_early_exit and not cfg.is_persistent):
-        # Dynamic-batch kernels launch a max token-CTA grid for
-        # CUDA graph reuse and skip inactive CTAs before touching routing tables.
-        num_non_exiting_ctas_view = cutlass.make_array_view(num_non_exiting_ctas_tensor)
-        num_non_exiting_ctas = num_non_exiting_ctas_view.load(
-            idx=Int32(0), vector_size=1
-        )[0]
-        block_m, block_n, _ = cute.arch.block_idx()
-        if cutlass.const_expr(cfg.is_swap_ab):
-            token_cta_idx = block_n
-        else:
-            token_cta_idx = block_m
-        if token_cta_idx < num_non_exiting_ctas:
-            _batched_gemm_kernel_bf16_body(
-                tma_a_desc,
-                tma_b_desc,
-                tma_c_desc,
-                tma_sfa_desc,
-                tma_sfb_desc,
-                c_tensor,
-                sf_c_tensor,
-                bias_tensor,
-                scale_c_tensor,
-                scale_gate_tensor,
-                gemm1_alpha_tensor,
-                gemm1_beta_tensor,
-                gemm1_clamp_limit_tensor,
-                per_token_sf_a_tensor,
-                per_token_sf_b_tensor,
-                tile_idx_tensor,
-                route_map_tensor,
-                mn_limit_tensor,
-                num_non_exiting_ctas_tensor,
-                total_num_padded_tokens_tensor,
-                act_tensor,
-                sfa_gmem_tensor,
-                sfb_gmem_tensor,
-                problem_m,
-                problem_n,
-                problem_k,
-                num_tokens,
-                num_experts,
-                tile_sched_params,
-                cfg,
-                early_exit_max_token_ctas,
-            )
-    else:
-        _batched_gemm_kernel_bf16_body(
-            tma_a_desc,
-            tma_b_desc,
-            tma_c_desc,
-            tma_sfa_desc,
-            tma_sfb_desc,
-            c_tensor,
-            sf_c_tensor,
-            bias_tensor,
-            scale_c_tensor,
-            scale_gate_tensor,
-            gemm1_alpha_tensor,
-            gemm1_beta_tensor,
-            gemm1_clamp_limit_tensor,
-            per_token_sf_a_tensor,
-            per_token_sf_b_tensor,
-            tile_idx_tensor,
-            route_map_tensor,
-            mn_limit_tensor,
-            num_non_exiting_ctas_tensor,
-            total_num_padded_tokens_tensor,
-            act_tensor,
-            sfa_gmem_tensor,
-            sfb_gmem_tensor,
-            problem_m,
-            problem_n,
-            problem_k,
-            num_tokens,
-            num_experts,
-            tile_sched_params,
-            cfg,
-            early_exit_max_token_ctas,
-        )
+    # Resource and allocator construction is compile-time bookkeeping. Keep
+    # it outside runtime control flow; the body guards task setup/execution
+    # after construction so inactive CTAs still skip routing-table accesses.
+    _batched_gemm_kernel_bf16_body(
+        tma_a_desc,
+        tma_b_desc,
+        tma_c_desc,
+        tma_sfa_desc,
+        tma_sfb_desc,
+        tma_local_weight_desc,
+        c_tensor,
+        sf_c_tensor,
+        bias_tensor,
+        scale_c_tensor,
+        scale_gate_tensor,
+        gemm1_alpha_tensor,
+        gemm1_beta_tensor,
+        gemm1_clamp_limit_tensor,
+        per_token_sf_a_tensor,
+        per_token_sf_b_tensor,
+        tile_idx_tensor,
+        route_map_tensor,
+        mn_limit_tensor,
+        num_non_exiting_ctas_tensor,
+        total_num_padded_tokens_tensor,
+        act_tensor,
+        sfa_gmem_tensor,
+        sfb_gmem_tensor,
+        problem_m,
+        problem_n,
+        problem_k,
+        num_tokens,
+        num_experts,
+        tile_sched_params,
+        cfg,
+        early_exit_max_token_ctas,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Host-side launcher
 # ---------------------------------------------------------------------------
+
+
+@cute.jit
+def _make_operand_layouts(
+    m, n, k, num_experts_dim, cfg: cutlass.Constexpr[BatchedGemmConfig]
+):
+    # Individual dimensions fit in Int32, but strides and address products may
+    # not. Widen before arithmetic; casting an overflowed product is too late.
+    m64, n64, k64 = cutlass.Int64(m), cutlass.Int64(n), cutlass.Int64(k)
+    # TMA route (gather4): the routed operand is 2D (K, total_rows) flat.
+    # TmaOobOpt: non-routed activations use a 4D out-of-bounds TMA descriptor.
+    # Non-swapAB: A=activations (routed 2D), B=weights (3D).
+    # SwapAB:     A=weights (3D), B=activations (routed 2D).
+    # No route:   activation operand may be 4D OOB; weights stay 3D.
+    if cutlass.const_expr(cfg.uses_block_major_k_weight_a):
+        a_block_k = cfg.block_major_k_elems
+        a_layout = cute.make_layout(
+            (a_block_k, m, cute.assume(k // a_block_k, 1), num_experts_dim),
+            stride=(
+                1,
+                a_block_k,
+                cute.assume(m64 * a_block_k, 32),
+                cute.assume(m64 * k64, 32),
+            ),
+        )
+    elif cutlass.const_expr(cfg.has_tma_route and not cfg.is_swap_ab):
+        a_layout = cute.make_layout(
+            (cute.assume(k, 32), m), stride=(1, cute.assume(k64, 32))
+        )
+    elif cutlass.const_expr(cfg.use_bf16_kbox_tma_a):
+        a_layout = cute.make_layout(
+            (64, m, cute.assume(k // 64, 1), num_experts_dim),
+            stride=(1, cute.assume(k64, 32), 64, cute.assume(m64 * k64, 32)),
+        )
+    elif cutlass.const_expr(cfg.use_tma_oob_opt_a):
+        a_layout = cute.make_layout(
+            (cute.assume(k, 32), cfg.tile_m, TMA_DIM_MAX, TMA_DIM_MAX),
+            stride=(1, cute.assume(k64, 32), TMA_XLARGE_N - k64, cute.assume(k64, 32)),
+        )
+    else:
+        a_layout = cute.make_layout(
+            (cute.assume(k, 32), m, num_experts_dim),
+            stride=(1, cute.assume(k64, 32), cute.assume(m64 * k64, 32)),
+        )
+
+    if cutlass.const_expr(cfg.uses_block_major_k_weight_b):
+        b_block_k = cfg.block_major_k_elems
+        b_layout = cute.make_layout(
+            (b_block_k, n, cute.assume(k // b_block_k, 1), num_experts_dim),
+            stride=(
+                1,
+                b_block_k,
+                cute.assume(n64 * b_block_k, 32),
+                cute.assume(n64 * k64, 32),
+            ),
+        )
+    elif cutlass.const_expr(cfg.has_tma_route and cfg.is_swap_ab):
+        b_layout = cute.make_layout(
+            (cute.assume(k, 32), n), stride=(1, cute.assume(k64, 32))
+        )
+    elif cutlass.const_expr(cfg.use_tma_oob_opt_b):
+        b_layout = cute.make_layout(
+            (cute.assume(k, 32), cfg.tile_n, TMA_DIM_MAX, TMA_DIM_MAX),
+            stride=(1, cute.assume(k64, 32), TMA_XLARGE_N - k64, cute.assume(k64, 32)),
+        )
+    else:
+        b_layout = cute.make_layout(
+            (cute.assume(k, 32), n, num_experts_dim),
+            stride=(1, cute.assume(k64, 32), cute.assume(n64 * k64, 32)),
+        )
+
+    return a_layout, b_layout
 
 
 @cute.jit
@@ -2526,10 +2569,11 @@ def gemm(
     gemm1_alpha_raw_ptr,
     gemm1_beta_raw_ptr,
     gemm1_clamp_limit_raw_ptr,
+    local_weight_raw_ptr,
     problem_size: tuple,
     early_exit_max_token_ctas: cutlass.Int32,
     cfg: cutlass.Constexpr[BatchedGemmConfig],
-    stream,
+    stream: CUstream,
 ):
     """Host-side: create TMA descs and launch kernel."""
     m, n, k, num_experts_dim, num_tokens = problem_size
@@ -2545,72 +2589,8 @@ def gemm(
     per_token_sf_a_ptr = per_token_sf_a_raw_ptr
     per_token_sf_b_ptr = per_token_sf_b_raw_ptr
 
-    # TMA route (gather4): the routed operand is 2D (K, total_rows) flat.
-    # TmaOobOpt: non-routed activations use a 4D out-of-bounds TMA descriptor.
-    # Non-swapAB: A=activations (routed 2D), B=weights (3D).
-    # SwapAB:     A=weights (3D), B=activations (routed 2D).
-    # No route:   activation operand may be 4D OOB; weights stay 3D.
-    if cutlass.const_expr(cfg.uses_block_major_k_weight_a):
-        a_block_k = cfg.block_major_k_elems
-        a_layout = cute.make_layout(
-            (a_block_k, m, cute.assume(k // a_block_k, 1), num_experts_dim),
-            stride=(
-                1,
-                a_block_k,
-                cute.assume(m * a_block_k, 32),
-                cute.assume(m * k, 32),
-            ),
-        )
-        a_tensor = cute.make_tensor(a_ptr, a_layout)
-    elif cutlass.const_expr(cfg.has_tma_route and not cfg.is_swap_ab):
-        a_layout = cute.make_layout(
-            (cute.assume(k, 32), m), stride=(1, cute.assume(k, 32))
-        )
-        a_tensor = cute.make_tensor(a_ptr, a_layout)
-    elif cutlass.const_expr(cfg.use_bf16_kbox_tma_a):
-        a_layout = cute.make_layout(
-            (64, m, cute.assume(k // 64, 1), num_experts_dim),
-            stride=(1, cute.assume(k, 32), 64, cute.assume(m * k, 32)),
-        )
-        a_tensor = cute.make_tensor(a_ptr, a_layout)
-    elif cutlass.const_expr(cfg.use_tma_oob_opt_a):
-        a_layout = cute.make_layout(
-            (cute.assume(k, 32), cfg.tile_m, TMA_DIM_MAX, TMA_DIM_MAX),
-            stride=(1, cute.assume(k, 32), TMA_XLARGE_N - k, cute.assume(k, 32)),
-        )
-        a_tensor = cute.make_tensor(a_ptr, a_layout)
-    else:
-        a_layout = cute.make_layout(
-            (cute.assume(k, 32), m, num_experts_dim),
-            stride=(1, cute.assume(k, 32), cute.assume(m * k, 32)),
-        )
-        a_tensor = cute.make_tensor(a_ptr, a_layout)
-
-    if cutlass.const_expr(cfg.uses_block_major_k_weight_b):
-        b_block_k = cfg.block_major_k_elems
-        b_layout = cute.make_layout(
-            (b_block_k, n, cute.assume(k // b_block_k, 1), num_experts_dim),
-            stride=(
-                1,
-                b_block_k,
-                cute.assume(n * b_block_k, 32),
-                cute.assume(n * k, 32),
-            ),
-        )
-    elif cutlass.const_expr(cfg.has_tma_route and cfg.is_swap_ab):
-        b_layout = cute.make_layout(
-            (cute.assume(k, 32), n), stride=(1, cute.assume(k, 32))
-        )
-    elif cutlass.const_expr(cfg.use_tma_oob_opt_b):
-        b_layout = cute.make_layout(
-            (cute.assume(k, 32), cfg.tile_n, TMA_DIM_MAX, TMA_DIM_MAX),
-            stride=(1, cute.assume(k, 32), TMA_XLARGE_N - k, cute.assume(k, 32)),
-        )
-    else:
-        b_layout = cute.make_layout(
-            (cute.assume(k, 32), n, num_experts_dim),
-            stride=(1, cute.assume(k, 32), cute.assume(n * k, 32)),
-        )
+    a_layout, b_layout = _make_operand_layouts(m, n, k, num_experts_dim, cfg)
+    a_tensor = cute.make_tensor(a_ptr, a_layout)
     b_tensor = cute.make_tensor(b_ptr, b_layout)
 
     def _tma_format_for_dtype(dtype_kind: int, native_fp4: bool = False):
@@ -2742,6 +2722,38 @@ def gemm(
                 tma_format=tma_format_b,
             )
 
+    tma_local_weight_desc = None
+    if cutlass.const_expr(cfg.local_expert_count > 0):
+        local_rows = m if cutlass.const_expr(cfg.is_swap_ab) else n
+        local_block_k = cfg.block_major_k_elems
+        local_weight = cute.make_tensor(
+            local_weight_raw_ptr,
+            cute.make_layout(
+                (local_block_k, local_rows, k // local_block_k, cfg.local_expert_count),
+                stride=(
+                    1,
+                    local_block_k,
+                    cutlass.Int64(local_rows) * local_block_k,
+                    cutlass.Int64(local_rows) * k,
+                ),
+            ),
+        )
+        local_box_rows = (
+            cfg.tile_m if cutlass.const_expr(cfg.is_swap_ab) else b_box_rows
+        )
+        tma_local_weight_desc = cuda.create_tensor_map_tiled_from_tensor(
+            tensor=local_weight,
+            box_dims=(
+                cfg.block_major_k_tile_block_elems,
+                local_box_rows,
+                cfg.block_major_k_tile_slices,
+                1,
+            ),
+            stride_order=(0, 1, 2, 3),
+            swizzle=tma_swizzle,
+            tma_format=TensorMapDataFormat.DEFAULT,
+        )
+
     # SF TMA descriptors (only for FP4/FP8/CastA with scale factors).
     # E8M0 scale factors are packed 2 per uint16 for TMA transport.
     tma_sfa_desc = None
@@ -2751,7 +2763,7 @@ def gemm(
         sf_tma_ptr_dtype = cutlass.Uint8
         # Each K-block = 4 SF atoms. dim0 = tile_mn * 4 / 2 (uint16 packing)
         k_atoms_per_block = 4
-        rest_k_blocks = k // sf_vec_size // k_atoms_per_block
+        rest_k_blocks = cutlass.Int64(k) // sf_vec_size // k_atoms_per_block
         rest_k_per_tile = cfg.tile_k // sf_vec_size // k_atoms_per_block
 
         sf_k_per_tile = cfg.tile_k // sf_vec_size  # SF elements per K-tile
@@ -2760,19 +2772,19 @@ def gemm(
         # Folds expert L into the weight operand's outer row
         # extent. The no-route activation operand is already expanded/padded
         # by token row and does not use a separate expert dimension.
-        sfa_outer_rows = m
+        sfa_outer_rows = cutlass.Int64(m)
         if cutlass.const_expr(cfg.is_swap_ab):
-            sfa_outer_rows = m * num_experts_dim
-        sfb_outer_rows = n
+            sfa_outer_rows = cutlass.Int64(m) * num_experts_dim
+        sfb_outer_rows = cutlass.Int64(n)
         if cutlass.const_expr(not cfg.is_swap_ab):
-            sfb_outer_rows = n * num_experts_dim
+            sfb_outer_rows = cutlass.Int64(n) * num_experts_dim
 
         # SFA descriptor: routed TMA gather4 (2D linear) or regular tiled SF layout.
         # LDGSTS-routed SF bypasses TensorMap encoding and uses raw GMEM tensors.
         if cutlass.const_expr(uses_routed_sfa_tma_desc(cfg)):
             # 2D linear layout: (K/sf_vec_size, total_tokens) for gather4.
             # Pad sf_k to 16-byte alignment (TMA requirement).
-            sf_k_total = ((k // sf_vec_size + 15) // 16) * 16
+            sf_k_total = ((cutlass.Int64(k) // sf_vec_size + 15) // 16) * 16
             sfa_2d_layout = cute.make_layout(
                 (sf_k_total, m),
                 stride=(1, sf_k_total),
@@ -2850,7 +2862,7 @@ def gemm(
         # LDGSTS-routed SF bypasses TensorMap encoding and uses raw GMEM tensors.
         if cutlass.const_expr(uses_routed_sfb_tma_desc(cfg)):
             # 2D linear layout: (K/sf_vec_size, total_tokens) for gather4
-            sf_k_total = ((k // sf_vec_size + 15) // 16) * 16
+            sf_k_total = ((cutlass.Int64(k) // sf_vec_size + 15) // 16) * 16
             sfb_2d_layout = cute.make_layout(
                 (sf_k_total, n),
                 stride=(1, sf_k_total),
@@ -2999,9 +3011,9 @@ def gemm(
         grid = (launch_num_tiles_m, launch_num_tiles_n, 1)
 
     # C output tensor
-    output_m_for_c = m
+    output_m_for_c = cutlass.Int64(m)
     if cutlass.const_expr(cfg.is_swap_ab and cfg.has_gated_epilogue):
-        output_m_for_c = m // Int32(2)
+        output_m_for_c = cutlass.Int64(m) // Int32(2)
     if cutlass.const_expr(cfg.is_swap_ab):
         # SwapAB: C is (M, N) in M-major (column-major) layout.
         # M = hidden dim (stride-1), N = tokens (stride-M).
@@ -3045,7 +3057,7 @@ def gemm(
         # Non-swapAB: C is (M, N) row-major.
         c_layout = cute.make_layout(
             (cute.assume(m, 32), cute.assume(n, 16)),
-            stride=(cute.assume(n, 16), 1),
+            stride=(cute.assume(cutlass.Int64(n), 16), 1),
         )
     if cutlass.const_expr(cfg.has_epilogue_quant or cfg.uses_fp8_output):
         c_quant_dtype = (
@@ -3128,18 +3140,18 @@ def gemm(
                 tma_format=tma_c_format,
             )
 
-    output_m_for_sf = m
+    output_m_for_sf = cutlass.Int64(m)
     if cutlass.const_expr(cfg.is_swap_ab and cfg.has_gated_epilogue):
-        output_m_for_sf = m // Int32(2)
+        output_m_for_sf = cutlass.Int64(m) // Int32(2)
     if cutlass.const_expr(cfg.has_epilogue_quant):
         sf_block_m = Int32(cfg.output_sf_block_size_c)
         sf_group_m = sf_block_m * Int32(4)
         if cutlass.const_expr(cfg.sf_layout_c == int(SfLayout.R8c4)):
-            sf_c_elems = ((n + Int32(7)) // Int32(8)) * (
+            sf_c_elems = ((cutlass.Int64(n) + Int32(7)) // Int32(8)) * (
                 ((output_m_for_sf + sf_group_m - Int32(1)) // sf_group_m) * Int32(32)
             )
         else:
-            sf_c_elems = ((n + Int32(127)) // Int32(128)) * (
+            sf_c_elems = ((cutlass.Int64(n) + Int32(127)) // Int32(128)) * (
                 ((output_m_for_sf + sf_group_m - Int32(1)) // sf_group_m) * Int32(512)
             )
         sf_c_layout = cute.make_layout((sf_c_elems,), stride=(1,))
@@ -3147,7 +3159,9 @@ def gemm(
         if cutlass.const_expr(cfg.is_swap_ab):
             sf_c_elems = ((output_m_for_sf + Int32(127)) // Int32(128)) * n
         else:
-            sf_c_elems = ((n + Int32(127)) // Int32(128)) * output_m_for_sf
+            sf_c_elems = (
+                (cutlass.Int64(n) + Int32(127)) // Int32(128)
+            ) * output_m_for_sf
         sf_c_layout = cute.make_layout((sf_c_elems,), stride=(1,))
     else:
         sf_c_layout = cute.make_layout((1,), stride=(1,))
@@ -3169,7 +3183,7 @@ def gemm(
 
     bias_layout = cute.make_layout(
         (cute.assume(m, 32), num_experts_dim),
-        stride=(1, cute.assume(m, 32)),
+        stride=(1, cute.assume(cutlass.Int64(m), 32)),
     )
     bias_tensor = cute.make_tensor(bias_raw_ptr, bias_layout)
 
@@ -3252,10 +3266,12 @@ def gemm(
         else:
             ds_act_rows = n if cfg.is_swap_ab else m
         sfa_gmem_layout = cute.make_layout(
-            (num_experts_dim * ds_weight_tiles * ds_k_blocks,),
+            (cutlass.Int64(num_experts_dim) * ds_weight_tiles * ds_k_blocks,),
             stride=(1,),
         )
-        sfb_gmem_layout = cute.make_layout((ds_act_rows * ds_k_blocks,), stride=(1,))
+        sfb_gmem_layout = cute.make_layout(
+            (cutlass.Int64(ds_act_rows) * ds_k_blocks,), stride=(1,)
+        )
         sfa_gmem_tensor = cute.make_tensor(
             cute.recast_ptr(sfa_ptr, dtype=cutlass.Float32), sfa_gmem_layout
         )
@@ -3267,8 +3283,12 @@ def gemm(
         sf_dtype = (
             cutlass.Float8E8M0FNU if cfg.uses_mx_scale_factors else cutlass.Float8E4M3FN
         )
-        sfa_gmem_layout = cute.make_layout((m * (k // cfg.sf_vec_size),), stride=(1,))
-        sfb_gmem_layout = cute.make_layout((n * (k // cfg.sf_vec_size),), stride=(1,))
+        sfa_gmem_layout = cute.make_layout(
+            (cutlass.Int64(m) * (k // cfg.sf_vec_size),), stride=(1,)
+        )
+        sfb_gmem_layout = cute.make_layout(
+            (cutlass.Int64(n) * (k // cfg.sf_vec_size),), stride=(1,)
+        )
         sfa_gmem_tensor = cute.make_tensor(
             cute.recast_ptr(sfa_ptr, dtype=sf_dtype), sfa_gmem_layout
         )
@@ -3292,6 +3312,7 @@ def gemm(
         tma_c_desc,
         tma_sfa_desc,
         tma_sfb_desc,
+        tma_local_weight_desc,
         c_tensor,
         sf_c_tensor,
         bias_tensor,

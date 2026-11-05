@@ -191,6 +191,9 @@ class BatchedGemmConfig:
         :attr:`num_load_sfb_warps`, which are honored only when ``> 1``.
     """
 
+    local_expert_start: int = 0
+    local_expert_count: int = 0
+
     # --- Shape ---
     cluster_m: int = 1
     """Number of CTAs per cluster along the M axis.
@@ -2566,6 +2569,13 @@ def validate_config(
     Called at the top of kernel assembly (both validation and GPU paths).
     """
     # ── Hard errors: combinations that are known to fail or are nonsensical ──
+
+    if cfg.local_expert_start < 0 or cfg.local_expert_count < 0:
+        raise ValueError("Resident expert ranges must be nonnegative")
+    if cfg.local_expert_count and (
+        not cfg.uses_block_major_k_weight or cfg.weight_dtype_kind != int(DType.BF16)
+    ):
+        raise ValueError("Resident expert buffers require BF16 BlockMajorK weights")
 
     if cfg.batch_mode not in (int(BatchMode.BATCH_N), int(BatchMode.BATCH_M)):
         raise ValueError(f"batch_mode must be BATCH_N or BATCH_M, got {cfg.batch_mode}")

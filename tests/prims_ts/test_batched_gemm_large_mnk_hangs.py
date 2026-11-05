@@ -335,3 +335,43 @@ def test_mxe4m3_ldgsts_routed_sfs_does_not_hang():
         use_unroll_loop_2x_for_mma=0,
         workid_regs=48,
     )
+
+
+def test_bf16_moe_expanded_activation_stride_exceeds_int32():
+    """FC2 TMA descriptors must support expanded activations above 2**31 elements."""
+    from flashinfer.fused_moe import prims_ts_bf16_routed_moe
+    from flashinfer.tllm_enums import ActivationType, WeightLayout
+
+    if torch.cuda.mem_get_info()[0] < 14 * 2**30:
+        pytest.skip("Requires 14 GiB free GPU memory")
+    tokens, experts, top_k, hidden, intermediate = 33920, 512, 22, 1024, 2688
+    weights = [
+        torch.full((experts, k // 64, n, 64), 1e-4, dtype=torch.bfloat16, device="cuda")
+        for n, k in [(intermediate, hidden), (hidden, intermediate)]
+    ]
+    x = torch.ones(tokens, hidden, dtype=torch.bfloat16, device="cuda")
+    ids = (
+        torch.arange(tokens * top_k, device="cuda").reshape(tokens, top_k) % experts
+    ).int()
+    scores = torch.full((tokens, top_k), 1 / top_k, dtype=torch.bfloat16, device="cuda")
+    result = prims_ts_bf16_routed_moe(
+        (ids, scores),
+        x,
+        *weights,
+        num_experts=experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate,
+        local_expert_offset=0,
+        local_num_experts=experts,
+        weight_layout=WeightLayout.BlockMajorK,
+        activation_type=ActivationType.Relu2,
+    )
+    weight = torch.tensor(1e-4, dtype=torch.bfloat16).float()
+    fc1 = ((hidden * weight).square()).bfloat16().float()
+    fc2 = (intermediate * weight * fc1).bfloat16().float()
+    expected = fc2 * top_k * torch.tensor(1 / top_k, dtype=torch.bfloat16).float()
+    torch.testing.assert_close(
+        result.float(), torch.full_like(result.float(), expected), rtol=1e-2, atol=1e-6
+    )

@@ -19,11 +19,13 @@ Map Prims-TS MoE autotuner tactics to local Prims-TS GEMM configs.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from copy import copy
+from dataclasses import dataclass, replace
 from enum import IntEnum
 from functools import lru_cache
 from importlib import resources
 import math
+import os
 from typing import Sequence
 
 from flashinfer.tllm_enums import ActivationType, WeightLayout
@@ -98,10 +100,57 @@ class PrimsTsConfigSpec:
 
     kwargs: dict[str, int]
 
-    def build(self) -> object:
-        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config
+    @property
+    def block_major_k_bytes(self) -> int:
+        """Storage size for validation, without materializing a mutable config."""
+        return _block_major_k_bytes_cached(tuple(sorted(self.kwargs.items())))
 
-        return make_config(**self.kwargs)
+    def build(self) -> object:
+        # Kernel assembly mutates warp layout fields. Never expose the cached
+        # template; its fields are scalar integers, so a shallow copy suffices.
+        return copy(_build_config_cached(tuple(sorted(self.kwargs.items()))))
+
+
+@lru_cache(maxsize=1024)
+def _build_config_cached(config_items: tuple[tuple[str, int], ...]) -> object:
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config
+
+    return make_config(**dict(config_items))
+
+
+@lru_cache(maxsize=1024)
+def _block_major_k_bytes_cached(config_items: tuple[tuple[str, int], ...]) -> int:
+    return int(_build_config_cached(config_items).block_major_k_bytes)
+
+
+@dataclass(frozen=True)
+class _ImmutablePrimsTsConfigSpec:
+    """Internal scalar-only spec shared across BF16 calls.
+
+    Assembly receives a separate mutable config; neither tensors nor mutable
+    option dictionaries are retained here.
+    """
+
+    config_items: tuple[tuple[str, int], ...]
+    weight_layout: int
+    weight_dtype_tma_bits: int
+    block_major_k_bytes: int
+
+    def build(self) -> object:
+        return copy(_build_config_cached(self.config_items))
+
+
+@lru_cache(maxsize=1024)
+def _immutable_config_spec_cached(
+    config_items: tuple[tuple[str, int], ...],
+) -> _ImmutablePrimsTsConfigSpec:
+    cfg = _build_config_cached(config_items)
+    return _ImmutablePrimsTsConfigSpec(
+        config_items=config_items,
+        weight_layout=int(cfg.weight_layout),
+        weight_dtype_tma_bits=int(cfg.weight_dtype_tma_bits),
+        block_major_k_bytes=int(cfg.block_major_k_bytes),
+    )
 
 
 @dataclass(frozen=True)
@@ -135,6 +184,7 @@ class _JsonBatchedGemmConfig:
     combo_index: int
     options: dict[str, object]
     is_scheduler_union_variant: bool = False
+    is_pipeline_union_variant: bool = False
 
 
 _SUPPORTED_JSON_OPTION_KEYS = frozenset(
@@ -615,6 +665,36 @@ def _expanded_prims_ts_json_configs() -> tuple[_JsonBatchedGemmConfig, ...]:
         )
         _validate_json_options(variant, options)
         expanded.append(variant)
+    # A quarter-width BF16 ReLU2 epilogue frees SMEM for deeper input pipelines.
+    # Append after scheduler variants to preserve every existing global index.
+    for cfg in tuple(expanded):
+        options = cfg.options
+        if not (
+            all(options.get(key) == "bf16" for key in ("dtype_a", "dtype_b", "dtype_c"))
+            and options.get("eltwise_act_type") == "relu2"
+            and options.get("tile_scheduler") == "persistent"
+            and options.get("tile_n") == 128
+            and options.get("tile_k") == 64
+            and options.get("epi_tile_n") == 128
+            and options.get("cluster_m") == 2
+            and options.get("num_stages_a") == 6
+            and options.get("num_stages_b") == 6
+        ):
+            continue
+        expanded.append(
+            replace(
+                cfg,
+                global_index=len(expanded),
+                comment=f"{cfg.comment} [8/9-stage, epilogue32]",
+                options={
+                    **options,
+                    "epi_tile_n": 32,
+                    "num_stages_a": 8,
+                    "num_stages_b": 9,
+                },
+                is_pipeline_union_variant=True,
+            )
+        )
     return tuple(expanded)
 
 
@@ -855,13 +935,18 @@ def _resolve_moe_json_config_pair(
             )
         )
     else:
-        # Appended union variants must not reinterpret any persisted baseline
-        # pair index. Keep the complete original FC1 x FC2 product first and
-        # place every pair involving a new scheduler variant afterward.
+        # Preserve the original product, then its scheduler union, before
+        # appending pairs using the new input/epilogue pipeline.
         config_pairs.sort(
-            key=lambda pair: int(
-                _json_config_by_global_index(pair[0]).is_scheduler_union_variant
-                or _json_config_by_global_index(pair[1]).is_scheduler_union_variant
+            key=lambda pair: (
+                int(
+                    _json_config_by_global_index(pair[0]).is_pipeline_union_variant
+                    or _json_config_by_global_index(pair[1]).is_pipeline_union_variant
+                ),
+                int(
+                    _json_config_by_global_index(pair[0]).is_scheduler_union_variant
+                    or _json_config_by_global_index(pair[1]).is_scheduler_union_variant
+                ),
             )
         )
     total = len(config_pairs)
@@ -1203,20 +1288,46 @@ def _ensure_config_task_manager_buildable(
     top_k: int | None = None,
     num_experts: int | None = None,
 ) -> None:
+    # Task-manager validation builds a synthetic schedule from the config, not
+    # the runtime token extent. The builder computes (then discards) that extent;
+    # actual launch bounds are resolved separately with the real token count.
+    # Reuse validation across batch sizes without changing tactic selection.
+    del num_tokens
+    validation_top_k = max(1, int(top_k or 1))
+    validation_num_experts = max(validation_top_k, int(num_experts or 2))
+    _validate_task_schedule_cached(
+        tuple(sorted(spec.kwargs.items())),
+        num_experts=validation_num_experts,
+        top_k=validation_top_k,
+        debug_checks=os.environ.get("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "0").lower(),
+    )
+
+
+@lru_cache(maxsize=1024)
+def _validate_task_schedule_cached(
+    config_items: tuple[tuple[str, int], ...],
+    *,
+    num_experts: int,
+    top_k: int,
+    debug_checks: str,
+) -> None:
+    """Remember successful CPU schedule validation without retaining managers."""
     from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
         build_batched_gemm_task_manager,
     )
 
-    validation_top_k = max(1, int(top_k or 1))
-    validation_num_experts = max(validation_top_k, int(num_experts or 2))
+    # The builder reads this environment setting itself; include it in the key
+    # so enabling debug checks cannot reuse a less thoroughly validated result.
+    del debug_checks
     manager = build_batched_gemm_task_manager(
-        num_experts=validation_num_experts,
-        num_tokens=max(1, int(num_tokens or 128)),
-        top_k=validation_top_k,
+        num_experts=num_experts,
+        num_tokens=128,
+        top_k=top_k,
         verbose=False,
-        **spec.kwargs,
+        **dict(config_items),
     )
     _task_manager_smem_bytes(manager)
+    # lru_cache stores only this successful None return, never exceptions.
 
 
 def _ensure_pair_buildable(
@@ -1319,29 +1430,51 @@ def _make_default_json_moe_config_pair(
     )
     if not fc1_indices or not fc2_indices:
         return None
-    return _make_json_moe_config_pair(
-        tile_n=tile_n,
-        moe_config_index=0,
-        activation_type=activation_type,
-        dtype_a=dtype_a,
-        dtype_b=dtype_b,
-        fc1_dtype_c=fc1_dtype_c,
-        fc2_dtype_c=fc2_dtype_c,
-        dtype_label=dtype_label,
-        fc1_has_bias=fc1_has_bias,
-        fc2_has_bias=fc2_has_bias,
-        use_deepseek_fp8=use_deepseek_fp8,
-        fc1_use_per_token_sf_a=fc1_use_per_token_sf_a,
-        fc2_use_per_token_sf_a=fc2_use_per_token_sf_a,
-        fc1_use_per_token_sf_b=fc1_use_per_token_sf_b,
-        fc2_use_per_token_sf_b=fc2_use_per_token_sf_b,
-        per_token_sf_dtype=per_token_sf_dtype,
-        weight_layout=weight_layout,
-        has_gemm1_alpha=has_gemm1_alpha,
-        has_gemm1_beta=has_gemm1_beta,
-        has_gemm1_clamp_limit=has_gemm1_clamp_limit,
-        enable_pdl=enable_pdl,
-    )
+    # JSON matching alone does not establish that a schedule fits in SMEM.
+    # Preserve tactic indices and try each pair before moving to another tile.
+    last_error = None
+    for config_index in range(len(fc1_indices) * len(fc2_indices)):
+        try:
+            pair = _make_json_moe_config_pair(
+                tile_n=tile_n,
+                moe_config_index=config_index,
+                activation_type=activation_type,
+                dtype_a=dtype_a,
+                dtype_b=dtype_b,
+                fc1_dtype_c=fc1_dtype_c,
+                fc2_dtype_c=fc2_dtype_c,
+                dtype_label=dtype_label,
+                fc1_has_bias=fc1_has_bias,
+                fc2_has_bias=fc2_has_bias,
+                use_deepseek_fp8=use_deepseek_fp8,
+                fc1_use_per_token_sf_a=fc1_use_per_token_sf_a,
+                fc2_use_per_token_sf_a=fc2_use_per_token_sf_a,
+                fc1_use_per_token_sf_b=fc1_use_per_token_sf_b,
+                fc2_use_per_token_sf_b=fc2_use_per_token_sf_b,
+                per_token_sf_dtype=per_token_sf_dtype,
+                weight_layout=weight_layout,
+                has_gemm1_alpha=has_gemm1_alpha,
+                has_gemm1_beta=has_gemm1_beta,
+                has_gemm1_clamp_limit=has_gemm1_clamp_limit,
+                enable_pdl=enable_pdl,
+            )
+            if pair is None:
+                continue
+            _ensure_pair_buildable(
+                pair,
+                dtype_label=dtype_label,
+                num_tokens=num_tokens,
+                top_k=top_k,
+                num_experts=num_experts,
+            )
+        except ValueError as exc:
+            last_error = exc
+            continue
+        return pair
+    raise ValueError(
+        f"No buildable local Prims-TS MoE config for {dtype_label} tile_N={tile_n}: "
+        f"{last_error}"
+    ) from last_error
 
 
 def _required_json_moe_config_pair(
@@ -1356,20 +1489,25 @@ def _required_json_moe_config_pair(
     **kwargs,
 ) -> PrimsTsGemmPair:
     pair = None
+    last_error = None
     if moe_config_index == -1:
         for candidate_tile_n in fallback_tile_ns or _fallback_tile_ns_for_label(
             dtype_label, tile_n
         ):
-            pair = _make_default_json_moe_config_pair(
-                tile_n=candidate_tile_n,
-                dtype_label=dtype_label,
-                num_tokens=num_tokens,
-                top_k=top_k,
-                num_experts=num_experts,
-                **kwargs,
-            )
+            try:
+                pair = _make_default_json_moe_config_pair(
+                    tile_n=candidate_tile_n,
+                    dtype_label=dtype_label,
+                    num_tokens=num_tokens,
+                    top_k=top_k,
+                    num_experts=num_experts,
+                    **kwargs,
+                )
+            except ValueError as exc:
+                last_error = exc
+                continue
             if pair is not None:
-                break
+                return pair
     else:
         pair = _make_json_moe_config_pair(
             tile_n=tile_n,
@@ -1381,7 +1519,8 @@ def _required_json_moe_config_pair(
         raise ValueError(
             "No buildable local Prims-TS MoE config found for "
             f"{dtype_label} tile_N={tile_n}, config_index={moe_config_index}"
-        )
+            + (f": {last_error}" if last_error is not None else "")
+        ) from last_error
     _ensure_pair_buildable(
         pair,
         dtype_label=dtype_label,
@@ -1724,6 +1863,53 @@ def map_trtllm_bf16_moe_tactic(
 ) -> PrimsTsGemmPair:
     """Return Prims-TS FC1/FC2 configs for a Prims-TS BF16 MoE tactic."""
 
+    pair = _resolve_bf16_moe_tactic(
+        tactic,
+        activation_type=activation_type,
+        num_tokens=num_tokens,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        fc1_has_bias=fc1_has_bias,
+        fc2_has_bias=fc2_has_bias,
+        has_gemm1_alpha=has_gemm1_alpha,
+        has_gemm1_beta=has_gemm1_beta,
+        has_gemm1_clamp_limit=has_gemm1_clamp_limit,
+        enable_pdl=enable_pdl,
+        weight_layout=weight_layout,
+    )
+
+    # Keep the public mutable-spec contract without exposing internal state.
+    return PrimsTsGemmPair(
+        pair.tile_n,
+        pair.moe_config_index,
+        PrimsTsMoeGemmConfig(
+            PrimsTsConfigSpec(dict(pair.fc1.cfg.config_items)),
+            pair.fc1.prims_ts_gemm_config_index,
+        ),
+        PrimsTsMoeGemmConfig(
+            PrimsTsConfigSpec(dict(pair.fc2.cfg.config_items)),
+            pair.fc2.prims_ts_gemm_config_index,
+        ),
+    )
+
+
+def _resolve_bf16_moe_tactic(
+    tactic: int | Sequence[int],
+    *,
+    activation_type: int = int(ActivationType.Swiglu),
+    num_tokens: int | None = None,
+    top_k: int | None = None,
+    num_local_experts: int | None = None,
+    fc1_has_bias: bool = False,
+    fc2_has_bias: bool = False,
+    has_gemm1_alpha: bool = False,
+    has_gemm1_beta: bool = False,
+    has_gemm1_clamp_limit: bool = False,
+    enable_pdl: bool = False,
+    weight_layout: int = int(WeightLayout.MajorK),
+) -> PrimsTsGemmPair:
+    """Resolve a shared immutable FC1/FC2 pair for the internal BF16 path."""
+
     tile_n, moe_config_index = _parse_tactic(
         tactic,
         num_tokens=num_tokens,
@@ -1736,10 +1922,13 @@ def map_trtllm_bf16_moe_tactic(
     if moe_config_index < -1:
         raise ValueError(f"Unsupported MoE config index={moe_config_index}")
 
-    return _required_json_moe_config_pair(
+    # _parse_tactic above still uses the actual token count to select tile_n.
+    # Once the tile is resolved, config construction and schedule validation do
+    # not depend on the exact batch size. Keep it out of the shared-pair key.
+    return _bf16_config_pair_cached(
+        debug_checks=os.environ.get("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "0").lower(),
         tile_n=tile_n,
         moe_config_index=moe_config_index,
-        num_tokens=num_tokens,
         top_k=top_k,
         num_experts=num_local_experts,
         activation_type=activation_type,
@@ -1755,6 +1944,26 @@ def map_trtllm_bf16_moe_tactic(
         has_gemm1_clamp_limit=has_gemm1_clamp_limit,
         enable_pdl=enable_pdl,
         weight_layout=weight_layout,
+    )
+
+
+@lru_cache(maxsize=1024)
+def _bf16_config_pair_cached(*, debug_checks: str, **kwargs) -> PrimsTsGemmPair:
+    # Schedule validation reads the environment itself. Partition results by
+    # debug mode so a cached production check never bypasses debug validation.
+    del debug_checks
+    pair = _required_json_moe_config_pair(**kwargs)
+    return PrimsTsGemmPair(
+        pair.tile_n,
+        pair.moe_config_index,
+        PrimsTsMoeGemmConfig(
+            _immutable_config_spec_cached(tuple(sorted(pair.fc1.cfg.kwargs.items()))),
+            pair.fc1.prims_ts_gemm_config_index,
+        ),
+        PrimsTsMoeGemmConfig(
+            _immutable_config_spec_cached(tuple(sorted(pair.fc2.cfg.kwargs.items()))),
+            pair.fc2.prims_ts_gemm_config_index,
+        ),
     )
 
 

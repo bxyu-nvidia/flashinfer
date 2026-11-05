@@ -74,10 +74,22 @@ def _get_compile_arch() -> str:
     If not set, detect from the current CUDA device.
     """
     arch = os.environ.get("CUTE_DSL_ARCH")
-    if not arch:
+    if arch:
+        # Explicit targets also work without initializing CUDA.
+        return _get_compile_arch_cached(None, arch)
+
+    import torch
+
+    return _get_compile_arch_cached(torch.cuda.current_device(), None)
+
+
+@functools.lru_cache(maxsize=64)
+def _get_compile_arch_cached(device_index: Optional[int], arch: Optional[str]) -> str:
+    """Cache target resolution without freezing the active device or override."""
+    if arch is None:
         import torch
 
-        major, minor = torch.cuda.get_device_capability()
+        major, minor = torch.cuda.get_device_capability(device_index)
         suffix = "a" if major >= 9 else ""
         arch = f"sm_{major}{minor}{suffix}"
     return sanitize_symbol_name(arch.replace("_", ""))
@@ -246,14 +258,15 @@ class JitSpecCuteDsl(JitSpec):
         module = cute.runtime.load_module(str(self.object_path), enable_tvm_ffi=True)
         return getattr(module, self.symbol)
 
+    def _export_compiled_kernel(self, object_path: Path) -> None:
+        self._compiled_kernel.export_to_c(str(object_path), function_name=self.symbol)
+
     def _export(self) -> None:
         self.module_dir.mkdir(parents=True, exist_ok=True)
         tmp_object_path = self.object_path.with_suffix(f".o.tmp.{os.getpid()}")
         tmp_meta_path = self.meta_path.with_suffix(f".json.tmp.{os.getpid()}")
         try:
-            self._compiled_kernel.export_to_c(
-                str(tmp_object_path), function_name=self.symbol
-            )
+            self._export_compiled_kernel(tmp_object_path)
             os.replace(tmp_object_path, self.object_path)
             # meta.json is the module's commit marker: written after the
             # object file is in place so a crash never leaves a loadable

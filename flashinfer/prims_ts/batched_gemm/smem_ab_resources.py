@@ -44,6 +44,7 @@ class SmemAResource(MemoryResource):
 
     cfg: Constexpr[BatchedGemmConfig]
     tma_a_desc: Any = None
+    tma_local_weight_desc: Any = None
     smem_buf: Any = None
     _alloc_a: Constexpr[Optional[SmemAllocation]] = None
     desc_a_mma_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -107,6 +108,17 @@ class SmemAResource(MemoryResource):
         stage_base = self.smem_buf.subview(
             self.cfg.num_bytes_a_per_stage * stage_info.stage_idx
         )
+        tma_desc = self.tma_a_desc
+        selected_l = coord_a_l
+        # Merge numeric addresses; Pointer objects do not form numeric SSA phis.
+        tma_addr = self.tma_a_desc.toint()
+        if cutlass.const_expr(self.cfg.local_expert_count > 0 and self.cfg.is_swap_ab):
+            if coord_a_l >= Int32(self.cfg.local_expert_start) and coord_a_l < Int32(
+                self.cfg.local_expert_start + self.cfg.local_expert_count
+            ):
+                tma_addr = self.tma_local_weight_desc.toint()
+                selected_l = coord_a_l - Int32(self.cfg.local_expert_start)
+            tma_desc = cutlass.inttoptr(tma_addr, 0, cutlass.Uint8)
         if prims.elect_sync():
             if cutlass.const_expr(self.cfg.uses_block_major_k_weight_a):
                 a_box_k = self.cfg.tile_k
@@ -130,11 +142,11 @@ class SmemAResource(MemoryResource):
                 for bi in cutlass.range_constexpr(self.cfg.tile_k // a_box_k):
                     self._tma_load(
                         stage_base.subview(bi * box_bytes),
-                        self.tma_a_desc,
+                        tma_desc,
                         self._coords_for_load(
                             coord_a_k + Int32(bi * a_box_k),
                             coord_a_mn,
-                            coord_a_l,
+                            selected_l,
                             mn_limit,
                         ),
                         stage_info.barrier,
@@ -142,8 +154,8 @@ class SmemAResource(MemoryResource):
             else:
                 self._tma_load(
                     stage_base,
-                    self.tma_a_desc,
-                    self._coords_for_load(coord_a_k, coord_a_mn, coord_a_l, mn_limit),
+                    tma_desc,
+                    self._coords_for_load(coord_a_k, coord_a_mn, selected_l, mn_limit),
                     stage_info.barrier,
                 )
 
@@ -274,6 +286,7 @@ class SmemBResource(MemoryResource):
 
     cfg: Constexpr[BatchedGemmConfig]
     tma_b_desc: Any = None
+    tma_local_weight_desc: Any = None
     smem_buf: Any = None
     _alloc_b: Constexpr[Optional[SmemAllocation]] = None
     desc_b_mma_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -337,6 +350,18 @@ class SmemBResource(MemoryResource):
         stage_base = self.smem_buf.subview(
             self.cfg.num_bytes_b_smem_per_stage * stage_info.stage_idx
         )
+        tma_desc = self.tma_b_desc
+        selected_l = coord_b_l
+        tma_addr = self.tma_b_desc.toint()
+        if cutlass.const_expr(
+            self.cfg.local_expert_count > 0 and not self.cfg.is_swap_ab
+        ):
+            if coord_b_l >= Int32(self.cfg.local_expert_start) and coord_b_l < Int32(
+                self.cfg.local_expert_start + self.cfg.local_expert_count
+            ):
+                tma_addr = self.tma_local_weight_desc.toint()
+                selected_l = coord_b_l - Int32(self.cfg.local_expert_start)
+            tma_desc = cutlass.inttoptr(tma_addr, 0, cutlass.Uint8)
         if prims.elect_sync():
             if cutlass.const_expr(self.cfg.uses_block_major_k_weight_b):
                 b_box_k = self.cfg.tile_k
@@ -357,11 +382,11 @@ class SmemBResource(MemoryResource):
                 for bi in cutlass.range_constexpr(self.cfg.tile_k // b_box_k):
                     self._tma_load(
                         stage_base.subview(bi * box_bytes),
-                        self.tma_b_desc,
+                        tma_desc,
                         self._coords_for_load(
                             coord_b_k + Int32(bi * b_box_k),
                             coord_b_mn,
-                            coord_b_l,
+                            selected_l,
                             mn_limit,
                             split_b_across_ctas,
                         ),
@@ -370,11 +395,11 @@ class SmemBResource(MemoryResource):
             else:
                 self._tma_load(
                     stage_base,
-                    self.tma_b_desc,
+                    tma_desc,
                     self._coords_for_load(
                         coord_b_k,
                         coord_b_mn,
-                        coord_b_l,
+                        selected_l,
                         mn_limit,
                         split_b_across_ctas,
                     ),
@@ -778,7 +803,9 @@ class SmemGatherResource(MemoryResource):
                     gmem_col_bytes = nonnegative_div(
                         gmem_col_bits, 8
                     ) + col_chunk * Int32(copy_bytes)
-                    gmem_byte_off = phys_row * self.act_stride_bytes + gmem_col_bytes
+                    gmem_byte_off = (
+                        Int64(phys_row) * self.act_stride_bytes + gmem_col_bytes
+                    )
                     gmem_ptr = self.act_gmem_ptr + gmem_byte_off
                     prims.inline_ptx_hl(
                         "cp.async.cg.shared.global.L2::128B [{$r0}], [{$r1}], 16;",

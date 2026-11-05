@@ -95,6 +95,31 @@ def test_config_mapper_loads_local_prims_ts_json():
     assert _expanded_trtllm_gen_json_configs()
 
 
+@pytest.mark.parametrize(
+    "weight_layout", [WeightLayout.MajorK, WeightLayout.BlockMajorK]
+)
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_default_relu2_tactic_falls_back_when_fc1_exceeds_smem(
+    weight_layout, enable_pdl
+):
+    """CUDA-graph warmup must survive the oversized 64-token FC1 schedule."""
+    kwargs = dict(
+        activation_type=ActivationType.Relu2,
+        num_tokens=1024,
+        top_k=8,
+        num_local_experts=64,
+        weight_layout=weight_layout,
+        enable_pdl=enable_pdl,
+    )
+    # Validate real schedules on the CPU, including their SMEM allocations.
+    with pytest.raises(ValueError, match="SMEM usage.*exceeds hardware capacity"):
+        map_trtllm_bf16_moe_tactic([64, 0], **kwargs)
+    pair = map_trtllm_bf16_moe_tactic(-1, **kwargs)
+    assert pair.tile_n == 128
+    assert pair.fc1.cfg.build().use_pdl == int(enable_pdl)
+    assert pair.fc2.cfg.build().use_pdl == int(enable_pdl)
+
+
 def test_config_mapper_json_uses_prims_ts_option_names():
     stale_keys = {
         "cluster_dim_z",
@@ -105,6 +130,74 @@ def test_config_mapper_json_uses_prims_ts_option_names():
     for cfg in _expanded_prims_ts_json_configs():
         assert not stale_keys.intersection(cfg.options)
         assert all(key == key.lower() for key in cfg.options)
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"num_tokens": 33},
+        {"top_k": 2},
+        {"num_local_experts": 9},
+        {"activation_type": int(ActivationType.Relu2)},
+        {"weight_layout": int(WeightLayout.BlockMajorK)},
+        {"debug_checks": "1"},
+    ],
+)
+def test_config_mapper_reuses_validation_only_for_the_same_configuration(
+    monkeypatch, changed
+):
+    from flashinfer.prims_ts.moe import config_mapper
+    from flashinfer.prims_ts.batched_gemm import batched_gemm_kernel
+
+    cache = config_mapper._validate_task_manager_buildable
+    cache.cache_clear()
+    calls = []
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "0")
+    monkeypatch.setattr(
+        batched_gemm_kernel,
+        "build_batched_gemm_task_manager",
+        lambda **kwargs: calls.append(kwargs),
+    )
+    options = dict(num_tokens=31, top_k=3, num_local_experts=7)
+    try:
+        map_trtllm_bf16_moe_tactic([8, 0], **options)
+        validated = len(calls)
+        assert validated > 0
+        map_trtllm_bf16_moe_tactic([8, 0], **options)
+        assert len(calls) == validated
+        changed = dict(changed)
+        if debug_checks := changed.pop("debug_checks", None):
+            monkeypatch.setenv("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", debug_checks)
+        map_trtllm_bf16_moe_tactic([8, 0], **(options | changed))
+        assert len(calls) > validated
+    finally:
+        cache.cache_clear()
+
+
+def test_config_mapper_retries_failed_validation(monkeypatch):
+    from flashinfer.prims_ts.moe import config_mapper
+    from flashinfer.prims_ts.batched_gemm import batched_gemm_kernel
+
+    cache = config_mapper._validate_task_manager_buildable
+    cache.cache_clear()
+    calls = []
+
+    def fail_validation(**kwargs):
+        calls.append(kwargs)
+        raise ValueError("invalid schedule")
+
+    monkeypatch.setattr(
+        batched_gemm_kernel, "build_batched_gemm_task_manager", fail_validation
+    )
+    try:
+        for _ in range(2):
+            with pytest.raises(ValueError, match="invalid schedule"):
+                map_trtllm_bf16_moe_tactic(
+                    [8, 0], num_tokens=31, top_k=3, num_local_experts=7
+                )
+        assert len(calls) == 2
+    finally:
+        cache.cache_clear()
 
 
 def test_config_mapper_uses_local_json_for_bf16_tactic():
@@ -1053,3 +1146,54 @@ def test_support_rejects_unshuffled_major_k(monkeypatch):
 
     assert not ok
     assert "shuffled weights" in reason
+
+
+@pytest.mark.parametrize(
+    "weight_layout", [WeightLayout.MajorK, WeightLayout.BlockMajorK]
+)
+def test_bf16_relu2_pipeline_preserves_persisted_tactics(weight_layout):
+    """Existing pairs retain their pipelines and scheduler policies."""
+    expected_schedulers = [(0, 0), (0, 1), (1, 0), (1, 1)]
+    for index in range(8):
+        pair = map_trtllm_bf16_moe_tactic(
+            [128, index],
+            activation_type=int(ActivationType.Relu2),
+            weight_layout=int(weight_layout),
+        )
+        fc1, fc2 = pair.fc1.cfg.build(), pair.fc2.cfg.build()
+        assert (fc1.use_clc_fast_drain, fc2.use_clc_fast_drain) == (
+            expected_schedulers[index % 4]
+        )
+        assert (fc1.num_stages_a, fc1.num_stages_b, fc1.epi_tile_n) == (
+            (6, 6, 128) if index < 4 else (8, 9, 32)
+        )
+        assert (fc2.num_stages_a, fc2.num_stages_b, fc2.epi_tile_n) == (8, 8, 64)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and not is_sm100a_supported(torch.device("cuda")),
+    reason="PrimsTS kernels require Blackwell SM100A+",
+)
+@pytest.mark.parametrize(
+    "weight_layout", [WeightLayout.MajorK, WeightLayout.BlockMajorK]
+)
+@pytest.mark.parametrize("problem_k", [1024, 1152])
+def test_bf16_relu2_asymmetric_pipeline_wrap_and_tails(weight_layout, problem_k):
+    """Exercise pipeline wraparound, a partial expert tile, and routed row tails."""
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
+
+    pair = map_trtllm_bf16_moe_tactic(
+        [128, 6],
+        activation_type=int(ActivationType.Relu2),
+        weight_layout=int(weight_layout),
+    )
+    assert reference_check(
+        num_experts=4,
+        num_tokens=257,
+        top_k=3,
+        problem_n=2688,
+        problem_k=problem_k,
+        seed=123,
+        **pair.fc1.cfg.kwargs,
+    )

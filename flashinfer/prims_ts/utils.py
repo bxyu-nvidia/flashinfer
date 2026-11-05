@@ -35,9 +35,15 @@ def configure_cute_dsl_cache_dir() -> str:
     return cache_dir
 
 
+_PRIMS_TS_AVAILABLE = False
+
+
 def is_prims_ts_available() -> bool:
+    global _PRIMS_TS_AVAILABLE
+    if _PRIMS_TS_AVAILABLE:
+        return True
     try:
-        return (
+        available = (
             importlib.util.find_spec("cutlass") is not None
             and importlib.util.find_spec("cutlass.cute") is not None
             and importlib.util.find_spec("cutlass.experimental.primitives") is not None
@@ -46,6 +52,9 @@ def is_prims_ts_available() -> bool:
         )
     except ModuleNotFoundError:
         return False
+    # Dependencies are stable once available; failures may recover after setup.
+    _PRIMS_TS_AVAILABLE = available
+    return available
 
 
 def get_prims_ts_compile_options() -> str:
