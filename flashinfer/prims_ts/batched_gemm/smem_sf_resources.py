@@ -54,6 +54,8 @@ class SmemSfAResource(MemoryResource):
 
     cfg: Constexpr[BatchedGemmConfig]
     tma_sfa_desc: Any = None
+    tma_local_sf_desc: Any = None
+    expert_sf_tiles: Any = None
     smem_buf: Any = None
     _alloc_sfa: Constexpr[Optional[SmemAllocation]] = None
     desc_a_s2t_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -120,6 +122,20 @@ class SmemSfAResource(MemoryResource):
         stage_base = self.smem_buf.subview(
             self.cfg.num_bytes_sfa_per_stage * stage_info.stage_idx
         )
+        tma_desc = self.tma_sfa_desc
+        selected_mn = coord_sfa_mn
+        if cutlass.const_expr(
+            self.cfg.local_expert_count > 0 and self.cfg.is_nvfp4_mma
+        ):
+            local_start = Int32(self.cfg.local_expert_start) * self.expert_sf_tiles
+            local_end = (
+                local_start + Int32(self.cfg.local_expert_count) * self.expert_sf_tiles
+            )
+            tma_addr = tma_desc.toint()
+            if coord_sfa_mn >= local_start and coord_sfa_mn < local_end:
+                tma_addr = self.tma_local_sf_desc.toint()
+                selected_mn = coord_sfa_mn - local_start
+            tma_desc = cutlass.inttoptr(tma_addr, 0, cutlass.Uint8)
         if prims.elect_sync():
             if cutlass.const_expr(
                 self.cfg.use_tile256_tmem_overlap
@@ -130,15 +146,15 @@ class SmemSfAResource(MemoryResource):
                 # Generated R128c4 SF TMA uses [256, 2, K/(sfBlock*4), outer/128].
                 self._tma_load(
                     stage_base,
-                    self.tma_sfa_desc,
-                    (Int32(0), Int32(0), sfk_block, coord_sfa_mn),
+                    tma_desc,
+                    (Int32(0), Int32(0), sfk_block, selected_mn),
                     stage_info.barrier,
                 )
             else:
                 self._tma_load(
                     stage_base,
-                    self.tma_sfa_desc,
-                    (Int32(0), sfk_block, coord_sfa_mn),
+                    tma_desc,
+                    (Int32(0), sfk_block, selected_mn),
                     stage_info.barrier,
                 )
 

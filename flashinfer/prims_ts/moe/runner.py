@@ -448,7 +448,7 @@ def _prims_ts_cache_key_extras(
     static_extras: tuple,
 ) -> tuple:
     return (
-        ("prims_ts_moe_config_version", 4),
+        ("prims_ts_moe_config_version", 6),
         ("dtype_act", dtype_act),
         ("dtype_weights", dtype_weights),
         ("fp8_quantization_type", fp8_quantization_type),
@@ -1243,6 +1243,9 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             per_token_sf_b=moe_inputs.per_token_scale,
         )
         fc1_io = build_nvfp4_launch_io(
+            resident_weights=kwargs.get("resident_gemm1_weights"),
+            resident_weights_scale=kwargs.get("resident_gemm1_weights_scale"),
+            resident_expert_offset=kwargs.get("resident_expert_offset", 0),
             fc="fc1",
             cfg=fc1_cfg,
             **common_io_kwargs,
@@ -1273,7 +1276,14 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 "per_token_sf_b": per_token_scale_fc2,
             }
 
-        fc2_io = build_nvfp4_launch_io(fc="fc2", cfg=fc2_cfg, **fc2_io_kwargs)
+        fc2_io = build_nvfp4_launch_io(
+            fc="fc2",
+            cfg=fc2_cfg,
+            resident_weights=kwargs.get("resident_gemm2_weights"),
+            resident_weights_scale=kwargs.get("resident_gemm2_weights_scale"),
+            resident_expert_offset=kwargs.get("resident_expert_offset", 0),
+            **fc2_io_kwargs,
+        )
         fc2_hash = stable_config_hash(fc2_io["cfg"])
         fc2_fn = get_compiled_gemm(fc2_hash, "nvfp4_fc2", fc2_io, stream)
         fc2_fn(*self._launch_args(fc2_io, stream))

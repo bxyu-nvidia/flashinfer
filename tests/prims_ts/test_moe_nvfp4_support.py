@@ -240,3 +240,144 @@ def test_nvfp4_bs256_has_matching_gen_tile32_pair():
             break
     else:
         pytest.fail("missing the Gen-matched NVFP4 BS=256 tile-32 config pair")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
+@_requires_non_sm107_prims_ts
+@pytest.mark.parametrize("stage", ["fc1", "fc2"])
+@pytest.mark.parametrize("expert_start,expert_count", [(0, 1), (2, 3), (6, 1)])
+def test_nvfp4_resident_weights_and_scales_bypass_poisoned_staging(
+    stage,
+    expert_start,
+    expert_count,
+):
+    """Remap packed weights and R128c4 scales for uneven resident ranges."""
+    from dataclasses import replace
+    import cutlass
+    import cuda.bindings.driver as cuda_drv
+    from cutlass.cute.runtime import make_ptr
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+        _build_launch_io,
+        _compile_for_launch,
+        _launch_arg_tuple,
+    )
+
+    pair = map_trtllm_nvfp4_moe_tactic(
+        [8, 0],
+        num_tokens=127,
+        top_k=2,
+        num_local_experts=7,
+        activation_type=int(ActivationType.Swiglu),
+    )
+    config = dict((pair.fc1 if stage == "fc1" else pair.fc2).cfg.kwargs)
+    config["dtype_c"] = int(DType.BF16)
+    io = _build_launch_io(
+        num_experts=7,
+        num_tokens=127,
+        top_k=2,
+        problem_n=256,
+        problem_k=512,
+        **config,
+    )
+    stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
+    output = io["_keepalive"][4]
+    output.zero_()
+    _compile_for_launch(io, stream)(*_launch_arg_tuple(io, stream))
+    expected = output.clone()
+    weights, scales = io["_keepalive"][0], io["_keepalive"][2]
+    stop = expert_start + expert_count
+    local_weights = weights.view(7, -1)[expert_start:stop].clone()
+    local_scales = scales.view(7, -1)[expert_start:stop].clone()
+    weights.view(7, -1)[expert_start:stop].zero_()
+    scales.view(torch.uint8).view(7, -1)[expert_start:stop].fill_(0x7F)
+    io["cfg"] = replace(
+        io["cfg"],
+        local_expert_start=expert_start,
+        local_expert_count=expert_count,
+    )
+    io["local_weight_dp"] = make_ptr(
+        cutlass.Float4E2M1FN,
+        local_weights.data_ptr(),
+        cutlass.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    io["local_sf_dp"] = make_ptr(
+        cutlass.Float8E4M3FN,
+        local_scales.data_ptr(),
+        cutlass.AddressSpace.gmem,
+        assumed_align=32,
+    )
+    output.zero_()
+    _compile_for_launch(io, stream)(*_launch_arg_tuple(io, stream))
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("activation", [ActivationType.Swiglu, ActivationType.Relu2])
+@pytest.mark.parametrize("tokens", [1, 16960])
+def test_per_token_nvfp4_requantizes_bf16_fc1_output(activation, tokens):
+    """Both GEMMs need dynamic scales, including non-gated Nemotron experts."""
+    pair = map_trtllm_nvfp4_moe_tactic(
+        [-1, -1],
+        activation_type=int(activation),
+        num_tokens=tokens,
+        top_k=2,
+        num_local_experts=7,
+        use_per_token_sf_b=True,
+    )
+    fc1, fc2 = pair.fc1.cfg.build(), pair.fc2.cfg.build()
+    assert not fc1.has_epilogue_quant
+    assert fc1.dtype_c == int(DType.BF16)
+    assert fc1.has_per_token_sf_b
+    assert fc2.has_per_token_sf_b
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
+@_requires_non_sm107_prims_ts
+@pytest.mark.parametrize("tile_n", [8, 128])
+def test_nvfp4_relu2_dequantizes_global_scale_before_squaring(tile_n):
+    """Ignoring the expert scale before ReLU2 causes full-model overflow."""
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
+
+    pair = map_trtllm_nvfp4_moe_tactic(
+        [tile_n, -1],
+        activation_type=int(ActivationType.Relu2),
+        num_tokens=192,
+        top_k=2,
+        num_local_experts=8,
+        use_per_token_sf_b=True,
+    )
+    common = dict(
+        num_experts=8,
+        num_tokens=192,
+        top_k=2,
+        problem_n=256,
+        problem_k=512,
+        return_output=True,
+        **pair.fc1.cfg.kwargs,
+    )
+    ok, unscaled = reference_check(scale_gate_value=1.0, **common)
+    ok_scaled, scaled = reference_check(scale_gate_value=0.5, **common)
+    assert ok and ok_scaled
+    torch.testing.assert_close(scaled, unscaled * 0.25, rtol=0, atol=0)
+
+
+def test_per_token_nvfp4_excludes_unvalidated_tile256_pairs():
+    """Stale or fresh tuning must not choose the large-prefill NaN tactic."""
+    tactics = valid_prims_ts_nvfp4_moe_tactics(
+        activation_type=int(ActivationType.Relu2),
+        num_tokens=16960,
+        top_k=22,
+        num_local_experts=512,
+        use_per_token_sf_b=True,
+    )
+    assert tactics
+    assert all(tile_n <= 128 for tile_n, _ in tactics)
+    with pytest.raises(ValueError, match="Unsupported Prims-TS NVFP4 tile_N=256"):
+        map_trtllm_nvfp4_moe_tactic(
+            [256, 2],
+            activation_type=int(ActivationType.Relu2),
+            num_tokens=16960,
+            top_k=22,
+            num_local_experts=512,
+            use_per_token_sf_b=True,
+        )
