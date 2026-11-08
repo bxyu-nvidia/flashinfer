@@ -117,6 +117,7 @@ class GmemCResource(MemoryResource):
     sBias: Any = None
     sPerTokenSfA: Any = None
     sPerTokenSfB: Any = None
+    sNvfp4Scales: Any = None
     tile_scale_c: Any = None
     tile_scale_gate: Any = None
     tile_gemm1_alpha: Any = None
@@ -130,6 +131,7 @@ class GmemCResource(MemoryResource):
     _alloc_bias: Constexpr[Optional[SmemAllocation]] = None
     _alloc_per_token_sf_a: Constexpr[Optional[SmemAllocation]] = None
     _alloc_per_token_sf_b: Constexpr[Optional[SmemAllocation]] = None
+    _alloc_nvfp4_scales: Constexpr[Optional[SmemAllocation]] = None
 
     def __post_init__(self):
         if self._alloc_sc is None:
@@ -160,11 +162,19 @@ class GmemCResource(MemoryResource):
                 size_bytes=self.cfg.tile_m * 4,
                 alignment=16,
             )
-        if self._alloc_per_token_sf_b is None and self.cfg.has_per_token_sf_b:
+        if (
+            self._alloc_per_token_sf_b is None
+            and self.cfg.has_per_token_sf_b
+            and not self.cfg.defer_nvfp4_token_scale
+        ):
             self._alloc_per_token_sf_b = SmemAllocation(
                 f"{self.name}_per_token_sf_b",
                 size_bytes=self.cfg.tile_n * 4,
                 alignment=16,
+            )
+        if self.cfg.stage_nvfp4_scales and self._alloc_nvfp4_scales is None:
+            self._alloc_nvfp4_scales = SmemAllocation(
+                f"{self.name}_nvfp4_scales", size_bytes=4096, alignment=16
             )
         if self.c_tensor is not None:
             self.gC = cutlass.make_array_view(self.c_tensor)
@@ -174,7 +184,7 @@ class GmemCResource(MemoryResource):
                 or self.cfg.uses_fp8_output
             ):
                 self.gCBytes = cutlass.Array(self.gC.data_ptr(), dtype=cutlass.Int8)
-            if self.cfg.uses_fp8_output:
+            if self.cfg.uses_fp8_output or self.cfg.use_deferred_nvfp4_scale:
                 self.gCInt16 = cutlass.Array(self.gC.data_ptr(), dtype=cutlass.Int16)
         if self.sf_c_tensor is not None:
             self.gSfC = cutlass.make_array_view(self.sf_c_tensor)
@@ -213,11 +223,21 @@ class GmemCResource(MemoryResource):
             requirements.append(self._alloc_per_token_sf_a)
         if self._alloc_per_token_sf_b is not None:
             requirements.append(self._alloc_per_token_sf_b)
+        if self._alloc_nvfp4_scales is not None:
+            requirements.append(self._alloc_nvfp4_scales)
         return requirements
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def init_store_state(self, stage_info: StageInfo) -> None:
+        if cutlass.const_expr(
+            self.cfg.is_nvfp4_mma
+            and self.cfg.has_per_token_sf_b
+            and self.cfg.use_pdl
+            and not self.cfg.do_pdl_wait_for_num_non_exiting_ctas
+        ):
+            # Routing also produces the map used by epilogue token-scale loads.
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         context = stage_info.context
         if cutlass.const_expr(
             self.cfg.uses_fp4_output_quant
@@ -280,6 +300,13 @@ class GmemCResource(MemoryResource):
                 context.smem_base.data_ptr() + self._alloc_per_token_sf_b.offset,
                 dtype=cutlass.Float32,
                 shape=(self.cfg.tile_n,),
+                addrspace=3,
+            )
+        if cutlass.const_expr(self._alloc_nvfp4_scales is not None):
+            self.sNvfp4Scales = cutlass.Array(
+                context.smem_base.data_ptr() + self._alloc_nvfp4_scales.offset,
+                dtype=Float32,
+                shape=(1024,),
                 addrspace=3,
             )
         self.tile_scale_c = Float32(1.0)
@@ -665,7 +692,9 @@ class GmemCResource(MemoryResource):
     @cute.jit
     def _load_per_token_sf_b(self, local_token_col):
         if cutlass.const_expr(
-            self.cfg.has_per_token_sf_b and self.sPerTokenSfB is not None
+            self.cfg.has_per_token_sf_b
+            and not self.cfg.defer_nvfp4_token_scale
+            and self.sPerTokenSfB is not None
         ):
             return self.sPerTokenSfB.subview(local_token_col).load()
         return Float32(1.0)
@@ -734,7 +763,9 @@ class GmemCResource(MemoryResource):
         """Load epilogue-side scalar/tile data once at work-tile head."""
         tile_coord_m, tile_coord_n, _ = stage_info.work_tile.tile_idx
         expert_idx = Int32(0)
-        if cutlass.const_expr(self.tile_idx_view is not None):
+        if cutlass.const_expr(
+            self.tile_idx_view is not None and not self.cfg.defer_nvfp4_global_scales
+        ):
             if cutlass.const_expr(self.cfg.is_swap_ab):
                 token_tile = tile_coord_n
             else:
@@ -758,8 +789,9 @@ class GmemCResource(MemoryResource):
                 token_rows,
             )
         self.tile_token_limit = token_limit
-        self.tile_scale_c = self._load_scale_c_global(expert_idx)
-        self.tile_scale_gate = self._load_scale_gate_global(expert_idx)
+        if cutlass.const_expr(not self.cfg.defer_nvfp4_global_scales):
+            self.tile_scale_c = self._load_scale_c_global(expert_idx)
+            self.tile_scale_gate = self._load_scale_gate_global(expert_idx)
         if cutlass.const_expr(self.cfg.has_gemm1_activation_params):
             self.tile_gemm1_alpha = self._load_gemm1_alpha_global(expert_idx)
             self.tile_gemm1_beta = self._load_gemm1_beta_global(expert_idx)
@@ -794,7 +826,9 @@ class GmemCResource(MemoryResource):
             )
 
         if cutlass.const_expr(
-            self.cfg.has_per_token_sf_b and self.sPerTokenSfB is not None
+            self.cfg.has_per_token_sf_b
+            and not self.cfg.defer_nvfp4_token_scale
+            and self.sPerTokenSfB is not None
         ):
             tidx, _, _ = cute.arch.thread_idx()
             local_col = tidx
@@ -906,6 +940,30 @@ class GmemCResource(MemoryResource):
                         subtile_idx,
                         warp_idx,
                     )
+
+        if cutlass.const_expr(self.cfg.stage_nvfp4_scales):
+            self._flush_nvfp4_scales(stage_info)
+
+    @cute.jit
+    def _flush_nvfp4_scales(self, stage_info):
+        tid, _, _ = cute.arch.thread_idx()
+        local_tid = tid - Int32(self.cfg.epilogue_warp_idx * 32)
+        tile_m, tile_n, _ = stage_info.work_tile.tile_idx
+        prims.barrier_cta_sync(barrier_id=10, thread_count=256)
+        row = local_tid >> Int32(1)
+        col = (local_tid & Int32(1)) * Int32(4)
+        src = row * Int32(8) + (col ^ (((row >> Int32(2)) & Int32(1)) * Int32(4)))
+        values = self.sNvfp4Scales.subview(src).load(vector_size=4, alignment=16)
+        global_row = tile_n * Int32(128) + row
+        global_col = tile_m * Int32(8) + col
+        if (global_row < self.problem_n) & (
+            global_col + Int32(3) < (self.problem_m >> Int32(4))
+        ):
+            offset = (
+                cutlass.Int64(global_row) * (self.problem_m >> Int32(4)) + global_col
+            )
+            self.gSfC.subview(offset).store(values, vector_size=4, alignment=16)
+        prims.barrier_cta_sync(barrier_id=10, thread_count=256)
 
     @cute.jit
     def _store_non_swap_32x32b(
@@ -1980,7 +2038,11 @@ class GmemCResource(MemoryResource):
     def _tma_oob_c_coords(
         self, tile_coord_m, tile_coord_n, call_idx, token_limit, warpgroup_idx
     ):
-        m_base = tile_coord_m * Int32(self.cfg.tile_m // 2)
+        m_base = tile_coord_m * Int32(
+            self.cfg.tile_m
+            if self.cfg.use_deferred_nvfp4_scale
+            else self.cfg.tile_m // 2
+        )
         n_base = tile_coord_n * Int32(self.cfg.tile_n)
         n_subtile_offset = call_idx * Int32(self.cfg.epi_tile_n)
         if cutlass.const_expr(self.cfg.num_epilogue_warps > 4):
@@ -2054,7 +2116,9 @@ class GmemCResource(MemoryResource):
             # max-overlap kernels.  Wait before the epilogue task releases the
             # scratch region to other tasks; waiting only at the next epilogue
             # subtile is not enough when another task reuses the alias first.
-            if cutlass.const_expr(self.cfg.use_tile256_tmem_overlap):
+            if cutlass.const_expr(
+                self.cfg.use_tile256_tmem_overlap or self.cfg.use_deferred_nvfp4_scale
+            ):
                 prims.cp_async_bulk_wait_group(0, read=True)
         prims.barrier_cta_sync(
             barrier_id=store_barrier_id,
@@ -2124,6 +2188,111 @@ class GmemCResource(MemoryResource):
                     else:
                         self.gSfCBytes.subview(sf_idx).store(sf_packed)
         return sf_packed
+
+    @cute.jit
+    def _store_deferred_nvfp4_quad(
+        self,
+        v0,
+        v1,
+        v2,
+        v3,
+        m_row,
+        n_col,
+        output_m,
+        lane_id,
+        in_bounds,
+        m_local_row,
+        n_local_col,
+        warpgroup_idx,
+    ):
+        amax = self._fmax_ftz(
+            self._fmax_ftz(cute.math.abs(v0), cute.math.abs(v1)),
+            self._fmax_ftz(cute.math.abs(v2), cute.math.abs(v3)),
+        )
+        for mask in (4, 8):
+            other = prims.shfl_sync(
+                thread_mask=0xFFFFFFFF,
+                val=amax.bitcast(Int32),
+                offset=mask,
+                mask_and_clamp=0x1F,
+                kind=prims.Shfl.BFLY,
+                return_value_and_is_valid=False,
+            ).bitcast(Float32)
+            amax = self._fmax_ftz(amax, other)
+        sf = amax * Float32(1.0 / 6.0)
+        bits = sf.bitcast(Int32)
+        # Round to three fraction bits, retaining the FP32 exponent.
+        rounded = bits + Int32(0x7FFFF) + ((bits >> Int32(20)) & Int32(1))
+        block_scale = (rounded & Int32(0x7FF00000)).bitcast(Float32)
+        reciprocal = Float32(0.0)
+        if block_scale > Float32(0.0):
+            reciprocal = cute.math.rcp(block_scale, approx=True, ftz=True)
+        if cutlass.const_expr(self.cfg.packed_nvfp4_epilogue):
+            v0, v1 = self._fmul2(v0, v1, reciprocal, reciprocal)
+            v2, v3 = self._fmul2(v2, v3, reciprocal, reciprocal)
+        else:
+            v0, v1 = v0 * reciprocal, v1 * reciprocal
+            v2, v3 = v2 * reciprocal, v3 * reciprocal
+        p0 = _convert_f32x2_to_e2m1x2(v1, v0)
+        p1 = _convert_f32x2_to_e2m1x2(v3, v2)
+        packed = (p0.to(cutlass.Int16) & cutlass.Int16(255)) | (
+            p1.to(cutlass.Int16) << cutlass.Int16(8)
+        )
+        if cutlass.const_expr(self.cfg.use_tma_store):
+            byte_offset = (n_local_col * Int32(self.cfg.tile_m) + m_local_row) >> Int32(
+                1
+            )
+            byte_offset = byte_offset ^ (
+                ((byte_offset >> Int32(7)) & Int32(3)) << Int32(4)
+            )
+            byte_offset += warpgroup_idx * Int32(
+                self.cfg.num_bytes_c_tma_store_per_group
+            )
+            self.sCInt16.subview(byte_offset >> Int32(1)).store(packed)
+        elif cutlass.const_expr(self.cfg.packed_nvfp4_epilogue):
+            packed_index = cutlass.Int64(n_col) * (output_m >> Int32(2)) + (
+                m_row >> Int32(2)
+            )
+            prims.inline_ptx_hl(
+                "st.global.b16 [{$r0}], {$r1};",
+                read_only_args=[self.gCInt16.subview(packed_index).data_ptr(), packed],
+                pred=in_bounds,
+            )
+        elif in_bounds:
+            index = cutlass.Int64(n_col) * output_m + m_row
+            self.gCInt16.subview(index // Int32(4)).store(packed)
+        if cutlass.const_expr(self.cfg.stage_nvfp4_scales):
+            local_row = warpgroup_idx * Int32(64) + n_local_col
+            local_sf = m_local_row >> Int32(4)
+            local_index = local_row * Int32(8) + (
+                local_sf ^ (((local_row >> Int32(2)) & Int32(1)) * Int32(4))
+            )
+            prims.inline_ptx_hl(
+                "st.shared.b32 [{$r0}], {$r1};",
+                read_only_args=[
+                    self.sNvfp4Scales.subview(local_index).data_ptr(),
+                    block_scale.bitcast(Int32),
+                ],
+                pred=(lane_id & Int32(12)) == Int32(0),
+            )
+        elif cutlass.const_expr(self.cfg.packed_nvfp4_epilogue):
+            sf_index = cutlass.Int64(n_col) * (output_m >> Int32(4)) + (
+                m_row >> Int32(4)
+            )
+            prims.inline_ptx_hl(
+                "st.global.b32 [{$r0}], {$r1};",
+                read_only_args=[
+                    self.gSfC.subview(sf_index).data_ptr(),
+                    block_scale.bitcast(Int32),
+                ],
+                pred=in_bounds & ((lane_id & Int32(12)) == Int32(0)),
+            )
+        elif in_bounds:
+            if (lane_id & Int32(12)) == Int32(0):
+                sf_index = cutlass.Int64(n_col) * (
+                    output_m // Int32(16)
+                ) + m_row // Int32(16)
+                self.gSfC.subview(sf_index).store(block_scale)
 
     @cute.jit
     def _select_int8_from_8(self, values, selector):
@@ -2572,6 +2741,109 @@ class GmemCResource(MemoryResource):
                 warp_idx,
                 warpgroup_idx,
             )
+            return
+
+        if cutlass.const_expr(self.cfg.use_deferred_nvfp4_scale):
+            for group in cutlass.range_constexpr(self.cfg.epi_tile_n // 8):
+                for col_sub in cutlass.range_constexpr(2):
+                    reg0 = group * 4 + col_sub
+                    reg1 = group * 4 + 2 + col_sub
+                    local_col = base_tmem_col + Int32(group * 8 + col_sub)
+                    v0 = self._maybe_apply_per_token_sf_a(t2r_rmem[reg0], base_row_idx)
+                    v1 = self._maybe_apply_per_token_sf_a(
+                        t2r_rmem[reg1], base_row_idx + Int32(1)
+                    )
+                    v2 = self._maybe_apply_per_token_sf_a(
+                        t2r_slice1[reg0], base_row_idx + Int32(2)
+                    )
+                    v3 = self._maybe_apply_per_token_sf_a(
+                        t2r_slice1[reg1], base_row_idx + Int32(3)
+                    )
+                    if cutlass.const_expr(
+                        self.cfg.has_per_token_sf_b
+                        and not self.cfg.defer_nvfp4_token_scale
+                    ):
+                        token_sf = self._load_per_token_sf_b(
+                            n_subtile_offset + local_col
+                        )
+                        v0, v1 = self._fmul2(v0, v1, token_sf, token_sf)
+                        v2, v3 = self._fmul2(v2, v3, token_sf, token_sf)
+                    v0 = self._maybe_add_bias_m(
+                        v0, expert_idx, m_tile_base + base_row_idx, base_row_idx
+                    )
+                    v1 = self._maybe_add_bias_m(
+                        v1,
+                        expert_idx,
+                        m_tile_base + base_row_idx + Int32(1),
+                        base_row_idx + Int32(1),
+                    )
+                    v2 = self._maybe_add_bias_m(
+                        v2,
+                        expert_idx,
+                        m_tile_base + base_row_idx + Int32(2),
+                        base_row_idx + Int32(2),
+                    )
+                    v3 = self._maybe_add_bias_m(
+                        v3,
+                        expert_idx,
+                        m_tile_base + base_row_idx + Int32(3),
+                        base_row_idx + Int32(3),
+                    )
+                    if cutlass.const_expr(is_eltwise_relu):
+                        if cutlass.const_expr(
+                            self.cfg.uses_global_scales
+                            and not self.cfg.defer_nvfp4_global_scales
+                        ):
+                            v0, v1 = self._fmul2(v0, v1, scale_gate, scale_gate)
+                            v2, v3 = self._fmul2(v2, v3, scale_gate, scale_gate)
+                        v0 = cute.math.max(v0, Float32(0.0))
+                        v1 = cute.math.max(v1, Float32(0.0))
+                        v2 = cute.math.max(v2, Float32(0.0))
+                        v3 = cute.math.max(v3, Float32(0.0))
+                        if cutlass.const_expr(self.cfg.packed_nvfp4_epilogue):
+                            v0, v1 = self._fmul2(v0, v1, v0, v1)
+                            v2, v3 = self._fmul2(v2, v3, v2, v3)
+                        else:
+                            v0, v1 = v0 * v0, v1 * v1
+                            v2, v3 = v2 * v2, v3 * v3
+                    if cutlass.const_expr(not self.cfg.defer_nvfp4_global_scales):
+                        v0, v1 = self._maybe_apply_scale_c_pair(v0, v1, scale_c)
+                        v2, v3 = self._maybe_apply_scale_c_pair(v2, v3, scale_c)
+                    m_row = m_tile_base + base_row_idx
+                    n_col = n_tile_base + local_col
+                    valid = (m_row < output_m) & (n_col < self.problem_n)
+                    if cutlass.const_expr(self.cfg.use_tma_oob_opt):
+                        valid = valid & ((n_subtile_offset + local_col) < token_limit)
+                    self._store_deferred_nvfp4_quad(
+                        v0,
+                        v1,
+                        v2,
+                        v3,
+                        m_row,
+                        n_col,
+                        output_m,
+                        lane_id,
+                        valid,
+                        base_row_idx,
+                        local_col,
+                        warpgroup_idx,
+                    )
+            if cutlass.const_expr(self.cfg.use_tma_store):
+                self._commit_swap_ab_fp4_tma(
+                    tile_coord_m,
+                    tile_coord_n,
+                    call_idx,
+                    token_limit,
+                    warp_idx,
+                    warpgroup_idx,
+                    Int32(0),
+                )
+            if cutlass.const_expr(not self.cfg.defer_nvfp4_token_scale):
+                # Protect shared tile scales until every epilogue finishes.
+                prims.barrier_cta_sync(
+                    barrier_id=6,
+                    thread_count=self.cfg.num_epilogue_warps * 32,
+                )
             return
 
         # Process both slices

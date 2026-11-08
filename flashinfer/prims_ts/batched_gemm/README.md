@@ -70,6 +70,40 @@ backend in `flashinfer/fused_moe/backends/prims_ts` maps a smaller curated set o
 FC1/FC2 configurations from `flashinfer/prims_ts/moe/prims_ts_moe_configs.json`
 and reuses the TRT-LLM routing/finalize code.
 
+## Per-token NVFP4 ReLU2 output
+
+Eligible persistent routed FC1 configurations with tile-N 64/128 and tile-K
+256/512 write activated
+FP4 elements directly. `use_deferred_nvfp4_scale` stores FP32 block scales with
+three mantissa bits; a metadata kernel chooses power-of-two per-token scales and
+writes the swizzled E4M3 scales consumed by FC2. It traverses physical rows using
+routing tile limits, skips padding, and never rereads the packed elements.
+This removes the BF16 intermediate but changes the quantization recipe from the
+previous row-amax normalization. Tiny relative block scales can underflow E4M3.
+
+The MoE mapper enables this path by default for per-token NVFP4 ReLU2 throughput
+configs. Set `FLASHINFER_PRIMS_TS_FUSED_NVFP4_FC1=0` to retain the BF16 intermediate.
+Latency-oriented configurations, other activations, OA activation parameters and
+`FLASHINFER_NVFP4_4OVER6=1` retain their existing paths. Both replicated Prims and
+merge-free resident expert execution use the same mapper. `use_swizzled_sfb`
+applies a matching XOR swizzle to compact routed SF-B producers and consumers.
+
+`FLASHINFER_PRIMS_TS_DEFER_NVFP4_TOKEN_SCALE=1` additionally moves positive token
+and expert factors into output row metadata for bias-free FP32 token-scaled
+ReLU2. This option defaults to off and changes floating-point evaluation order.
+For the 512-expert, top-22, K=1024, output=2688 tile-128 path with at least 8192
+tokens, it also pre-routes input scale bytes, coalesces raw output scale stores,
+and uses static persistent scheduling. Packed activation elements remain compact;
+resident DWDP weights and scale factors retain their existing ownership.
+
+`benchmarks/bench_prims_ts_nvfp4_fc1.py` compares the complete NVFP4 FC1 GPU
+path against BF16 stage/throttle variants with interleaved, cold-L2 CUPTI timing.
+It defaults to shuffled token IDs; `--routing cyclic` retains the locality
+control. It reports input/output scale kernels separately, but those isolated
+measurements have different cache state and should not be added together.
+`--profile` captures the three NVFP4 kernels for NCU with
+`--profile-from-start off`.
+
 ## MoE Integration Parity Gaps
 
 PrimsTS MoE is intended to track the TRT-LLM Gen MoE backend, but it is not at
@@ -107,7 +141,8 @@ Kernel-level performance/configuration gaps inherited by the MoE backend:
   kernel/config limitation; the current TRT-LLM Gen tests do not establish
   DeepSeek FP8 `ClusterDimX=2` or tile-N 256 support.
 - Output block scaling and sub-byte output formats are only available in the
-  supported swap-AB/gated epilogue forms. The MXFP4 x BF16 cast-A path currently
+  supported swap-AB/gated epilogue forms and deferred NVFP4 ReLU2 output described
+  above. The MXFP4 x BF16 cast-A path currently
   stores plain BF16/FP16 output.
 
 Tests that define the current boundary:

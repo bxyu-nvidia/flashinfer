@@ -629,7 +629,7 @@ def _make_pipeline_configs(cfg):
         )
 
     # CLC dynamic persistent WorkQueue pipeline
-    if cfg.is_persistent:
+    if cfg.is_persistent and not cfg.static_persistent_clusters:
         clc_cluster_scale = cfg.cluster_m if cfg.has_cluster else 1
         num_clc_consumer_threads = 0
 
@@ -732,7 +732,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
     gmem_c = GmemCResource(cfg=cfg, name="GmemC")
 
     # WorkQueue — CLC persistent or static (non-persistent)
-    if cfg.is_persistent:
+    if cfg.is_persistent and not cfg.static_persistent_clusters:
         tile_sched_cfg = TileSchedulerConfig(
             tile_scheduler_type=TileSchedulerType.ClcDynamicPersistent,
             tile_scheduler_params=None,
@@ -748,7 +748,14 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             tile_scheduler_type=TileSchedulerType.StaticPersistent,
             tile_scheduler_params=None,
         )
-        work_queue = WorkQueue(tile_scheduler_config=tile_sched_cfg, name="WorkQueue")
+        if cfg.static_persistent_clusters:
+            work_queue = BatchedGemmWorkQueue(
+                tile_scheduler_config=tile_sched_cfg, cfg=cfg, name="WorkQueue"
+            )
+        else:
+            work_queue = WorkQueue(
+                tile_scheduler_config=tile_sched_cfg, name="WorkQueue"
+            )
 
     work_throttle = None
     if cfg.use_work_throttle_barrier:
@@ -1167,7 +1174,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
         pad = create_padding_task(cfg, work_queue, num_k_tiles)
         task_list.append(pad)
     # WorkScheduleTask (CLC persistent only)
-    if cfg.is_persistent:
+    if cfg.is_persistent and not cfg.static_persistent_clusters:
         workid = create_workid_task(
             cfg,
             work_queue,
@@ -1823,6 +1830,7 @@ def _batched_gemm_kernel_bf16_body(
             num_non_exiting_ctas_value = num_non_exiting_ctas_view.load(
                 idx=Int32(0), vector_size=1
             )[0]
+    if cutlass.const_expr(cfg.is_persistent and not cfg.static_persistent_clusters):
         clc_response_ptr = cute.arch.alloc_smem(cutlass.Int128, cfg.num_stages_workid)
         tile_sched_cfg = (
             TileSchedulerConfig.create_clc_dynamic_persistent_tile_scheduler_params(
@@ -1844,7 +1852,18 @@ def _batched_gemm_kernel_bf16_body(
                 tile_scheduler_params=tile_sched_params,
             )
         )
-        work_queue = WorkQueue(tile_scheduler_config=tile_sched_cfg, name="WorkQueue")
+        if cutlass.const_expr(cfg.static_persistent_clusters > 0):
+            work_queue = BatchedGemmWorkQueue(
+                tile_scheduler_config=tile_sched_cfg,
+                cfg=cfg,
+                num_non_exiting_ctas_tensor=num_non_exiting_ctas_tensor,
+                num_non_exiting_ctas_value=num_non_exiting_ctas_value,
+                name="WorkQueue",
+            )
+        else:
+            work_queue = WorkQueue(
+                tile_scheduler_config=tile_sched_cfg, name="WorkQueue"
+            )
 
     work_throttle = None
     if cutlass.const_expr(cfg.use_work_throttle_barrier):
@@ -2171,7 +2190,7 @@ def _batched_gemm_kernel_bf16_body(
         pad = create_padding_task(cfg, work_queue, k_tile_cnt)
         task_list.append(pad)
     # WorkScheduleTask (CLC persistent only)
-    if cutlass.const_expr(cfg.is_persistent):
+    if cutlass.const_expr(cfg.is_persistent and not cfg.static_persistent_clusters):
         workid = create_workid_task(
             cfg,
             work_queue,
@@ -2902,7 +2921,12 @@ def gemm(
 
         # SFB descriptor: routed TMA gather4 (2D linear) or regular tiled SF layout.
         # LDGSTS-routed SF bypasses TensorMap encoding and uses raw GMEM tensors.
-        if cutlass.const_expr(uses_routed_sfb_tma_desc(cfg)):
+        if cutlass.const_expr(
+            cfg.has_routed_sfs and cfg.uses_ldgsts_routed_sfs and cfg.is_swap_ab
+        ):
+            # Routed scalar copies use the raw SF pointer, never this descriptor.
+            tma_sfb_desc = tma_b_desc
+        elif cutlass.const_expr(uses_routed_sfb_tma_desc(cfg)):
             # 2D linear layout: (K/sf_vec_size, total_tokens) for gather4
             sf_k_total = ((cutlass.Int64(k) // sf_vec_size + 15) // 16) * 16
             sfb_2d_layout = cute.make_layout(
@@ -3035,7 +3059,7 @@ def gemm(
     block = cfg.threads_per_cta
     cluster_shape = (cfg.cluster_m, 1, 1)
 
-    if cutlass.const_expr(cfg.is_persistent):
+    if cutlass.const_expr(cfg.is_persistent and not cfg.static_persistent_clusters):
         clc_raster_along_m = True
         tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
             (launch_num_tiles_m, launch_num_tiles_n, 1),
@@ -3049,8 +3073,13 @@ def gemm(
         tile_sched_params = utils.PersistentTileSchedulerParams(
             (launch_num_tiles_m, launch_num_tiles_n, 1),
             cluster_shape,
+            cfg.static_swizzle_size,
+            bool(cfg.static_raster_along_m),
         )
-        grid = (launch_num_tiles_m, launch_num_tiles_n, 1)
+        if cutlass.const_expr(cfg.static_persistent_clusters > 0):
+            grid = (cfg.cluster_m, 1, cfg.static_persistent_clusters)
+        else:
+            grid = (launch_num_tiles_m, launch_num_tiles_n, 1)
 
     # C output tensor
     output_m_for_c = cutlass.Int64(m)
@@ -3123,12 +3152,21 @@ def gemm(
                 tma_c_swizzle = cuda.TensorMapSwizzle.s64b
                 tma_c_format = cuda.TensorMapDataFormat.BYTE
             else:
-                tma_c_swizzle = cuda.TensorMapSwizzle.s32b
+                tma_c_swizzle = (
+                    cuda.TensorMapSwizzle.s64b
+                    if cfg.use_deferred_nvfp4_scale
+                    else cuda.TensorMapSwizzle.s32b
+                )
                 tma_c_format = cuda.TensorMapDataFormat.B4X16
             if cutlass.const_expr(cfg.use_tma_oob_opt):
                 tma_c_desc = cuda.create_tensor_map_tiled_from_tensor(
                     tensor=c_tensor,
-                    box_dims=(cfg.tile_m // 2, cfg.epi_tile_n, 1, 1),
+                    box_dims=(
+                        cfg.tile_m if cfg.use_deferred_nvfp4_scale else cfg.tile_m // 2,
+                        cfg.epi_tile_n,
+                        1,
+                        1,
+                    ),
                     stride_order=(0, 1, 2, 3),
                     swizzle=tma_c_swizzle,
                     tma_format=tma_c_format,
@@ -3136,7 +3174,10 @@ def gemm(
             else:
                 tma_c_desc = cuda.create_tensor_map_tiled_from_tensor(
                     tensor=c_tensor,
-                    box_dims=(cfg.tile_m // 2, cfg.epi_tile_n),
+                    box_dims=(
+                        cfg.tile_m if cfg.use_deferred_nvfp4_scale else cfg.tile_m // 2,
+                        cfg.epi_tile_n,
+                    ),
                     stride_order=(0, 1),
                     swizzle=tma_c_swizzle,
                     tma_format=tma_c_format,
@@ -3185,7 +3226,10 @@ def gemm(
     output_m_for_sf = cutlass.Int64(m)
     if cutlass.const_expr(cfg.is_swap_ab and cfg.has_gated_epilogue):
         output_m_for_sf = cutlass.Int64(m) // Int32(2)
-    if cutlass.const_expr(cfg.has_epilogue_quant):
+    if cutlass.const_expr(cfg.use_deferred_nvfp4_scale):
+        sf_c_elems = n * (output_m_for_sf // Int32(16))
+        sf_c_layout = cute.make_layout((sf_c_elems,), stride=(1,))
+    elif cutlass.const_expr(cfg.has_epilogue_quant):
         sf_block_m = Int32(cfg.output_sf_block_size_c)
         sf_group_m = sf_block_m * Int32(4)
         if cutlass.const_expr(cfg.sf_layout_c == int(SfLayout.R8c4)):
@@ -3212,7 +3256,7 @@ def gemm(
             sf_c_raw_ptr,
             dtype=(
                 cutlass.Float32
-                if cfg.has_deepseek_fp8_c_scale
+                if cfg.has_deepseek_fp8_c_scale or cfg.use_deferred_nvfp4_scale
                 else (
                     cutlass.Float8E8M0FNU
                     if cfg.uses_mx_output_quant

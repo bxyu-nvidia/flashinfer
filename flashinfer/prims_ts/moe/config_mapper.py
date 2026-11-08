@@ -1971,6 +1971,21 @@ def _bf16_config_pair_cached(*, debug_checks: str, **kwargs) -> PrimsTsGemmPair:
     )
 
 
+def _fused_nvfp4_fc1_enabled() -> bool:
+    truthy = {"1", "true", "yes", "on"}
+    enabled = (
+        os.environ.get("FLASHINFER_PRIMS_TS_FUSED_NVFP4_FC1", "1").lower() in truthy
+    )
+    four_over_six = os.environ.get("FLASHINFER_NVFP4_4OVER6", "0").lower() in truthy
+    return enabled and not four_over_six
+
+
+def _deferred_nvfp4_token_scale_enabled() -> bool:
+    return os.environ.get(
+        "FLASHINFER_PRIMS_TS_DEFER_NVFP4_TOKEN_SCALE", "0"
+    ).lower() in {"1", "true", "yes", "on"}
+
+
 def map_trtllm_nvfp4_moe_tactic(
     tactic: int | Sequence[int],
     *,
@@ -2008,7 +2023,7 @@ def map_trtllm_nvfp4_moe_tactic(
     if moe_config_index < -1:
         raise ValueError(f"Unsupported MoE config index={moe_config_index}")
 
-    return _required_json_moe_config_pair(
+    pair = _required_json_moe_config_pair(
         tile_n=tile_n,
         moe_config_index=moe_config_index,
         num_tokens=num_tokens,
@@ -2031,6 +2046,86 @@ def map_trtllm_nvfp4_moe_tactic(
         enable_pdl=enable_pdl,
         weight_layout=weight_layout,
     )
+
+    if (
+        _fused_nvfp4_fc1_enabled()
+        and use_per_token_sf_b
+        and int(activation_type) == int(ActivationType.Relu2)
+        and pair.tile_n in (64, 128)
+        and pair.fc1.cfg.kwargs["route_act"] == int(_RouteImpl.TMA)
+        and pair.fc1.cfg.kwargs["route_sfs_act"] == int(_RouteImpl.NONE)
+        and pair.fc1.cfg.kwargs["cluster_m"] == 2
+        and pair.fc1.cfg.kwargs["tile_scheduler"] == 1
+        and not (has_gemm1_alpha or has_gemm1_beta or has_gemm1_clamp_limit)
+    ):
+        cfg = dict(pair.fc1.cfg.kwargs)
+        stages = 4 if pair.tile_n == 64 else 5
+        cfg.update(
+            dtype_c=int(_DType.E2M1),
+            use_deferred_nvfp4_scale=1,
+            defer_nvfp4_token_scale=int(
+                _deferred_nvfp4_token_scale_enabled()
+                and not fc1_has_bias
+                and per_token_sf_dtype == int(_DType.FP32)
+            ),
+            use_swizzled_sfb=1,
+            use_tma_store=0,
+            tile_k=512 if pair.tile_n == 64 else 256,
+            num_epilogue_warps=8,
+            epi_tile_n=32,
+            epilogue_regs=96 if pair.tile_n == 64 else 112,
+            num_load_sfb_warps=4 if pair.tile_n == 64 else 8,
+            num_load_b_warps=4,
+            num_stages_a=stages,
+            num_stages_b=stages,
+            num_stages_smem_sfa=stages,
+            num_stages_smem_sfb=stages,
+            num_stages_tmem_sfa=stages,
+            num_stages_tmem_sfb=stages,
+            sf_layout_c=int(_SfLayout.R8c4 if pair.tile_n == 64 else _SfLayout.R128c4),
+            use_clc_fast_drain=0,
+            use_work_throttle=0,
+        )
+        if cfg["defer_nvfp4_token_scale"] and pair.tile_n == 128:
+            preroute_scales = (
+                num_tokens is not None
+                and num_tokens >= 8192
+                and top_k == 22
+                and num_local_experts == 512
+            )
+            cfg.update(
+                route_act=int(_RouteImpl.LDGSTS),
+                route_sfs_act=int(_RouteImpl.LDGSTS),
+                fuse_operand_sf_loads=1,
+                fuse_sf_copy_to_mma=1,
+                packed_nvfp4_epilogue=1,
+                vectorize_routed_sfb=int(not preroute_scales),
+                prerouted_sfb_ldgsts=int(preroute_scales),
+                stage_nvfp4_scales=int(preroute_scales),
+                defer_nvfp4_global_scales=1,
+                gather_regs=64,
+                tile_k=512,
+                num_load_sfa_warps=1,
+                num_load_sfb_warps=4,
+                num_epilogue_warps=8,
+                epi_tile_n=64,
+                epilogue_regs=96 if preroute_scales else 112,
+            )
+            cfg.update(
+                {
+                    key: 3
+                    for key in (
+                        "num_stages_a",
+                        "num_stages_b",
+                        "num_stages_smem_sfa",
+                        "num_stages_smem_sfb",
+                        "num_stages_tmem_sfa",
+                        "num_stages_tmem_sfb",
+                    )
+                }
+            )
+        pair = replace(pair, fc1=replace(pair.fc1, cfg=PrimsTsConfigSpec(cfg)))
+    return pair
 
 
 def map_trtllm_fp8_per_tensor_moe_tactic(

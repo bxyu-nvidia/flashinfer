@@ -467,6 +467,15 @@ class TmemSfRouteResource(MemoryResource):
                         smem_word_offset = (
                             sf_tile_idx * Int32(8) + local_vec_idx
                         ) * Int32(TMEM_SF_PACK_SIZE_BYTES)
+                        if cutlass.const_expr(
+                            self.cfg.use_swizzled_sfb
+                            and is_b
+                            and self.cfg.has_implicit_routed_sfs
+                        ):
+                            smem_word_offset = smem_word_offset ^ (
+                                (source_lane // Int32(8))
+                                & Int32(min(num_sttm_iters, 4) - 1)
+                            ) * Int32(32)
                         smem_word = cutlass.Array(
                             stage_base.data_ptr() + smem_word_offset,
                             dtype=cutlass.Int32,
