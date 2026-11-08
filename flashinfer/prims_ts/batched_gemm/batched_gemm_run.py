@@ -2699,7 +2699,12 @@ def reference_check(
             ref_torch = ref_torch.to(plain_output_dtype)
         c_compare = c_logical
     elif is_relu2:
-        ref_torch = torch.clamp(ref_gemm.float(), min=0).pow(2)
+        relu_input = ref_gemm.float()
+        if cfg.is_nvfp4_mma and cfg.uses_global_scales:
+            relu_input = relu_input * _expert_scale_like(
+                relu_input.shape, scale_gate_torch
+            )
+        ref_torch = torch.clamp(relu_input, min=0).pow(2)
         ref_torch = ref_torch * _expert_scale_like(ref_torch.shape, scale_c_torch)
         if cfg.uses_fp8_output:
             ref_torch = ref_torch.to(torch.float8_e4m3fn).float()
@@ -3404,6 +3409,7 @@ def _compile_arg_tuple(io: dict, stream) -> tuple:
         io["gemm1_beta_dp"],
         io["gemm1_clamp_limit_dp"],
         io.get("local_weight_dp", io["b_dp"]),
+        io.get("local_sf_dp", io["sfa_dp"]),
         io["shape"],
         io["launch_early_exit_max_token_ctas"],
         io["cfg"],
@@ -3439,6 +3445,7 @@ def _launch_arg_tuple(io: dict, stream) -> tuple:
         io["gemm1_beta_dp"],
         io["gemm1_clamp_limit_dp"],
         io.get("local_weight_dp", io["b_dp"]),
+        io.get("local_sf_dp", io["sfa_dp"]),
         io["shape"],
         io["launch_early_exit_max_token_ctas"],
         stream,

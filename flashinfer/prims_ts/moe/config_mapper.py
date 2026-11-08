@@ -1647,20 +1647,24 @@ def valid_prims_ts_nvfp4_moe_tactics(
     weight_layout: int = int(WeightLayout.MajorK),
 ) -> list[list[int]]:
     return _valid_json_moe_tactics(
-        supported_tiles=SUPPORTED_NVFP4_TILE_N,
+        supported_tiles=(
+            SUPPORTED_NVFP4_TILE_N[:-1]
+            if use_per_token_sf_b
+            else SUPPORTED_NVFP4_TILE_N
+        ),
         num_tokens=num_tokens,
         top_k=top_k,
         num_local_experts=num_local_experts,
         activation_type=activation_type,
         dtype_a=int(_DType.E2M1),
         dtype_b=int(_DType.E2M1),
-        fc1_dtype_c=int(_DType.E2M1),
+        fc1_dtype_c=int(_DType.BF16 if use_per_token_sf_b else _DType.E2M1),
         fc2_dtype_c=int(_DType.BF16),
         dtype_label="NVFP4xNVFP4",
         fc1_has_bias=fc1_has_bias,
         fc2_has_bias=fc2_has_bias,
         fc1_use_per_token_sf_b=use_per_token_sf_b,
-        fc2_use_per_token_sf_b=False,
+        fc2_use_per_token_sf_b=use_per_token_sf_b,
         per_token_sf_dtype=per_token_sf_dtype,
         has_gemm1_alpha=has_gemm1_alpha,
         has_gemm1_beta=has_gemm1_beta,
@@ -1986,14 +1990,20 @@ def map_trtllm_nvfp4_moe_tactic(
 ) -> PrimsTsGemmPair:
     """Return Prims-TS FC1/FC2 configs for a Prims-TS NVFP4xNVFP4 MoE tactic."""
 
+    # Tile-256 pairs can produce NaNs with the BF16 intermediate required by
+    # per-token NVFP4 (including long Nemotron prefills). Keep them out of both
+    # explicit dispatch and autotuning until their numerics are validated.
+    supported_tiles = (
+        SUPPORTED_NVFP4_TILE_N[:-1] if use_per_token_sf_b else SUPPORTED_NVFP4_TILE_N
+    )
     tile_n, moe_config_index = _parse_tactic(
         tactic,
         num_tokens=num_tokens,
         top_k=top_k,
         num_local_experts=num_local_experts,
-        supported_tiles=SUPPORTED_NVFP4_TILE_N,
+        supported_tiles=supported_tiles,
     )
-    if tile_n not in SUPPORTED_NVFP4_TILE_N:
+    if tile_n not in supported_tiles:
         raise ValueError(f"Unsupported Prims-TS NVFP4 tile_N={tile_n}")
     if moe_config_index < -1:
         raise ValueError(f"Unsupported MoE config index={moe_config_index}")
@@ -2007,13 +2017,13 @@ def map_trtllm_nvfp4_moe_tactic(
         activation_type=activation_type,
         dtype_a=int(_DType.E2M1),
         dtype_b=int(_DType.E2M1),
-        fc1_dtype_c=int(_DType.E2M1),
+        fc1_dtype_c=int(_DType.BF16 if use_per_token_sf_b else _DType.E2M1),
         fc2_dtype_c=int(_DType.BF16),
         dtype_label="NVFP4xNVFP4",
         fc1_has_bias=fc1_has_bias,
         fc2_has_bias=fc2_has_bias,
         fc1_use_per_token_sf_b=use_per_token_sf_b,
-        fc2_use_per_token_sf_b=False,
+        fc2_use_per_token_sf_b=use_per_token_sf_b,
         per_token_sf_dtype=per_token_sf_dtype,
         has_gemm1_alpha=has_gemm1_alpha,
         has_gemm1_beta=has_gemm1_beta,

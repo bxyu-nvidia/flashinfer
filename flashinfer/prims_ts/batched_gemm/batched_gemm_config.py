@@ -2573,9 +2573,18 @@ def validate_config(
     if cfg.local_expert_start < 0 or cfg.local_expert_count < 0:
         raise ValueError("Resident expert ranges must be nonnegative")
     if cfg.local_expert_count and (
-        not cfg.uses_block_major_k_weight or cfg.weight_dtype_kind != int(DType.BF16)
+        not (
+            (cfg.uses_block_major_k_weight and cfg.weight_dtype_kind == int(DType.BF16))
+            or (
+                cfg.is_nvfp4_mma
+                and cfg.is_swap_ab
+                and not cfg.uses_block_major_k_weight
+            )
+        )
     ):
-        raise ValueError("Resident expert buffers require BF16 BlockMajorK weights")
+        raise ValueError(
+            "Resident expert buffers require BF16 BlockMajorK or NVFP4 MajorK weights"
+        )
 
     if cfg.batch_mode not in (int(BatchMode.BATCH_N), int(BatchMode.BATCH_M)):
         raise ValueError(f"batch_mode must be BATCH_N or BATCH_M, got {cfg.batch_mode}")

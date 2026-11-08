@@ -910,6 +910,7 @@ def build_bf16_launch_io(
         gemm1_beta_dp,
         gemm1_clamp_limit_dp,
         local_weight_dp,
+        a_dp,
         shape,
         launch_early_exit_max_token_ctas,
     )
@@ -973,6 +974,9 @@ def build_bf16_launch_io(
 def build_nvfp4_launch_io(
     *,
     fc: Literal["fc1", "fc2"],
+    resident_weights: torch.Tensor | None = None,
+    resident_weights_scale: torch.Tensor | None = None,
+    resident_expert_offset: int = 0,
     cfg,
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
@@ -1039,6 +1043,18 @@ def build_nvfp4_launch_io(
         scale_gate = output2_scale_scalar
 
     cfg = _runtime_config(cfg, in_hidden)
+    if resident_weights is not None:
+        from .compile_cache import with_bf16_resident_experts
+
+        if out_hidden % 128:
+            raise ValueError(
+                "Resident NVFP4 experts require output widths divisible by 128"
+            )
+        cfg = with_bf16_resident_experts(
+            cfg,
+            expert_offset=resident_expert_offset,
+            expert_count=resident_weights.shape[0],
+        )
     _validate_weight_storage(
         name="gemm1_weights" if fc == "fc1" else "gemm2_weights",
         tensor=weights,
@@ -1272,7 +1288,25 @@ def build_nvfp4_launch_io(
             assumed_align=16,
         )
 
+    local_weight_dp = make_ptr(
+        data_dtype,
+        (resident_weights if resident_weights is not None else weights).data_ptr(),
+        cutlass.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    local_sf_dp = make_ptr(
+        sf_dtype,
+        (
+            resident_weights_scale
+            if resident_weights_scale is not None
+            else weights_scale
+        ).data_ptr(),
+        cutlass.AddressSpace.gmem,
+        assumed_align=32,
+    )
     _keepalive = [
+        resident_weights,
+        resident_weights_scale,
         kernel_a,
         kernel_b,
         sf_a,
@@ -1307,6 +1341,8 @@ def build_nvfp4_launch_io(
         "in_hidden": in_hidden,
         "logical_output_m": logical_output_m,
         "shape": (m_val, n_val, k_val, l_val, num_tokens),
+        "local_weight_dp": local_weight_dp,
+        "local_sf_dp": local_sf_dp,
         "a_dp": a_dp,
         "b_dp": b_dp,
         "sfa_dp": sfa_dp,

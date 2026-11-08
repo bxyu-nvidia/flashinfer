@@ -148,6 +148,11 @@ def prims_ts_fp4_block_scale_moe(
     topk_ids: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
     num_fused_shared_experts: Optional[int] = None,
+    resident_gemm1_weights: Optional[torch.Tensor] = None,
+    resident_gemm1_weights_scale: Optional[torch.Tensor] = None,
+    resident_gemm2_weights: Optional[torch.Tensor] = None,
+    resident_gemm2_weights_scale: Optional[torch.Tensor] = None,
+    resident_expert_offset: int = 0,
 ) -> List[torch.Tensor]:
     r"""FP4 block-scaled MoE using the Prims-TS backend on SM100.
 
@@ -234,6 +239,15 @@ def prims_ts_fp4_block_scale_moe(
     num_fused_shared_experts : Optional[int]
         Number of fused shared experts (default ``None`` / ``0``).
 
+    resident_gemm1_weights, resident_gemm2_weights : Optional[torch.Tensor]
+        Resident packed expert shards. Staged entries in their ownership range
+        may be uninitialized; the kernel reads these shards directly.
+    resident_gemm1_weights_scale, resident_gemm2_weights_scale : Optional[torch.Tensor]
+        Matching expert-major R128c4 block scales. Supply all four resident
+        tensors together; global per-expert output scales cover every expert.
+    resident_expert_offset : int
+        Start of the resident range within the routed local expert set.
+
     Returns
     -------
     List[torch.Tensor]
@@ -251,6 +265,49 @@ def prims_ts_fp4_block_scale_moe(
             routing_method_type,
             routing_replay_out,
         )
+
+    resident = (
+        resident_gemm1_weights,
+        resident_gemm1_weights_scale,
+        resident_gemm2_weights,
+        resident_gemm2_weights_scale,
+    )
+    resident_count = 0
+    if any(tensor is not None for tensor in resident):
+        if not all(tensor is not None for tensor in resident):
+            raise ValueError(
+                "Resident NVFP4 weights require both weights and block scales"
+            )
+        if hidden_states.dtype != torch.uint8 or weight_layout != 0:
+            raise ValueError("Resident expert buffers require NVFP4 MajorK weights")
+        resident_count = resident_gemm1_weights.shape[0]
+        if (
+            resident_count <= 0
+            or resident_expert_offset < 0
+            or resident_expert_offset + resident_count > local_num_experts
+        ):
+            raise ValueError("Resident expert range is outside the routed expert range")
+        for local, remote in zip(
+            resident,
+            (
+                gemm1_weights,
+                gemm1_weights_scale,
+                gemm2_weights,
+                gemm2_weights_scale,
+            ),
+            strict=False,
+        ):
+            if (
+                local.shape != (resident_count, *remote.shape[1:])
+                or local.dtype != remote.dtype
+                or local.device != remote.device
+                or not local.is_contiguous()
+            ):
+                raise ValueError(
+                    "Resident NVFP4 storage must match the staged expert layout"
+                )
+    elif resident_expert_offset != 0:
+        raise ValueError("resident_expert_offset requires resident expert buffers")
 
     if hidden_states.dtype == torch.uint8:
         runner_cls = PrimsTsNvfp4MoERunner
@@ -338,6 +395,12 @@ def prims_ts_fp4_block_scale_moe(
     )
 
     common_kwargs = dict(
+        resident_gemm1_weights=resident_gemm1_weights,
+        resident_gemm1_weights_scale=resident_gemm1_weights_scale,
+        resident_gemm2_weights=resident_gemm2_weights,
+        resident_gemm2_weights_scale=resident_gemm2_weights_scale,
+        resident_expert_offset=resident_expert_offset,
+        resident_expert_count=resident_count,
         routing_bias=routing_bias,
         gemm1_weights=gemm1_weights,
         gemm1_weights_scale=gemm1_weights_scale,
@@ -443,6 +506,11 @@ def _fake_prims_ts_fp4_block_scale_moe(
     routing_input_mode: int = RoutingInputMode.FromLogits,
     topk_ids: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
+    resident_gemm1_weights: Optional[torch.Tensor] = None,
+    resident_gemm1_weights_scale: Optional[torch.Tensor] = None,
+    resident_gemm2_weights: Optional[torch.Tensor] = None,
+    resident_gemm2_weights_scale: Optional[torch.Tensor] = None,
+    resident_expert_offset: int = 0,
 ) -> List[torch.Tensor]:
     del (
         routing_logits,
@@ -529,6 +597,11 @@ def prims_ts_fp4_block_scale_routed_moe(
     per_token_scale: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
+    resident_gemm1_weights: Optional[torch.Tensor] = None,
+    resident_gemm1_weights_scale: Optional[torch.Tensor] = None,
+    resident_gemm2_weights: Optional[torch.Tensor] = None,
+    resident_gemm2_weights_scale: Optional[torch.Tensor] = None,
+    resident_expert_offset: int = 0,
 ) -> List[torch.Tensor]:
     r"""FP4 block-scaled MoE with precomputed routing (Prims-TS / SM100).
 
@@ -603,6 +676,15 @@ def prims_ts_fp4_block_scale_routed_moe(
     tune_max_num_tokens : int
         Autotune token-bucket upper bound (default ``8192``).
 
+    resident_gemm1_weights, resident_gemm2_weights : Optional[torch.Tensor]
+        Resident packed expert shards. Staged entries in their ownership range
+        may be uninitialized; the kernel reads these shards directly.
+    resident_gemm1_weights_scale, resident_gemm2_weights_scale : Optional[torch.Tensor]
+        Matching expert-major R128c4 block scales. Supply all four resident
+        tensors together; global per-expert output scales cover every expert.
+    resident_expert_offset : int
+        Start of the resident range within the routed local expert set.
+
     Returns
     -------
     List[torch.Tensor]
@@ -618,6 +700,11 @@ def prims_ts_fp4_block_scale_routed_moe(
         routing_mode = RoutingInputMode.PackedPrecomputed
 
     return prims_ts_fp4_block_scale_moe(
+        resident_gemm1_weights=resident_gemm1_weights,
+        resident_gemm1_weights_scale=resident_gemm1_weights_scale,
+        resident_gemm2_weights=resident_gemm2_weights,
+        resident_gemm2_weights_scale=resident_gemm2_weights_scale,
+        resident_expert_offset=resident_expert_offset,
         routing_logits=None,
         routing_bias=routing_bias,
         hidden_states=hidden_states,

@@ -999,6 +999,10 @@ class GmemCResource(MemoryResource):
                 )
                 vec_f32 = vec_f32 + bias_vec
             if cutlass.const_expr(is_eltwise_relu):
+                if cutlass.const_expr(
+                    self.cfg.is_nvfp4_mma and self.cfg.uses_global_scales
+                ):
+                    vec_f32 = vec_f32 * cutlass.vector.full_like(vec_f32, scale_gate)
                 relu_vec = cute.math.max(
                     vec_f32, cutlass.vector.full_like(vec_f32, 0.0)
                 )
@@ -2542,6 +2546,11 @@ class GmemCResource(MemoryResource):
                         base_row_idx + Int32(1),
                     )
                     if cutlass.const_expr(is_eltwise_relu):
+                        if cutlass.const_expr(
+                            self.cfg.is_nvfp4_mma and self.cfg.uses_global_scales
+                        ):
+                            val0_f32 = val0_f32 * scale_gate
+                            val1_f32 = val1_f32 * scale_gate
                         val0_f32 = cute.math.max(val0_f32, Float32(0.0))
                         val1_f32 = cute.math.max(val1_f32, Float32(0.0))
                         val0_f32 = val0_f32 * val0_f32
@@ -3400,6 +3409,13 @@ class GmemCResource(MemoryResource):
                             base_row_idx + Int32(3),
                         )
                         if cutlass.const_expr(is_eltwise_relu):
+                            if cutlass.const_expr(
+                                self.cfg.is_nvfp4_mma and self.cfg.uses_global_scales
+                            ):
+                                val0_f32 = val0_f32 * scale_gate
+                                val1_f32 = val1_f32 * scale_gate
+                                val2_f32 = val2_f32 * scale_gate
+                                val3_f32 = val3_f32 * scale_gate
                             val0_f32 = cute.math.max(val0_f32, Float32(0.0))
                             val1_f32 = cute.math.max(val1_f32, Float32(0.0))
                             val2_f32 = cute.math.max(val2_f32, Float32(0.0))
@@ -3573,6 +3589,13 @@ class GmemCResource(MemoryResource):
                             base_row_idx + Int32(3),
                         )
                         if cutlass.const_expr(is_eltwise_relu):
+                            if cutlass.const_expr(
+                                self.cfg.is_nvfp4_mma and self.cfg.uses_global_scales
+                            ):
+                                val0_f32 = val0_f32 * scale_gate
+                                val1_f32 = val1_f32 * scale_gate
+                                val2_f32 = val2_f32 * scale_gate
+                                val3_f32 = val3_f32 * scale_gate
                             val0_f32 = cute.math.max(val0_f32, Float32(0.0))
                             val1_f32 = cute.math.max(val1_f32, Float32(0.0))
                             val2_f32 = cute.math.max(val2_f32, Float32(0.0))
@@ -3628,6 +3651,11 @@ class GmemCResource(MemoryResource):
                                 val_f32, expert_idx, m_row, m_local_row
                             )
                             if cutlass.const_expr(is_eltwise_relu):
+                                if cutlass.const_expr(
+                                    self.cfg.is_nvfp4_mma
+                                    and self.cfg.uses_global_scales
+                                ):
+                                    val_f32 = val_f32 * scale_gate
                                 val_f32 = cute.math.max(val_f32, Float32(0.0))
                                 val_f32 = val_f32 * val_f32
                             val_f32 = self._maybe_apply_scale_c(val_f32, scale_c)
