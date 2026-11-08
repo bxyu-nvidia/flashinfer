@@ -635,6 +635,15 @@ class BatchedGemmConfig:
     ``0`` for the ``BATCH_M`` non-swapped path. FP8 per-token SFB requires ``1``.
     """
 
+    static_raster_along_m: int = 1
+    """Raster direction for the static persistent scheduler."""
+
+    static_swizzle_size: int = 1
+    """Number of adjacent static-persistent work tiles grouped in the raster."""
+
+    static_persistent_clusters: int = 0
+    """Use a fixed number of statically assigned persistent clusters when positive."""
+
     use_clc_fast_drain: int = 0
     """Enable batched CLC cancellation for persistent early-exit overlaunch.
 
@@ -795,6 +804,30 @@ class BatchedGemmConfig:
     # task factories can consume this as a static delayed-commit prefetch cap
     # instead of guarding head/tail entries against runtime K.
     ldgsts_sfb_producer_commit_prefetch_depth: int = MAX_PRODUCER_COMMIT_PREFETCH_DEPTH
+
+    vectorize_routed_sfb: int = 0
+    """Vector-load routed SF rows and write shared words without bank conflicts."""
+
+    use_swizzled_sfb: int = 0
+    """Swizzle compact routed SF-B staging to avoid shared-memory bank conflicts."""
+
+    stage_nvfp4_scales: int = 0
+    """Stage only raw FC1 scale words for coalesced global stores."""
+
+    packed_nvfp4_epilogue: int = 0
+    """Use packed FP32 multiplication in the direct NVFP4 epilogue."""
+
+    prerouted_sfb_ldgsts: int = 0
+    """Copy pre-routed R128c4 activation scales with contiguous cp.async."""
+
+    defer_nvfp4_global_scales: int = 0
+    """Defer positive expert scale factors to output row metadata."""
+
+    defer_nvfp4_token_scale: int = 0
+    """Apply positive token scales after ReLU2 in output metadata instead."""
+
+    use_deferred_nvfp4_scale: int = 0
+    """Write NVFP4 elements and FP32 block scales for later row normalization."""
 
     # --- Activation and epilogue knobs ---
     bias_type: int = int(BiasType.NONE)
@@ -1480,6 +1513,8 @@ class BatchedGemmConfig:
         reduced per-warpgroup form when :attr:`uses_bf16_gated_tma_c_scratch` or
         :attr:`uses_deepseek_fp8_split_epilogue_tma_c_scratch`.
         """
+        if self.use_deferred_nvfp4_scale and self.use_tma_store:
+            return self.num_bytes_c_per_stage * max(1, self.num_epilogue_warps // 4)
         if self.uses_deepseek_fp8_split_epilogue_tma_c_scratch:
             return (
                 (self.tile_m // 2)
@@ -2051,7 +2086,9 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
         cfg.num_cast_a_warps = 0
         cfg.num_gather_warps = 0
         cfg.num_sync_warps = 0
-        cfg.num_workid_warps = 1 if cfg.is_persistent else 0
+        cfg.num_workid_warps = (
+            1 if cfg.is_persistent and not cfg.static_persistent_clusters else 0
+        )
         _pack_warp_layout(
             cfg,
             WarpLayout(
@@ -2073,7 +2110,9 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
         cfg.num_copy_sfb_warps = 0
         cfg.num_gather_warps = 0
         cfg.num_sync_warps = 0
-        cfg.num_workid_warps = 1 if cfg.is_persistent else 0
+        cfg.num_workid_warps = (
+            1 if cfg.is_persistent and not cfg.static_persistent_clusters else 0
+        )
 
         cfg.epilogue_warp_idx = 0
         if cfg.has_activation_side_effects:
@@ -2157,7 +2196,9 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
         cfg.num_copy_sfa_warps = 0
         cfg.num_copy_sfb_warps = 0
         cfg.num_sync_warps = 0
-        cfg.num_workid_warps = 1 if cfg.is_persistent else 0
+        cfg.num_workid_warps = (
+            1 if cfg.is_persistent and not cfg.static_persistent_clusters else 0
+        )
 
         c = cfg.cast_a_warp_idx_first + cfg.num_cast_a_warps
         if cfg.has_gather:
@@ -2199,7 +2240,8 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
         cfg.threads_per_cta = total_warps * 32
         return
 
-    cfg.num_epilogue_warps = 8 if (cfg.is_fp8_mma and cfg.tile_n == 256) else 4
+    if not cfg.use_deferred_nvfp4_scale:
+        cfg.num_epilogue_warps = 8 if (cfg.is_fp8_mma and cfg.tile_n == 256) else 4
     cfg.epilogue_warp_idx = 0
     cfg.num_cast_a_warps = 0
     cfg.num_mma_warps = 1
@@ -2271,7 +2313,9 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
     cfg.num_sync_warps = (
         1 if cfg.has_cluster and cfg.has_gather and not cfg.fuse_operand_sf_loads else 0
     )
-    cfg.num_workid_warps = 1 if cfg.is_persistent else 0
+    cfg.num_workid_warps = (
+        1 if cfg.is_persistent and not cfg.static_persistent_clusters else 0
+    )
     # CopySf warps copy scale factors to TMEM before the MMA. The compact low-N
     # SFB path needs the 4-warp STTM warpgroup; all bulk S2T paths use one warp
     # to stay inside the launch envelope.
@@ -2335,7 +2379,11 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
                 )
             ),
         )
-        if cfg.has_activation_side_effects and cfg.tile_n == 64:
+        if (
+            cfg.has_activation_side_effects
+            and cfg.tile_n == 64
+            and not cfg.use_deferred_nvfp4_scale
+        ):
             cfg.epilogue_regs = max(cfg.epilogue_regs, 160)
         return
 
@@ -3058,6 +3106,178 @@ def validate_config(
                 + "/".join(unsupported_fused_layouts)
             )
 
+    for name in (
+        "use_swizzled_sfb",
+        "vectorize_routed_sfb",
+        "use_deferred_nvfp4_scale",
+        "defer_nvfp4_token_scale",
+        "defer_nvfp4_global_scales",
+        "prerouted_sfb_ldgsts",
+        "packed_nvfp4_epilogue",
+        "stage_nvfp4_scales",
+    ):
+        _validate_binary_config_option(name, getattr(cfg, name))
+    if (
+        cfg.use_swizzled_sfb
+        and cfg.has_implicit_routed_sfs
+        and cfg.smem_sfb_layout == int(SfLayout.R8c4)
+    ):
+        sf_groups = cfg.tile_k // cfg.input_sf_block_size_b // TMEM_SF_PACK_SIZE_BYTES
+        if sf_groups <= 0 or sf_groups & (sf_groups - 1):
+            raise ValueError("Swizzled SF-B requires a power-of-two block count")
+    if cfg.use_deferred_nvfp4_scale and not (
+        cfg.is_nvfp4_mma
+        and cfg.uses_fp4_output_quant
+        and not cfg.uses_mxfp4_output_quant
+        and cfg.is_swap_ab
+        and cfg.has_per_token_sf_b
+        and cfg.has_routed_act
+        and cfg.tile_m == 128
+        and cfg.epi_tile_m == 128
+        and cfg.tile_n in (64, 128, 256)
+        and cfg.act_kind == int(ActKind.RELU2)
+    ):
+        raise ValueError("Deferred NVFP4 scales require routed Relu2 FP4 direct output")
+
+    if cfg.vectorize_routed_sfb and not (
+        cfg.is_nvfp4_mma
+        and cfg.is_swap_ab
+        and cfg.has_routed_sfs
+        and cfg.fuse_operand_sf_loads
+        and cfg.uses_ldgsts_routed_sfs
+        and cfg.tile_n in (128, 256)
+        and cfg.num_load_sfb_warps == 4
+        and cfg.smem_sfb_layout == int(SfLayout.R128c4)
+        and cfg.tile_k % 256 == 0
+    ):
+        raise ValueError(
+            "Vector routed SFB requires four-warps, NVFP4 R128c4 tile_N128/256"
+        )
+    if cfg.vectorize_routed_sfb and problem_mnk is not None:
+        if isinstance(problem_mnk[2], int) and problem_mnk[2] % cfg.tile_k:
+            raise ValueError("Vector routed SFB requires complete K tiles")
+    _validate_binary_config_option("static_raster_along_m", cfg.static_raster_along_m)
+    if cfg.static_swizzle_size not in (1, 2, 4, 8):
+        raise ValueError("Static persistent swizzle size must be 1, 2, 4, or 8")
+    if cfg.stage_nvfp4_scales and not (
+        cfg.use_deferred_nvfp4_scale
+        and cfg.defer_nvfp4_token_scale
+        and cfg.is_swap_ab
+        and cfg.tile_m == cfg.tile_n == 128
+        and cfg.epi_tile_n == 64
+        and cfg.num_epilogue_warps == 8
+        and cfg.packed_nvfp4_epilogue
+        and not cfg.use_tma_store
+    ):
+        raise ValueError("Raw NVFP4 scale staging requires deferred 128x128 tiles")
+    if cfg.static_persistent_clusters < 0:
+        raise ValueError("Static persistent cluster count must be nonnegative")
+    if cfg.static_persistent_clusters and not (
+        cfg.is_persistent
+        and cfg.use_deferred_nvfp4_scale
+        and cfg.defer_nvfp4_token_scale
+        and cfg.fuse_operand_sf_loads
+        and cfg.tile_n == 128
+        and not cfg.use_work_throttle
+        and not cfg.use_clc_fast_drain
+    ):
+        raise ValueError(
+            "Static persistent scheduling requires deferred fused tile_N128"
+        )
+    if cfg.prerouted_sfb_ldgsts and not (
+        cfg.is_nvfp4_mma
+        and cfg.is_swap_ab
+        and cfg.uses_ldgsts_routed_sfs
+        and cfg.fuse_operand_sf_loads
+        and cfg.tile_n == 128
+        and cfg.smem_sfb_layout == int(SfLayout.R128c4)
+        and not cfg.vectorize_routed_sfb
+    ):
+        raise ValueError("Pre-routed LDGSTS SFB requires fused NVFP4 R128c4 tile_N128")
+    if cfg.defer_nvfp4_global_scales and not cfg.defer_nvfp4_token_scale:
+        raise ValueError("Deferred global scales require deferred token scales")
+    if cfg.defer_nvfp4_token_scale and not (
+        cfg.use_deferred_nvfp4_scale
+        and not cfg.has_per_token_sf_a
+        and not cfg.has_bias_m
+        and cfg.per_token_sf_dtype == int(DType.FP32)
+    ):
+        raise ValueError(
+            "Deferred token scales require bias-free FP32 token-scaled direct NVFP4"
+        )
+
+    if cfg.use_deferred_nvfp4_scale:
+        if cfg.use_tma_store and cfg.num_epilogue_warps == 16 and cfg.epi_tile_n == 32:
+            raise ValueError("Sixteen-warp FP4 TMA output with epi_N 32 is unvalidated")
+        if cfg.tile_k not in (256, 512, 1024):
+            raise ValueError(
+                "Deferred NVFP4 output requires tile_K 256 or 512, or single-stage 1024"
+            )
+        if cfg.tile_k == 1024 and any(
+            stage != 1
+            for stage in (
+                cfg.num_stages_a,
+                cfg.num_stages_b,
+                cfg.num_stages_smem_sfa,
+                cfg.num_stages_smem_sfb,
+                cfg.num_stages_tmem_sfa,
+                cfg.num_stages_tmem_sfb,
+            )
+        ):
+            raise ValueError("Deferred tile_K 1024 requires a single operand stage")
+        if cfg.num_epilogue_warps not in (4, 8, 16) or cfg.threads_per_cta > 1024:
+            raise ValueError(
+                "Deferred NVFP4 output requires four, eight or sixteen epilogue warps"
+            )
+        role_registers = {
+            "epilogue": cfg.epilogue_regs,
+            "cast_a": cfg.cast_a_regs,
+            "gather": cfg.gather_regs,
+            "load_a": cfg.load_a_task_regs,
+            "load_b": cfg.load_b_task_regs,
+            "load_sfa": cfg.load_sfa_task_regs,
+            "load_sfb": cfg.load_sfb_task_regs,
+            "load_sfab": cfg.load_sfab_regs,
+            "copy_sfa": cfg.copy_sfa_task_regs,
+            "copy_sfb": cfg.copy_sfb_task_regs,
+            "sync": cfg.sync_regs,
+            "mma": cfg.mma_regs,
+            "workid": cfg.workid_regs,
+        }
+        warp_registers = [cfg.padding_regs] * (cfg.threads_per_cta // 32)
+        for name, task in _WARP_TASKS.items():
+            count = getattr(cfg, task.count_field)
+            first = getattr(cfg, task.index_field)
+            for warp in range(first, first + count):
+                warp_registers[warp] = max(warp_registers[warp], role_registers[name])
+        for first in range(0, len(warp_registers), 4):
+            warp_registers[first : first + 4] = [
+                max(warp_registers[first : first + 4])
+            ] * 4
+        initial_registers = 65536 // (cfg.threads_per_cta * 8) * 8
+        register_pool = initial_registers * cfg.threads_per_cta
+        if cfg.has_cluster:
+            # CTA-leader-only tasks skip setmaxnreg on the other CTA, retaining
+            # the initial allocation instead of returning their unused registers.
+            inactive_roles = ["copy_sfa", "mma", "workid"]
+            if cfg.sfb_smem_to_tmem_copy != int(SfSmemToTmemCopy.LDS_STTM) and not (
+                cfg.has_routed_sfs and cfg.uses_tma_routed_sfs and cfg.is_swap_ab
+            ):
+                inactive_roles.append("copy_sfb")
+            for name in inactive_roles:
+                task = _WARP_TASKS[name]
+                first = getattr(cfg, task.index_field)
+                count = getattr(cfg, task.count_field)
+                for warp in range(first, first + count):
+                    warp_registers[warp] = max(warp_registers[warp], initial_registers)
+        if cfg.fuse_operand_sf_loads:
+            for first in range(0, len(warp_registers), 4):
+                warp_registers[first : first + 4] = [
+                    max(warp_registers[first : first + 4])
+                ] * 4
+        if sum(warp_registers) * 32 > register_pool:
+            raise ValueError("Deferred NVFP4 warp register budgets exceed the CTA pool")
+
     if cfg.has_epilogue_quant:
         if not cfg.has_scale_factors:
             raise ValueError("Output block scaling requires FP4/MX input scale factors")
@@ -3065,7 +3285,9 @@ def validate_config(
             raise ValueError(
                 "Output block scaling requires dtype_c=e2m1, mxe2m1, or mxe4m3"
             )
-        if not cfg.is_swap_ab or not cfg.has_gated_epilogue:
+        if not cfg.is_swap_ab or not (
+            cfg.has_gated_epilogue or cfg.use_deferred_nvfp4_scale
+        ):
             raise ValueError(
                 "Output block scaling currently requires is_swap_ab with a gated epilogue"
             )

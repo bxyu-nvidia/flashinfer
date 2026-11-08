@@ -66,6 +66,8 @@ from .config_mapper import (
     map_trtllm_mxfp4_mxfp8_moe_tactic,
     map_trtllm_mxfp8_mxfp8_moe_tactic,
     map_trtllm_nvfp4_moe_tactic,
+    _fused_nvfp4_fc1_enabled,
+    _deferred_nvfp4_token_scale_enabled,
     valid_prims_ts_bf16_moe_tactics,
     valid_prims_ts_deepseek_fp8_moe_tactics,
     valid_prims_ts_fp8_per_tensor_moe_tactics,
@@ -1039,6 +1041,12 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             **kwargs,
         )
 
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        return super().get_cache_key_extras(inputs) + (
+            ("nvfp4_fc1_deferred_scales_v1", _fused_nvfp4_fc1_enabled()),
+            ("nvfp4_fc1_defer_token_v1", _deferred_nvfp4_token_scale_enabled()),
+        )
+
     def get_valid_tactics(
         self,
         inputs: List[torch.Tensor],
@@ -1054,6 +1062,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         )
         gemm_config_flags = _gemm_config_flags_from_static_extras(self)
         instance_key = (
+            _fused_nvfp4_fc1_enabled(),
             self.dtype_act,
             self.dtype_weights,
             self.fp8_quantization_type,
@@ -1256,19 +1265,56 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
         fc2_io_kwargs = common_io_kwargs
         if uses_per_token_scaling and fc2_cfg.has_per_token_sf_b:
-            (
-                activation_output,
-                activation_output_scale,
-                per_token_scale_fc2,
-            ) = _quantize_nvfp4_fc1_output_for_fc2(
-                gemm1_output=gemm1_output,
-                gemm1_output_scale=gemm1_output_scale,
-                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-                num_tokens=num_tokens,
-                top_k=self.top_k,
-                intermediate_size=self.intermediate_size,
-                tile_n=pair.tile_n,
-            )
+            if fc1_cfg.use_deferred_nvfp4_scale:
+                from .nvfp4_output import normalize_nvfp4_output_scales
+
+                activation_output = gemm1_output
+                activation_output_scale = gemm1_output_scale
+                per_token_scale_fc2 = normalize_nvfp4_output_scales(
+                    fc1_io["deferred_nvfp4_scales"],
+                    gemm1_output_scale,
+                    mn_limit,
+                    total_num_padded_tokens,
+                    tile_n=pair.tile_n,
+                    sf_layout=3 if pair.tile_n >= 128 else 1,
+                    input_token_scales=(
+                        moe_inputs.per_token_scale
+                        if fc1_cfg.defer_nvfp4_token_scale
+                        else None
+                    ),
+                    route_map=(
+                        permuted_idx_to_token_idx
+                        if fc1_cfg.defer_nvfp4_token_scale
+                        else None
+                    ),
+                    tile_experts=tile_idx
+                    if fc1_cfg.defer_nvfp4_global_scales
+                    else None,
+                    expert_gate_scales=(
+                        kwargs["output1_scale_gate_scalar"]
+                        if fc1_cfg.defer_nvfp4_global_scales
+                        else None
+                    ),
+                    expert_output_scales=(
+                        kwargs["output1_scale_scalar"]
+                        if fc1_cfg.defer_nvfp4_global_scales
+                        else None
+                    ),
+                )
+            else:
+                (
+                    activation_output,
+                    activation_output_scale,
+                    per_token_scale_fc2,
+                ) = _quantize_nvfp4_fc1_output_for_fc2(
+                    gemm1_output=gemm1_output,
+                    gemm1_output_scale=gemm1_output_scale,
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    num_tokens=num_tokens,
+                    top_k=self.top_k,
+                    intermediate_size=self.intermediate_size,
+                    tile_n=pair.tile_n,
+                )
             fc2_io_kwargs = {
                 **common_io_kwargs,
                 "gemm1_output": activation_output,

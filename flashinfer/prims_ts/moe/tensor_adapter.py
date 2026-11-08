@@ -18,7 +18,7 @@ Adapters from TRT-LLM MoE stage tensors to Prims-TS batched GEMM launch IO.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import TYPE_CHECKING, Literal
 
@@ -1042,6 +1042,28 @@ def build_nvfp4_launch_io(
         scale_c = output2_scale_scalar
         scale_gate = output2_scale_scalar
 
+    if cfg.vectorize_routed_sfb and (
+        in_hidden % cfg.tile_k or activation_scale.data_ptr() % 16
+    ):
+        cfg = replace(cfg, vectorize_routed_sfb=0)
+    if cfg.prerouted_sfb_ldgsts and (
+        in_hidden != 1024 or out_hidden != 2688 or activation_scale.data_ptr() % 4
+    ):
+        cfg = replace(
+            cfg,
+            prerouted_sfb_ldgsts=0,
+            stage_nvfp4_scales=0,
+            epilogue_regs=112,
+            vectorize_routed_sfb=int(
+                in_hidden % cfg.tile_k == 0 and activation_scale.data_ptr() % 16 == 0
+            ),
+        )
+    if cfg.stage_nvfp4_scales and not cfg.static_persistent_clusters:
+        clusters = (
+            torch.cuda.get_device_properties(hidden_states.device).multi_processor_count
+            // cfg.cluster_m
+        )
+        cfg = replace(cfg, static_persistent_clusters=clusters)
     cfg = _runtime_config(cfg, in_hidden)
     if resident_weights is not None:
         from .compile_cache import with_bf16_resident_experts
@@ -1146,6 +1168,17 @@ def build_nvfp4_launch_io(
     kernel_b = activation_compact
     sf_a = weights_scale
     sf_b = activation_scale
+    if cfg.prerouted_sfb_ldgsts:
+        from .routed_scales import preroute_nvfp4_activation_scales
+
+        sf_b = preroute_nvfp4_activation_scales(
+            activation_scale,
+            route_map,
+            mn_limit,
+            total_num_padded_tokens,
+            capacity=logical_token_capacity,
+            scale_columns=in_hidden // cfg.sf_vec_size,
+        )
     bias_torch = _select_bias(
         fc=fc,
         cfg=cfg,
@@ -1170,6 +1203,15 @@ def build_nvfp4_launch_io(
     sfb_dp = make_ptr(
         sf_dtype, sf_b.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=32
     )
+    deferred_nvfp4_scales = None
+    if cfg.use_deferred_nvfp4_scale:
+        if fc != "fc1" or output_buf.dtype != torch.uint8:
+            raise ValueError("Deferred NVFP4 output requires packed FC1 storage")
+        deferred_nvfp4_scales = torch.empty(
+            (int(output_buf.shape[0]), logical_output_m // 16),
+            dtype=torch.float32,
+            device=output_buf.device,
+        )
     if cfg.has_epilogue_quant:
         c0_dp = make_ptr(
             data_dtype,
@@ -1178,8 +1220,10 @@ def build_nvfp4_launch_io(
             assumed_align=16,
         )
         sf_c_dp = make_ptr(
-            sf_dtype,
-            output_scale.data_ptr(),
+            cutlass.Float32 if cfg.use_deferred_nvfp4_scale else sf_dtype,
+            (
+                deferred_nvfp4_scales if cfg.use_deferred_nvfp4_scale else output_scale
+            ).data_ptr(),
             cutlass.AddressSpace.gmem,
             assumed_align=16,
         )
@@ -1305,6 +1349,7 @@ def build_nvfp4_launch_io(
         assumed_align=32,
     )
     _keepalive = [
+        deferred_nvfp4_scales,
         resident_weights,
         resident_weights_scale,
         kernel_a,
@@ -1329,6 +1374,7 @@ def build_nvfp4_launch_io(
     ]
 
     return {
+        "deferred_nvfp4_scales": deferred_nvfp4_scales,
         "cfg": cfg,
         "launch_early_exit_max_token_ctas": launch_early_exit_max_token_ctas,
         "M": m_val,

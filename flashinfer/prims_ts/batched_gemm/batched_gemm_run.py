@@ -406,7 +406,7 @@ def _sf_ab_cutlass_dtype(cfg):
 
 
 def _sf_c_cutlass_dtype(cfg):
-    if cfg.has_deepseek_fp8_c_scale:
+    if cfg.has_deepseek_fp8_c_scale or cfg.use_deferred_nvfp4_scale:
         return cutlass.Float32
     return cutlass.Float8E8M0FNU if cfg.uses_mx_output_quant else cutlass.Float8E4M3FN
 
@@ -1089,6 +1089,16 @@ def _sf_c_index_grid(
     raise ValueError(f"Unsupported sfLayoutC for quantized output: {sf_layout_c}")
 
 
+def _allocate_output_scales(cfg, output_m: int, n: int, device):
+    if cfg.use_deferred_nvfp4_scale:
+        return torch.zeros((n * (output_m // 16),), dtype=torch.float32, device=device)
+    return torch.zeros(
+        (_sf_c_numel(output_m, n, cfg.sf_layout_c, cfg.output_sf_block_size_c),),
+        dtype=torch.uint8,
+        device=device,
+    )
+
+
 def _dequantize_fp4_output(
     c_storage: torch.Tensor,
     sf_c: torch.Tensor,
@@ -1098,6 +1108,7 @@ def _dequantize_fp4_output(
     is_swap_ab: bool,
     sf_layout_c: int,
     uses_mxfp4: bool,
+    deferred_sf: bool = False,
 ) -> torch.Tensor:
     """Decode packed E2M1 C and its NVFP4/MXFP4 SF-C into a logical view."""
     elem_count = output_m * n
@@ -1114,6 +1125,10 @@ def _dequantize_fp4_output(
         fp4_view = torch.as_strided(fp4_vals, (output_m, n), (1, output_m))
     else:
         fp4_view = fp4_vals.view(output_m, n)
+
+    if deferred_sf:
+        scales = sf_c.float().view(n, output_m // 16).repeat_interleave(16, dim=1)
+        return fp4_view * scales.T
 
     sf_idx = _sf_c_index_grid(
         output_m=output_m,
@@ -1975,17 +1990,8 @@ def reference_check(
             device=device,
         )
         c_torch = None
-        sf_c_torch = torch.zeros(
-            (
-                _sf_c_numel(
-                    logical_output_m,
-                    logical_output_n,
-                    cfg.sf_layout_c,
-                    cfg.output_sf_block_size_c,
-                ),
-            ),
-            dtype=torch.uint8,
-            device=device,
+        sf_c_torch = _allocate_output_scales(
+            cfg, logical_output_m, logical_output_n, device
         )
         output_guard_value = None
         c_guard = None
@@ -2352,6 +2358,7 @@ def reference_check(
                 is_swap_ab=cfg.is_swap_ab,
                 sf_layout_c=cfg.sf_layout_c,
                 uses_mxfp4=cfg.uses_mxfp4_output_quant,
+                deferred_sf=bool(cfg.use_deferred_nvfp4_scale),
             )
     elif cfg.has_deepseek_fp8_c_scale:
         c_logical = _dequantize_dsfp8_output(
@@ -2370,6 +2377,19 @@ def reference_check(
         )
     else:
         c_logical = c_torch
+
+    if cfg.defer_nvfp4_token_scale:
+        token_factors = per_token_sf_b_torch[route_map[:logical_output_n].long()]
+        c_logical = c_logical * token_factors.float().square().view(1, -1)
+
+    if cfg.defer_nvfp4_global_scales:
+        expert = tile_idx[
+            torch.arange(logical_output_n, device=device) // cfg.tile_n
+        ].long()
+        expert_factor = (
+            scale_gate_torch[expert].float().square() * scale_c_torch[expert].float()
+        )
+        c_logical = c_logical * expert_factor.view(1, -1)
 
     print(f"Output shape: {c_logical.shape}")
     print(
@@ -3057,17 +3077,8 @@ def _build_launch_io(
             device=device,
         )
         c_torch = None
-        sf_c_torch = torch.zeros(
-            (
-                _sf_c_numel(
-                    logical_output_m,
-                    logical_output_n,
-                    cfg.sf_layout_c,
-                    cfg.output_sf_block_size_c,
-                ),
-            ),
-            dtype=torch.uint8,
-            device=device,
+        sf_c_torch = _allocate_output_scales(
+            cfg, logical_output_m, logical_output_n, device
         )
     elif cfg.uses_fp8_output:
         c_storage = torch.zeros(
